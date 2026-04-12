@@ -1,0 +1,9 @@
+node_modules/
+build/
+config.json
+.env
+*.js.map
+*.lock
+.DS_Store
+*.log
+.claude/

@@ -1,0 +1,30 @@
+{
+  "name": "roon-bridge",
+  "version": "1.0.0",
+  "description": "Persistent Roon MCP bridge — single Roon connection shared across multiple Claude sessions via HTTP",
+  "type": "module",
+  "main": "build/server.js",
+  "bin": {
+    "roon-bridge": "./build/server.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/patch-roon-api.js",
+    "build": "tsc",
+    "start": "node build/server.js",
+    "dev": "tsc --watch & node --watch build/server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "express": "^5.1.0",
+    "node-roon-api": "github:roonlabs/node-roon-api",
+    "node-roon-api-browse": "github:roonlabs/node-roon-api-browse",
+    "node-roon-api-status": "github:roonlabs/node-roon-api-status",
+    "node-roon-api-transport": "github:roonlabs/node-roon-api-transport",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  }
+}

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.roon-bridge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/node</string>
+        <string>/Users/monty/dev/roon-bridge/build/server.js</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/monty/dev/roon-bridge</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ROON_HOST</key>
+        <string>127.0.0.1</string>
+        <key>ROON_PORT</key>
+        <string>9330</string>
+        <key>BRIDGE_PORT</key>
+        <string>3100</string>
+        <key>BRIDGE_HOST</key>
+        <string>0.0.0.0</string>
+        <key>BRIDGE_AUTH_TOKEN</key>
+        <string>d48df9dc2bb10f477a47f11588fff8d073ec191ece54ba9ce8d3fedeceecc9a8</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/monty/Library/Logs/roon-bridge.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/monty/Library/Logs/roon-bridge.log</string>
+</dict>
+</plist>

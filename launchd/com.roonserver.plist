@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.roonserver</string>
+
+    <key>UserName</key>
+    <string>monty</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Roon.app/Contents/RoonServer.app/Contents/MacOS/RoonServer</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/monty</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/monty/Library/Logs/roonserver-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/monty/Library/Logs/roonserver-launchd.log</string>
+</dict>
+</plist>
