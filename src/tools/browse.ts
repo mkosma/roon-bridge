@@ -60,12 +60,52 @@ interface BrowseAndLoadResult {
   list?: BrowseResult["list"];
   items?: BrowseItem[];
   message?: string;
+  total?: number;
+  nextOffset?: number | null;
+}
+
+const PAGE_SIZE = 100;
+
+async function loadPaginated(
+  browse: RoonApiBrowse,
+  hierarchy: string,
+  sessionKey: string | undefined,
+  limit: number,
+  offset: number,
+): Promise<{ error: string | null; items: BrowseItem[]; total: number; nextOffset: number | null }> {
+  const collected: BrowseItem[] = [];
+  let cursor = offset;
+  let total = 0;
+
+  while (collected.length < limit) {
+    const remaining = limit - collected.length;
+    const pageCount = Math.min(PAGE_SIZE, remaining);
+    const loaded = await promisifyLoad(browse, {
+      hierarchy,
+      multi_session_key: sessionKey,
+      offset: cursor,
+      count: pageCount,
+    });
+    if (loaded.error) {
+      return { error: String(loaded.error), items: collected, total, nextOffset: null };
+    }
+    const items = loaded.body.items || [];
+    total = loaded.body.list?.count ?? collected.length + items.length;
+    collected.push(...items);
+    cursor += items.length;
+    if (items.length < pageCount) break;
+    if (cursor >= total) break;
+  }
+
+  const nextOffset = cursor < total ? cursor : null;
+  return { error: null, items: collected, total, nextOffset };
 }
 
 async function browseAndLoad(
   browse: RoonApiBrowse,
   browseOpts: BrowseOptions,
   loadCount = 100,
+  loadOffset = 0,
 ): Promise<BrowseAndLoadResult> {
   const result = await promisifyBrowse(browse, browseOpts);
 
@@ -81,17 +121,26 @@ async function browseAndLoad(
     return { error: null, navigated: false, list: result.body.list, items: [] };
   }
 
-  const loaded = await promisifyLoad(browse, {
-    hierarchy: browseOpts.hierarchy,
-    multi_session_key: browseOpts.multi_session_key,
-    count: loadCount,
-  });
+  const paged = await loadPaginated(
+    browse,
+    browseOpts.hierarchy,
+    browseOpts.multi_session_key,
+    loadCount,
+    loadOffset,
+  );
 
-  if (loaded.error) {
-    return { error: String(loaded.error), navigated: true };
+  if (paged.error) {
+    return { error: paged.error, navigated: true };
   }
 
-  return { error: null, navigated: true, list: result.body.list, items: loaded.body.items };
+  return {
+    error: null,
+    navigated: true,
+    list: result.body.list,
+    items: paged.items,
+    total: paged.total,
+    nextOffset: paged.nextOffset,
+  };
 }
 
 function bestMatch(items: BrowseItem[], query: string): BrowseItem | undefined {
@@ -457,12 +506,29 @@ async function searchAndPlay(
 export function registerBrowseTools(server: McpServer): void {
   server.tool(
     "search",
-    "Search the Roon music library. Returns matching artists, albums, tracks, playlists, etc.",
+    "Search the Roon music library. Returns matching artists, albums, tracks, playlists, etc. Use `category` to narrow and paginate within one category.",
     {
       query: z.string().describe("Search query (artist name, album title, track name, etc.)"),
       zone: z.string().optional().describe("Zone name or ID (optional, provides playback context)"),
+      category: z
+        .enum(["artist", "album", "track", "playlist", "composer", "genre"])
+        .optional()
+        .describe("Narrow to a single category. When set, `offset` paginates within it."),
+      limit: z
+        .coerce.number()
+        .int()
+        .min(1)
+        .max(1000)
+        .default(100)
+        .describe("Max items per category (default 100, max 1000). Loops internally for values > 100."),
+      offset: z
+        .coerce.number()
+        .int()
+        .min(0)
+        .default(0)
+        .describe("Pagination offset — only meaningful with `category`."),
     },
-    async ({ query, zone }): Promise<ToolResult> => {
+    async ({ query, zone, category, limit, offset }): Promise<ToolResult> => {
       try {
         const browse = roonConnection.getBrowse();
         const zoneObj = zone ? roonConnection.findZoneOrThrow(zone) : null;
@@ -485,17 +551,38 @@ export function registerBrowseTools(server: McpServer): void {
           return { content: [{ type: "text", text: `No results for "${query}".` }] };
         }
 
+        const playableCats = searchData.items.filter((c) => c.item_key && c.hint !== "header");
+        let categoriesToLoad: BrowseItem[];
+
+        if (category) {
+          const catLower = category.toLowerCase();
+          const exact = playableCats.find(
+            (c) => c.title.toLowerCase() === catLower || c.title.toLowerCase() === catLower + "s",
+          );
+          const fuzzy = exact ?? playableCats.find((c) => c.title.toLowerCase().includes(catLower));
+          if (!fuzzy) {
+            return { content: [{ type: "text", text: `No "${category}" results for "${query}".` }] };
+          }
+          categoriesToLoad = [fuzzy];
+        } else {
+          categoriesToLoad = playableCats;
+        }
+
         const allResults: string[] = [`Search results for "${query}":`];
 
-        for (const cat of searchData.items) {
-          if (!cat.item_key || cat.hint === "header") continue;
-
-          const catData = await browseAndLoad(browse, {
-            hierarchy,
-            item_key: cat.item_key,
-            zone_or_output_id: zoneObj?.zone_id,
-            multi_session_key: sessionKey,
-          }, 5);
+        for (const cat of categoriesToLoad) {
+          const catOffset = category ? offset : 0;
+          const catData = await browseAndLoad(
+            browse,
+            {
+              hierarchy,
+              item_key: cat.item_key!,
+              zone_or_output_id: zoneObj?.zone_id,
+              multi_session_key: sessionKey,
+            },
+            limit,
+            catOffset,
+          );
 
           if (catData.error || !catData.items?.length) {
             if (catData.navigated) {
@@ -504,12 +591,25 @@ export function registerBrowseTools(server: McpServer): void {
             continue;
           }
 
-          const count = catData.list?.count || catData.items.length;
-          allResults.push(`\n${catData.list?.title || cat.title} (${count}):`);
-          for (const item of catData.items) {
-            if (item.hint === "header") continue;
+          const visibleItems = catData.items.filter((item) => item.hint !== "header");
+          const total = catData.total ?? visibleItems.length;
+          const title = catData.list?.title || cat.title;
+          const start = catOffset + 1;
+          const end = catOffset + visibleItems.length;
+          const header =
+            total > visibleItems.length
+              ? `\n${title} (showing ${start}-${end} of ${total}):`
+              : `\n${title} (${total}):`;
+          allResults.push(header);
+          for (const item of visibleItems) {
             const sub = item.subtitle ? ` - ${stripRoonLinks(item.subtitle)}` : "";
             allResults.push(`  - ${item.title}${sub}`);
+          }
+          if (catData.nextOffset != null) {
+            const catName = title.toLowerCase().replace(/s$/, "");
+            allResults.push(
+              `  [${total - end} more — call search with category="${catName}", offset=${catData.nextOffset}]`,
+            );
           }
 
           if (catData.navigated) {
