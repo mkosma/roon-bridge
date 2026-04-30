@@ -181,6 +181,32 @@ All the same tools as [roon-mcp](https://github.com/AzureStackNerd/roon-mcp):
 - `play_artist` / `play_album` / `play_playlist` / `play_track` — search and play
 - `add_to_queue` — search and queue
 
+## REST control endpoint
+
+For one-shot HTTP clients (iOS Shortcuts, browser bookmarks, `curl`),
+`roon-bridge` exposes a simple REST endpoint that wraps the same
+playback controls as the MCP `play_pause` / `play` / `pause` / etc.
+tools. It uses the same bearer token as `/mcp` and operates on the
+default zone unless `?zone=Name` is supplied.
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  http://localhost:3100/control/play_pause
+```
+
+Both GET and POST are accepted (Shortcuts' "Get Contents of URL"
+defaults to GET, which is convenient). Valid actions:
+
+- `play_pause` (alias: `playpause`, `toggle`)
+- `play`
+- `pause`
+- `stop`
+- `next` (alias: `next_track`)
+- `previous` (alias: `prev`, `previous_track`)
+
+Returns `{"ok":true,"zone":"WiiM + 1","state":"playpause"}` on success
+or `{"ok":false,"error":"..."}` on failure (HTTP 500).
+
 ## Health endpoint
 
 ```bash
