@@ -76,11 +76,45 @@ function authMiddleware(
   next();
 }
 
+type Control = "play" | "pause" | "playpause" | "stop" | "next" | "previous";
+const CONTROL_ALIASES: Record<string, Control> = {
+  play: "play",
+  pause: "pause",
+  play_pause: "playpause",
+  playpause: "playpause",
+  toggle: "playpause",
+  stop: "stop",
+  next: "next",
+  next_track: "next",
+  previous: "previous",
+  prev: "previous",
+  previous_track: "previous",
+};
+
+function runControl(action: Control, zoneName: string): Promise<{ ok: true; zone: string; state: string } | { ok: false; error: string }> {
+  return new Promise((resolve) => {
+    try {
+      const transport = roonConnection.getTransport();
+      const zone = roonConnection.findZoneOrThrow(zoneName);
+      transport.control(zone, action, (error) => {
+        if (error) {
+          resolve({ ok: false, error: String(error) });
+        } else {
+          resolve({ ok: true, zone: zone.display_name, state: action });
+        }
+      });
+    } catch (e) {
+      resolve({ ok: false, error: e instanceof Error ? e.message : String(e) });
+    }
+  });
+}
+
 async function startHttpServer(): Promise<void> {
   const app = express();
 
-  // Auth on the MCP endpoint
+  // Auth on protected endpoints
   app.use("/mcp", authMiddleware);
+  app.use("/control", authMiddleware);
 
   // Health check (no auth required)
   app.get("/health", (_req, res) => {
@@ -92,6 +126,25 @@ async function startHttpServer(): Promise<void> {
         state: z.state,
       })),
     });
+  });
+
+  // Simple REST control endpoints for iOS Shortcuts and similar clients.
+  // GET or POST both work so the iOS "Get Contents of URL" action can call
+  // them without configuring a body. The default zone is used unless
+  // ?zone=Name is supplied.
+  app.all("/control/:action", async (req, res) => {
+    const raw = String(req.params.action || "").toLowerCase();
+    const action = CONTROL_ALIASES[raw];
+    if (!action) {
+      res.status(404).json({
+        ok: false,
+        error: `Unknown action '${raw}'. Valid: ${Object.keys(CONTROL_ALIASES).join(", ")}`,
+      });
+      return;
+    }
+    const zoneParam = (req.query.zone as string | undefined) ?? "";
+    const result = await runControl(action, zoneParam);
+    res.status(result.ok ? 200 : 500).json(result);
   });
 
   // Map of session ID → { transport, server } for session resumption
