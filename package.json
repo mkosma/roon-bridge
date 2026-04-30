@@ -11,10 +11,13 @@
     "postinstall": "node scripts/patch-roon-api.js",
     "build": "tsc",
     "start": "node build/server.js",
-    "dev": "tsc --watch & node --watch build/server.js"
+    "dev": "tsc --watch & node --watch build/server.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
+    "bonjour-service": "^1.3.0",
     "express": "^5.1.0",
     "node-roon-api": "github:roonlabs/node-roon-api",
     "node-roon-api-browse": "github:roonlabs/node-roon-api-browse",
@@ -25,6 +28,8 @@
   "devDependencies": {
     "@types/express": "^5.0.0",
     "@types/node": "^22.0.0",
-    "typescript": "^5.8.0"
+    "@vitest/coverage-v8": "^4.1.5",
+    "typescript": "^5.8.0",
+    "vitest": "^4.1.5"
   }
 }

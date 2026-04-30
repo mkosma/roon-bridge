@@ -20,8 +20,22 @@ import { registerZoneTools } from "./tools/zone.js";
 import { registerPlaybackTools } from "./tools/playback.js";
 import { registerVolumeTools } from "./tools/volume.js";
 import { registerBrowseTools } from "./tools/browse.js";
+import { createControlRouter, createConfigRouter } from "./control/control-router.js";
 import express from "express";
 import { randomUUID } from "node:crypto";
+import { Bonjour } from "bonjour-service";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const _pkgPath = join(dirname(dirname(fileURLToPath(import.meta.url))), "package.json");
+let _pkgVersion = "1.0.0";
+try {
+  const pkg = JSON.parse(readFileSync(_pkgPath, { encoding: "utf8" })) as { version?: string };
+  _pkgVersion = pkg.version ?? "1.0.0";
+} catch {
+  // ignore
+}
 
 // Prevent process crashes from unhandled errors in node-roon-api's WebSocket
 process.on("uncaughtException", (error) => {
@@ -111,10 +125,12 @@ function runControl(action: Control, zoneName: string): Promise<{ ok: true; zone
 
 async function startHttpServer(): Promise<void> {
   const app = express();
+  app.use(express.json());
 
   // Auth on protected endpoints
   app.use("/mcp", authMiddleware);
   app.use("/control", authMiddleware);
+  app.use("/config", authMiddleware);
 
   // Health check (no auth required)
   app.get("/health", (_req, res) => {
@@ -128,10 +144,18 @@ async function startHttpServer(): Promise<void> {
     });
   });
 
-  // Simple REST control endpoints for iOS Shortcuts and similar clients.
+  // roon-key control endpoints (POST /control/volume_ramp, etc.)
+  app.use("/control", createControlRouter());
+
+  // roon-key config endpoints (GET/POST /config/roon-key)
+  app.use("/config", createConfigRouter());
+
+  // Legacy REST control endpoints for iOS Shortcuts and similar clients.
   // GET or POST both work so the iOS "Get Contents of URL" action can call
   // them without configuring a body. The default zone is used unless
   // ?zone=Name is supplied.
+  // Note: this catch-all is registered AFTER the specific roon-key routes
+  // so /control/volume_ramp etc. are handled first.
   app.all("/control/:action", async (req, res) => {
     const raw = String(req.params.action || "").toLowerCase();
     const action = CONTROL_ALIASES[raw];
@@ -190,12 +214,38 @@ async function startHttpServer(): Promise<void> {
     await transport.handleRequest(req, res);
   });
 
-  app.listen(BRIDGE_PORT, BRIDGE_HOST, () => {
+  const httpServer = app.listen(BRIDGE_PORT, BRIDGE_HOST, () => {
     console.error(`[roon-bridge] HTTP MCP server listening on http://${BRIDGE_HOST}:${BRIDGE_PORT}/mcp`);
     if (AUTH_TOKEN) {
       console.error(`[roon-bridge] Auth: Bearer token required`);
     } else {
       console.error(`[roon-bridge] Auth: NONE (set BRIDGE_AUTH_TOKEN for production)`);
+    }
+
+    // Advertise _roon-bridge._tcp.local for roon-key discovery
+    try {
+      const bonjour = new Bonjour();
+      // publish() starts advertisement immediately
+      bonjour.publish({
+        name: "roon-bridge",
+        type: "roon-bridge",
+        port: BRIDGE_PORT,
+        txt: { version: _pkgVersion },
+      });
+      console.error(`[roon-bridge] mDNS: advertising _roon-bridge._tcp.local on port ${BRIDGE_PORT}`);
+
+      // Deregister on process exit
+      const shutdown = () => {
+        bonjour.unpublishAll(() => {
+          bonjour.destroy();
+          httpServer.close();
+          process.exit(0);
+        });
+      };
+      process.on("SIGINT", shutdown);
+      process.on("SIGTERM", shutdown);
+    } catch (e) {
+      console.error(`[roon-bridge] mDNS advertisement failed (non-fatal):`, e);
     }
   });
 }
