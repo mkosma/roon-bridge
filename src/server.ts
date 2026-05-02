@@ -126,6 +126,80 @@ function runControl(action: Control, zoneName: string): Promise<{ ok: true; zone
 async function startHttpServer(): Promise<void> {
   const app = express();
   app.use(express.json());
+  app.use(express.urlencoded({ extended: false }));
+
+  // Short-lived authorization codes: code → { codeChallenge, codeChallengeMethod }
+  const pendingCodes = new Map<string, { codeChallenge?: string; codeChallengeMethod?: string }>();
+
+  // OAuth 2.1 / MCP auth endpoints — minimal implementation for a single-user local server.
+  // Claude Code (and other MCP clients) attempt OAuth when they see a 401. Since this is a
+  // trusted LAN-only service we auto-approve and hand back the static bearer token.
+
+  app.get("/.well-known/oauth-protected-resource", (req, res) => {
+    const base = `${req.protocol}://${req.headers.host}`;
+    res.json({ resource: base, authorization_servers: [base] });
+  });
+
+  app.get("/.well-known/oauth-authorization-server", (req, res) => {
+    const base = `${req.protocol}://${req.headers.host}`;
+    res.json({
+      issuer: base,
+      authorization_endpoint: `${base}/authorize`,
+      token_endpoint: `${base}/token`,
+      registration_endpoint: `${base}/register`,
+      response_types_supported: ["code"],
+      grant_types_supported: ["authorization_code"],
+      code_challenge_methods_supported: ["S256"],
+    });
+  });
+
+  // Dynamic client registration — accept any client, no secrets required
+  app.post("/register", (req, res) => {
+    res.status(201).json({
+      client_id: randomUUID(),
+      client_id_issued_at: Math.floor(Date.now() / 1000),
+      redirect_uris: (req.body as { redirect_uris?: string[] })?.redirect_uris ?? [],
+      grant_types: ["authorization_code"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+    });
+  });
+
+  // Authorization — auto-approve and redirect immediately with a one-time code
+  app.get("/authorize", (req, res) => {
+    const { redirect_uri, state, code_challenge, code_challenge_method } = req.query as Record<string, string>;
+    if (!redirect_uri) {
+      res.status(400).json({ error: "invalid_request", error_description: "Missing redirect_uri" });
+      return;
+    }
+    const code = randomUUID();
+    pendingCodes.set(code, { codeChallenge: code_challenge, codeChallengeMethod: code_challenge_method });
+    // Expire codes after 5 minutes
+    setTimeout(() => pendingCodes.delete(code), 5 * 60 * 1000);
+    const dest = new URL(redirect_uri);
+    dest.searchParams.set("code", code);
+    if (state) dest.searchParams.set("state", state);
+    res.redirect(dest.toString());
+  });
+
+  // Token exchange — return the static bearer token (or generate one if unconfigured)
+  app.post("/token", (req, res) => {
+    const body = req.body as Record<string, string>;
+    if (body.grant_type !== "authorization_code") {
+      res.status(400).json({ error: "unsupported_grant_type" });
+      return;
+    }
+    if (!body.code || !pendingCodes.has(body.code)) {
+      res.status(400).json({ error: "invalid_grant" });
+      return;
+    }
+    pendingCodes.delete(body.code);
+    res.json({
+      access_token: AUTH_TOKEN ?? randomUUID(),
+      token_type: "bearer",
+      expires_in: 365 * 24 * 3600,
+    });
+  });
 
   // Auth on protected endpoints
   app.use("/mcp", authMiddleware);
