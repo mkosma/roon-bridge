@@ -106,6 +106,67 @@ Same configuration as above, but use the Tailscale IP of your Roon Core machine:
 }
 ```
 
+## Public exposure with OAuth (for ChatGPT)
+
+ChatGPT's MCP connector requires OAuth 2.1; it cannot send a static
+bearer header. Claude Desktop, Claude Code, and iOS Shortcuts all
+work fine with the bearer token described above, but ChatGPT does not.
+
+To support ChatGPT we sit [`mcp-auth-proxy`](https://github.com/sigbit/mcp-auth-proxy)
+in front of `roon-bridge` on the same machine, fronted by a Cloudflare
+Tunnel. The proxy terminates OAuth (Google OIDC, single-email allowlist)
+and forwards authenticated requests to `roon-bridge` with the static
+bearer token injected. The `/control/*` and `/health` paths bypass the
+proxy entirely so iOS Shortcuts continue to work unchanged.
+
+Layout:
+
+```
+ChatGPT ─┐
+Claude  ─┼─► https://roon.kindredic.app  ──► cloudflared tunnel
+mcp-rem ─┘                                       │
+                                                 ├─► /control/*  ─► roon-bridge :3100  (static bearer)
+                                                 ├─► /health     ─► roon-bridge :3100
+                                                 └─► /*          ─► mcp-auth-proxy :3101  (OAuth)
+                                                                       │ on success, injects bearer
+                                                                       └─► roon-bridge :3100/mcp
+```
+
+Components on the Roon Core machine:
+
+- `cloudflared` LaunchAgent (`launchd/com.cloudflared-roon.plist`) terminates the tunnel
+- `mcp-auth-proxy` LaunchAgent (`launchd/com.mcp-auth-proxy.plist`) handles OAuth on `127.0.0.1:3101`
+- `roon-bridge` LaunchAgent (`launchd/com.roon-bridge.plist`) listens on `127.0.0.1:3100` as before
+
+The proxy is configured via `~/.claude/secrets/roon-oauth.env` (chmod 600)
+with Google client ID/secret, an `mkosma@gmail.com` allowlist, and the
+existing `BRIDGE_AUTH_TOKEN` as `PROXY_BEARER_TOKEN` for upstream
+injection. The plist execs a wrapper script at `~/bin/mcp-auth-proxy-wrapper.sh`
+that sources the env file and runs the binary.
+
+`cloudflared` ingress (`~/.cloudflared/config.yml`) splits traffic by path:
+
+```yaml
+ingress:
+  - hostname: roon.kindredic.app
+    path: ^/(control|health)
+    service: http://localhost:3100
+  - hostname: roon.kindredic.app
+    service: http://localhost:3101
+  - service: http_status:404
+```
+
+### Connecting ChatGPT
+
+Settings → Apps & connectors → Developer mode → Create.
+
+- MCP Server URL: `https://roon.kindredic.app/mcp`
+- Authentication: OAuth
+- Registration method: Dynamic Client Registration (DCR)
+
+Sign in with the allowlisted Google account on first use; ChatGPT
+caches the resulting token.
+
 ## Running as a persistent service
 
 ### Install
