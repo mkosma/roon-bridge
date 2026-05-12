@@ -328,9 +328,13 @@ export function createControlRouter(): Router {
 
       let zoneInfo: {
         display_name: string;
+        state: string | null;
         volume: number | null;
         muted: boolean;
         outputs: Array<{ name: string; volume: number | null; muted: boolean }>;
+        now_playing_title: string | null;
+        now_playing_artist: string | null;
+        now_playing_album: string | null;
       } | null = null;
 
       try {
@@ -349,12 +353,17 @@ export function createControlRouter(): Router {
             : null;
         const volumeOutputs = zone.outputs.filter((o) => o.volume);
         const anyMuted = volumeOutputs.some((o) => o.volume?.is_muted);
+        const np = (zone as { now_playing?: { three_line?: { line1?: string; line2?: string; line3?: string } } }).now_playing;
 
         zoneInfo = {
           display_name: zone.display_name,
+          state: (zone as { state?: string }).state ?? null,
           volume: maxVol,
           muted: anyMuted,
           outputs,
+          now_playing_title: np?.three_line?.line1 ?? null,
+          now_playing_artist: np?.three_line?.line2 ?? null,
+          now_playing_album: np?.three_line?.line3 ?? null,
         };
       } catch {
         // zone not available
