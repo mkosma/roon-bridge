@@ -4,8 +4,12 @@
  * config.json), so the bridge MUST NOT be running concurrently.
  *
  *   launchctl bootout gui/$(id -u)/com.roon-bridge
- *   node scripts/perf-baseline.mjs
+ *   npm run perf:baseline
  *   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.roon-bridge.plist
+ *
+ * Prints a markdown table of best-of-3 timings for 8 representative
+ * library/search calls (Library counts, album/artist listing, paging
+ * variants, artist drill-in, and two searches).
  */
 
 import RoonApi from "node-roon-api";

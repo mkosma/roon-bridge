@@ -13,7 +13,9 @@
     "start": "node build/server.js",
     "dev": "tsc --watch & node --watch build/server.js",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "perf:baseline": "node scripts/perf-baseline.mjs",
+    "perf:probe": "node scripts/perf-probe.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",

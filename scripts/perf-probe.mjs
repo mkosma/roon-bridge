@@ -1,5 +1,21 @@
 #!/usr/bin/env node
-// Quick probe: print what's at the root of the "browse" hierarchy.
+/**
+ * Quick exploratory probe of the Roon browse tree. Pairs as the same
+ * extension as roon-bridge (com.roon-bridge.claude) and reuses
+ * config.json, so the bridge MUST NOT be running concurrently.
+ *
+ * Dumps:
+ *   - root of the "browse" hierarchy
+ *   - the "Library" section (if present)
+ *   - direct "albums" hierarchy root
+ *   - direct "artists" hierarchy root
+ *
+ * Usage (run on the Roon Core host):
+ *
+ *   launchctl bootout gui/$(id -u)/com.roon-bridge
+ *   npm run perf:probe
+ *   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.roon-bridge.plist
+ */
 import RoonApi from "node-roon-api";
 import RoonApiBrowse from "node-roon-api-browse";
 import RoonApiTransport from "node-roon-api-transport";

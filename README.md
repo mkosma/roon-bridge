@@ -226,6 +226,32 @@ Returns:
 }
 ```
 
+## Perf scripts
+
+Two standalone scripts in `scripts/` benchmark and explore the Roon
+browse API. Both pair as the same extension as the bridge and reuse
+`config.json`, so **the bridge must be stopped before running them**.
+
+```bash
+# Stop the bridge
+launchctl bootout gui/$(id -u)/com.roon-bridge
+
+# Benchmark: best-of-3 timings for 8 library/search calls,
+# printed as a markdown table
+npm run perf:baseline
+
+# Probe: dump the root of the browse hierarchy + Library section,
+# plus direct albums/artists roots. Useful for spotting structural
+# changes in the Roon API.
+npm run perf:probe
+
+# Restart the bridge
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.roon-bridge.plist
+```
+
+Override the Roon Core address with `ROON_HOST` / `ROON_PORT` env vars
+(defaults: `127.0.0.1:9330`).
+
 ## Credits
 
 - [AzureStackNerd/roon-mcp](https://github.com/AzureStackNerd/roon-mcp) — the original MCP server for Roon that this project is based on. Tool definitions, Roon API integration patterns, and the WebSocket patch are adapted from that project (MIT license).
