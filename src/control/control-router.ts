@@ -13,6 +13,7 @@ import { Router } from "express";
 import type { Request, Response } from "express";
 import { exec } from "node:child_process";
 import { roonConnection } from "../roon-connection.js";
+import type { Zone } from "node-roon-api-transport";
 import { VolumeRamper } from "./volume-ramper.js";
 import {
   readRoonKeyConfig,
@@ -40,6 +41,55 @@ function getActiveZoneOrThrow() {
   const zone = getActiveZone();
   if (!zone) throw new Error("no_zone");
   return zone;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: build the zone snapshot used by both /control/status and
+// the SSE /control/events stream. Returns null if no active zone.
+// ---------------------------------------------------------------------------
+
+interface ZoneSnapshot {
+  display_name: string;
+  state: string | null;
+  volume: number | null;
+  muted: boolean;
+  outputs: Array<{ name: string; volume: number | null; muted: boolean }>;
+  now_playing_title: string | null;
+  now_playing_artist: string | null;
+  now_playing_album: string | null;
+}
+
+function buildZoneSnapshot(zone: Zone): ZoneSnapshot {
+  const outputs = zone.outputs.map((o) => ({
+    name: o.display_name,
+    volume: o.volume?.value ?? null,
+    muted: o.volume?.is_muted ?? false,
+  }));
+  const numericOutputs = zone.outputs.filter(
+    (o) => o.volume && (o.volume.type === "number" || o.volume.type === "db"),
+  );
+  const maxVol =
+    numericOutputs.length > 0
+      ? Math.max(...numericOutputs.map((o) => o.volume!.value ?? 0))
+      : null;
+  const volumeOutputs = zone.outputs.filter((o) => o.volume);
+  const anyMuted = volumeOutputs.some((o) => o.volume?.is_muted);
+  const np = (zone as { now_playing?: { three_line?: { line1?: string; line2?: string; line3?: string } } }).now_playing;
+  return {
+    display_name: zone.display_name,
+    state: (zone as { state?: string }).state ?? null,
+    volume: maxVol,
+    muted: anyMuted,
+    outputs,
+    now_playing_title: np?.three_line?.line1 ?? null,
+    now_playing_artist: np?.three_line?.line2 ?? null,
+    now_playing_album: np?.three_line?.line3 ?? null,
+  };
+}
+
+function getActiveZoneSnapshot(): ZoneSnapshot | null {
+  const zone = getActiveZone();
+  return zone ? buildZoneSnapshot(zone) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -328,49 +378,7 @@ export function createControlRouter(): Router {
     asyncRoute(async (_req, res) => {
       const roonConnected = roonConnection.isConnected();
       const cfg = readRoonKeyConfig();
-
-      let zoneInfo: {
-        display_name: string;
-        state: string | null;
-        volume: number | null;
-        muted: boolean;
-        outputs: Array<{ name: string; volume: number | null; muted: boolean }>;
-        now_playing_title: string | null;
-        now_playing_artist: string | null;
-        now_playing_album: string | null;
-      } | null = null;
-
-      try {
-        const zone = getActiveZoneOrThrow();
-        const outputs = zone.outputs.map((o) => ({
-          name: o.display_name,
-          volume: o.volume?.value ?? null,
-          muted: o.volume?.is_muted ?? false,
-        }));
-        const numericOutputs = zone.outputs.filter(
-          (o) => o.volume && (o.volume.type === "number" || o.volume.type === "db"),
-        );
-        const maxVol =
-          numericOutputs.length > 0
-            ? Math.max(...numericOutputs.map((o) => o.volume!.value ?? 0))
-            : null;
-        const volumeOutputs = zone.outputs.filter((o) => o.volume);
-        const anyMuted = volumeOutputs.some((o) => o.volume?.is_muted);
-        const np = (zone as { now_playing?: { three_line?: { line1?: string; line2?: string; line3?: string } } }).now_playing;
-
-        zoneInfo = {
-          display_name: zone.display_name,
-          state: (zone as { state?: string }).state ?? null,
-          volume: maxVol,
-          muted: anyMuted,
-          outputs,
-          now_playing_title: np?.three_line?.line1 ?? null,
-          now_playing_artist: np?.three_line?.line2 ?? null,
-          now_playing_album: np?.three_line?.line3 ?? null,
-        };
-      } catch {
-        // zone not available
-      }
+      const zoneInfo = getActiveZoneSnapshot();
 
       res.json({
         ok: true,
@@ -385,6 +393,51 @@ export function createControlRouter(): Router {
       });
     }),
   );
+
+  // -------------------------------------------------------------------------
+  // GET /control/events
+  // SSE stream of the active zone snapshot. Emits on every zones-changed
+  // from Roon Core (~2.5Hz upper bound, set by Roon's extension API), plus
+  // an initial snapshot on connect and a keep-alive comment every 25s.
+  // -------------------------------------------------------------------------
+  router.get("/events", (req, res) => {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders?.();
+
+    let lastPayload = "";
+    const send = (event: string, data: unknown) => {
+      const json = JSON.stringify(data);
+      if (event === "zone" && json === lastPayload) return;
+      if (event === "zone") lastPayload = json;
+      res.write(`event: ${event}\ndata: ${json}\n\n`);
+    };
+
+    // Initial snapshot
+    send("zone", {
+      roon_connected: roonConnection.isConnected(),
+      zone: getActiveZoneSnapshot(),
+    });
+
+    const onChange = () => {
+      send("zone", {
+        roon_connected: roonConnection.isConnected(),
+        zone: getActiveZoneSnapshot(),
+      });
+    };
+    roonConnection.on("zones-changed", onChange);
+
+    const keepAlive = setInterval(() => {
+      res.write(`: keep-alive\n\n`);
+    }, 25000);
+
+    req.on("close", () => {
+      clearInterval(keepAlive);
+      roonConnection.off("zones-changed", onChange);
+    });
+  });
 
   // -------------------------------------------------------------------------
   // POST /control/open_roon_app
