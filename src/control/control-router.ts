@@ -102,8 +102,11 @@ export function createConfigRouter(): Router {
  */
 export function createControlRouter(): Router {
   const router = Router();
+  const debug = process.env.BRIDGE_DEBUG === "1";
   router.use((req, _res, next) => {
-    // Keep ramper rampStepMs in sync with config
+    if (debug) {
+      console.error(`[control] ${req.method} ${req.path} body=${JSON.stringify(req.body)}`);
+    }
     try {
       const cfg = readRoonKeyConfig();
       ramper.setRampStepMs(cfg.ramp_step_ms);
