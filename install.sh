@@ -34,10 +34,11 @@ npm run build
 PLIST_SRC="$SCRIPT_DIR/launchd/com.roon-bridge.plist"
 PLIST_DEST="$HOME/Library/LaunchAgents/com.roon-bridge.plist"
 
-# Update node path in source plist
-sed "s|/opt/homebrew/bin/node|$NODE_PATH|" "$PLIST_SRC" > /tmp/com.roon-bridge.plist.tmp
+# Stage the plist for path rewriting
+cp "$PLIST_SRC" /tmp/com.roon-bridge.plist.tmp
 
-# Update project path
+# Update project path (the wrapper script itself uses /opt/homebrew/bin/{node,npm}
+# directly, so node path no longer flows through the plist)
 sed -i '' "s|/Users/monty/dev/roon-bridge|$SCRIPT_DIR|g" /tmp/com.roon-bridge.plist.tmp
 
 # Update log path
