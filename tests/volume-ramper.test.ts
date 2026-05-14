@@ -91,8 +91,8 @@ function makeMockTransport(error: false | string = false) {
 // Tests: rampDelta
 // ---------------------------------------------------------------------------
 
-describe("VolumeRamper.rampDelta", () => {
-  it("applies correct number of +1 steps for positive delta", async () => {
+describe("VolumeRamper.rampDelta (numeric outputs: pipelined absolute)", () => {
+  it("applies correct sequence of absolute steps for positive delta", async () => {
     const ramper = new VolumeRamper(0); // 0ms delay for speed
     const output = makeOutput("WiiM", 50);
     const zone = makeZone([output]);
@@ -101,13 +101,11 @@ describe("VolumeRamper.rampDelta", () => {
     await ramper.rampDelta(4, () => zone, transport);
 
     expect(transport.volumeCalls).toHaveLength(4);
-    transport.volumeCalls.forEach((c) => {
-      expect(c.how).toBe("relative");
-      expect(c.value).toBe(1);
-    });
+    expect(transport.volumeCalls.map((c) => c.value)).toEqual([51, 52, 53, 54]);
+    transport.volumeCalls.forEach((c) => expect(c.how).toBe("absolute"));
   });
 
-  it("applies correct number of -1 steps for negative delta", async () => {
+  it("applies correct sequence of absolute steps for negative delta", async () => {
     const ramper = new VolumeRamper(0);
     const output = makeOutput("WiiM", 50);
     const zone = makeZone([output]);
@@ -116,37 +114,27 @@ describe("VolumeRamper.rampDelta", () => {
     await ramper.rampDelta(-3, () => zone, transport);
 
     expect(transport.volumeCalls).toHaveLength(3);
-    transport.volumeCalls.forEach((c) => {
-      expect(c.value).toBe(-1);
-    });
+    expect(transport.volumeCalls.map((c) => c.value)).toEqual([49, 48, 47]);
+    transport.volumeCalls.forEach((c) => expect(c.how).toBe("absolute"));
   });
 
-  it("applies delta to ALL outputs in a grouped zone", async () => {
+  it("applies the same absolute target to all outputs in a grouped zone", async () => {
     const ramper = new VolumeRamper(0);
     const out1 = makeOutput("WiiM", 50);
     const out2 = makeOutput("KEF", 44);
     const zone = makeZone([out1, out2]);
     const transport = makeMockTransport();
 
+    // Max is 50, +2 => step targets 51, 52, each fired to both outputs
     await ramper.rampDelta(2, () => zone, transport);
 
-    // 2 steps * 2 outputs = 4 calls
     expect(transport.volumeCalls).toHaveLength(4);
-  });
-
-  it("preserves group differential (each output gets same relative change)", async () => {
-    const ramper = new VolumeRamper(0);
-    const out1 = makeOutput("WiiM", 50);
-    const out2 = makeOutput("KEF", 44);
-    const zone = makeZone([out1, out2]);
-    const transport = makeMockTransport();
-
-    await ramper.rampDelta(2, () => zone, transport);
-
-    // All calls should be relative +1 or -1 (not absolute)
-    transport.volumeCalls.forEach((c) => {
-      expect(c.how).toBe("relative");
-    });
+    transport.volumeCalls.forEach((c) => expect(c.how).toBe("absolute"));
+    // Both outputs converge: step 1 targets 51 for both, step 2 targets 52 for both
+    const byOutput = (name: string) =>
+      transport.volumeCalls.filter((c) => c.output.display_name === name).map((c) => c.value);
+    expect(byOutput("WiiM")).toEqual([51, 52]);
+    expect(byOutput("KEF")).toEqual([51, 52]);
   });
 
   it("does nothing for delta = 0", async () => {
@@ -208,14 +196,15 @@ describe("VolumeRamper.rampAbsolute", () => {
     const zone = makeZone([out1, out2]);
     const transport = makeMockTransport();
 
-    // Max is 60, target is 64 => delta = 4
+    // Max is 60, target 64 => 4 absolute steps (61..64) per output
     await ramper.rampAbsolute(64, () => zone, transport);
 
-    // 4 steps * 2 outputs = 8 calls, all +1
     expect(transport.volumeCalls).toHaveLength(8);
-    transport.volumeCalls.forEach((c) => {
-      expect(c.value).toBe(1);
-    });
+    transport.volumeCalls.forEach((c) => expect(c.how).toBe("absolute"));
+    const wiimVals = transport.volumeCalls
+      .filter((c) => c.output.display_name === "WiiM")
+      .map((c) => c.value);
+    expect(wiimVals).toEqual([61, 62, 63, 64]);
   });
 
   it("ramps down from current max to target", async () => {
@@ -223,13 +212,12 @@ describe("VolumeRamper.rampAbsolute", () => {
     const zone = makeZone([makeOutput("WiiM", 70)]);
     const transport = makeMockTransport();
 
-    // Max is 70, target is 64 => delta = -6
+    // Max is 70, target 64 => 6 absolute steps (69..64)
     await ramper.rampAbsolute(64, () => zone, transport);
 
     expect(transport.volumeCalls).toHaveLength(6);
-    transport.volumeCalls.forEach((c) => {
-      expect(c.value).toBe(-1);
-    });
+    transport.volumeCalls.forEach((c) => expect(c.how).toBe("absolute"));
+    expect(transport.volumeCalls.map((c) => c.value)).toEqual([69, 68, 67, 66, 65, 64]);
   });
 
   it("cancels prior ramp before starting new absolute ramp", async () => {
