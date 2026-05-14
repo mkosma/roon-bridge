@@ -6,6 +6,12 @@
 set -e
 cd "$(dirname "$0")/.."
 
+# launchd's default PATH (/usr/bin:/bin:/usr/sbin:/sbin) doesn't include
+# Homebrew, so tsc's `#!/usr/bin/env node` shebang fails to resolve node
+# during the rebuild step. Prepend /opt/homebrew/bin so npm + tsc + node
+# all find each other.
+export PATH="/opt/homebrew/bin:$PATH"
+
 NPM=/opt/homebrew/bin/npm
 NODE=/opt/homebrew/bin/node
 
