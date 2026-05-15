@@ -185,9 +185,12 @@ async function startHttpServer(): Promise<void> {
       return;
     }
 
-    // For GET/DELETE without a valid session, reject
+    // GET/DELETE without a valid session: per MCP Streamable HTTP spec,
+    // return 405 so clients (mcp-remote / SDK) silently back off rather
+    // than crashing on a 400. The standalone SSE listening stream is
+    // optional; we only support it for sessions established via POST.
     if (req.method === "GET" || req.method === "DELETE") {
-      res.status(400).json({ error: "Invalid or missing session ID" });
+      res.status(405).json({ error: "Method Not Allowed without session" });
       return;
     }
 
