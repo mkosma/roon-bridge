@@ -64,8 +64,18 @@ export class VolumeRamper {
 
   /**
    * Smooth ramp by a relative delta (positive = up, negative = down).
-   * Steps 1 unit at a time, awaiting rampStepMs between each step.
-   * Cancels if a new ramp starts (generation changes).
+   * Steps 1 unit at a time at rampStepMs cadence.
+   *
+   * For zones whose outputs all have numeric volume (type "number" or "db"),
+   * the steps are absolute values, fire-and-forget: each step sends
+   * `change_volume(output, "absolute", N)` without awaiting the callback,
+   * paced by rampStepMs. This pipelines the ramp so cadence matches the
+   * configured value instead of being bottlenecked by Roon API round-trip,
+   * and makes dropped/coalesced steps self-correcting (the next absolute
+   * target supersedes any lost prior step).
+   *
+   * For zones with incremental-only outputs, falls back to the older
+   * serialized-relative path. Cancellable via generation counter.
    */
   async rampDelta(
     delta: number,
@@ -76,19 +86,39 @@ export class VolumeRamper {
     this.generation++;
     const captured = this.generation;
 
+    const zone = getZone();
+    if (!zone) return;
+
+    const allVolume = getVolumeOutputs(zone);
+    if (allVolume.length === 0) return;
+
+    const numeric = getNumericVolumeOutputs(zone);
     const steps = Math.abs(delta);
     const direction = delta > 0 ? 1 : -1;
 
+    if (numeric.length === allVolume.length) {
+      const startVol = Math.max(...numeric.map((o) => o.volume!.value ?? 0));
+      for (let i = 1; i <= steps; i++) {
+        if (this.generation !== captured) return;
+        const target = startVol + direction * i;
+        for (const output of numeric) {
+          transport.change_volume(output, "absolute", target, (err) => {
+            if (err) console.error("[VolumeRamper] step failed:", err);
+          });
+        }
+        if (i < steps) await delay(this.rampStepMs);
+      }
+      return;
+    }
+
+    // Fallback: incremental-only outputs can't take absolute values.
+    // Serialized relative path; slower (RTT-bound) but works everywhere.
     for (let i = 0; i < steps; i++) {
       if (this.generation !== captured) return;
-
-      const zone = getZone();
-      if (!zone) return;
-
-      const outputs = getVolumeOutputs(zone);
+      const currentZone = getZone();
+      if (!currentZone) return;
+      const outputs = getVolumeOutputs(currentZone);
       if (outputs.length === 0) return;
-
-      // Apply 1-unit relative step to all outputs in parallel
       await Promise.all(
         outputs.map((output) =>
           promisifyResult((cb) =>
@@ -96,10 +126,7 @@ export class VolumeRamper {
           ),
         ),
       );
-
-      if (i < steps - 1) {
-        await delay(this.rampStepMs);
-      }
+      if (i < steps - 1) await delay(this.rampStepMs);
     }
   }
 

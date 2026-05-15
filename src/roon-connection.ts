@@ -7,6 +7,7 @@ import type { Zone } from "node-roon-api-transport";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { EventEmitter } from "node:events";
 
 const ROON_HOST = process.env.ROON_HOST || "192.168.1.100";
 const ROON_PORT = (() => {
@@ -50,7 +51,7 @@ function savePersistedState(state: Record<string, unknown>): void {
   saveConfig({ roonstate: state });
 }
 
-export class RoonConnection {
+export class RoonConnection extends EventEmitter {
   private roon: RoonApi;
   private status: RoonApiStatus;
   private core: RoonCore | null = null;
@@ -58,6 +59,11 @@ export class RoonConnection {
   private defaultZone: string = "";
 
   constructor() {
+    super();
+    // Listeners are added per SSE client; raise the cap a little so node's
+    // default warning at 10 doesn't fire under modest fan-out.
+    this.setMaxListeners(64);
+
     // Load persisted default zone at startup
     this.defaultZone = (loadConfig().defaultZone as string) || "";
     if (this.defaultZone) {
@@ -124,6 +130,7 @@ export class RoonConnection {
     if (!transport) return;
 
     transport.subscribe_zones((response, msg) => {
+      let changed = false;
       if (response === "Subscribed" && msg.zones) {
         this.zones.clear();
         for (const zone of msg.zones) {
@@ -131,21 +138,25 @@ export class RoonConnection {
         }
         console.error(`[roon-bridge] Subscribed to ${this.zones.size} zone(s)`);
         this.status.set_status("Connected", false);
+        changed = true;
       } else if (response === "Changed") {
         if (msg.zones_removed) {
           for (const id of msg.zones_removed) {
             this.zones.delete(id);
           }
+          changed = true;
         }
         if (msg.zones_added) {
           for (const zone of msg.zones_added) {
             this.zones.set(zone.zone_id, zone);
           }
+          changed = true;
         }
         if (msg.zones_changed) {
           for (const zone of msg.zones_changed) {
             this.zones.set(zone.zone_id, zone);
           }
+          changed = true;
         }
         if (msg.zones_seek_changed) {
           for (const update of msg.zones_seek_changed) {
@@ -157,8 +168,11 @@ export class RoonConnection {
               zone.queue_time_remaining = update.queue_time_remaining;
             }
           }
+          // Seek-only updates fire frequently (~1Hz per playing zone) and
+          // don't affect state SSE consumers care about. Don't emit.
         }
       }
+      if (changed) this.emit("zones-changed");
     });
   }
 
