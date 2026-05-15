@@ -185,12 +185,27 @@ async function startHttpServer(): Promise<void> {
       return;
     }
 
-    // GET/DELETE without a valid session: per MCP Streamable HTTP spec,
-    // return 405 so clients (mcp-remote / SDK) silently back off rather
-    // than crashing on a 400. The standalone SSE listening stream is
-    // optional; we only support it for sessions established via POST.
-    if (req.method === "GET" || req.method === "DELETE") {
+    // DELETE without a valid session: nothing to terminate.
+    if (req.method === "DELETE") {
       res.status(405).json({ error: "Method Not Allowed without session" });
+      return;
+    }
+    // GET without a session: open an empty SSE stream and hold it open.
+    // mcp-remote 0.1.38's StreamableHTTP client calls transport.start()
+    // which opens this stream before initialize; if it gets a non-200
+    // it treats the whole transport as broken and falls back to sse-only.
+    // We have no messages to push pre-session, so we keep the stream
+    // idle until the client closes it (which it does after initialize
+    // and reopens with a real session ID).
+    if (req.method === "GET") {
+      res.status(200);
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.flushHeaders();
+      req.on("close", () => {
+        res.end();
+      });
       return;
     }
 
