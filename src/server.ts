@@ -181,7 +181,7 @@ async function startHttpServer(): Promise<void> {
     // If we have an existing session, route to it
     if (sessionId && sessions.has(sessionId)) {
       const session = sessions.get(sessionId)!;
-      await session.transport.handleRequest(req, res);
+      await session.transport.handleRequest(req, res, req.body);
       return;
     }
 
@@ -211,7 +211,7 @@ async function startHttpServer(): Promise<void> {
 
     const server = createMcpServer();
     await server.connect(transport);
-    await transport.handleRequest(req, res);
+    await transport.handleRequest(req, res, req.body);
   });
 
   const httpServer = app.listen(BRIDGE_PORT, BRIDGE_HOST, () => {
