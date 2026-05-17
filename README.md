@@ -42,8 +42,32 @@ Environment variables (set in `.env`, shell, or the launchd plist):
 | `BRIDGE_PORT` | `3100` | HTTP server port |
 | `BRIDGE_HOST` | `0.0.0.0` | HTTP bind address |
 | `BRIDGE_AUTH_TOKEN` | *(none)* | Bearer token for auth (recommended) |
+| `MUSIC_PROVIDERS` | `qobuz` | Comma list of enabled playlist providers (`qobuz`, `tidal`) |
+| `MUSIC_PROVIDER_DEFAULT` | first enabled | Default provider when a tool omits `provider` |
+| `PLAYLIST_TOOLS` | *(on)* | Set `0` to omit the playlist tools entirely |
+| `QOBUZ_AUTO_REFRESH` | *(off)* | Set `1` to let the bridge subprocess-run the external Qobuz refresher on token expiry |
 
 If Roon Core runs on the same machine, use `ROON_HOST=127.0.0.1`.
+
+### Playlist provider tools
+
+roon-bridge exposes provider-neutral playlist tools (`search_tracks`,
+`list_playlists`, `get_playlist`, `create_playlist`,
+`add_tracks_to_playlist`, `remove_tracks_from_playlist`, `rename_playlist`,
+`delete_playlist`). Each takes an optional `provider` argument; omit it for
+`MUSIC_PROVIDER_DEFAULT`. `delete_playlist` requires `confirm: true`.
+
+Qobuz is the only implemented provider. App credentials are extracted
+browser-free from the Qobuz web bundle. The user token is read from
+`~/.qobuz-mcp/token.json`, which is produced by the **standalone**
+`refresh_token.py` (Playwright + one-time reCAPTCHA login) in the
+`qobuz-mcp` repo — that script is intentionally **not** a dependency of
+roon-bridge. On token expiry the tools return an actionable error telling
+you to run it; `QOBUZ_AUTO_REFRESH=1` opts into auto-invoking it.
+
+Adding Tidal (or another service) is implementing one interface — see
+`src/providers/tidal/README.md`. The standalone `qobuz-mcp` MCP server is
+now redundant for playlists; keep only its `refresh_token.py`.
 
 ### Generate an auth token
 
