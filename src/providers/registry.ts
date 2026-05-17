@@ -107,6 +107,10 @@ export class ProviderRegistry {
   get defaultName(): ProviderName {
     return this.config.default;
   }
+
+  get enabledNames(): ProviderName[] {
+    return [...this.config.enabled];
+  }
 }
 
 let _registry: ProviderRegistry | null = null;

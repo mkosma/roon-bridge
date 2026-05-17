@@ -20,6 +20,7 @@ import { registerZoneTools } from "./tools/zone.js";
 import { registerPlaybackTools } from "./tools/playback.js";
 import { registerVolumeTools } from "./tools/volume.js";
 import { registerBrowseTools } from "./tools/browse.js";
+import { registerPlaylistTools } from "./tools/playlist.js";
 import { createControlRouter, createConfigRouter } from "./control/control-router.js";
 import express from "express";
 import { randomUUID } from "node:crypto";
@@ -65,6 +66,7 @@ function createMcpServer(): McpServer {
   registerPlaybackTools(server);
   registerVolumeTools(server);
   registerBrowseTools(server);
+  registerPlaylistTools(server);
 
   return server;
 }
