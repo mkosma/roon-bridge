@@ -46,6 +46,10 @@ export interface MusicProvider {
   ): Promise<ProviderPlaylist>;
   addTracks(playlistId: string, trackIds: string[]): Promise<void>;
   removeTracks(playlistId: string, trackIds: string[]): Promise<void>;
+  /** Move tracks already in the playlist to a 0-based target index. */
+  moveTracks(playlistId: string, trackIds: string[], toIndex: number): Promise<void>;
+  /** Append the given tracks, then move them to a 0-based target index. */
+  insertTracksAt(playlistId: string, trackIds: string[], atIndex: number): Promise<void>;
   renamePlaylist(playlistId: string, name: string): Promise<void>;
   deletePlaylist(playlistId: string): Promise<void>;
 }

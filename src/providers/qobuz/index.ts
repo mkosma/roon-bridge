@@ -149,24 +149,46 @@ export class QobuzProvider implements MusicProvider {
     });
   }
 
-  async removeTracks(playlistId: string, trackIds: string[]): Promise<void> {
-    if (trackIds.length === 0) return;
+  /** Page through every track row (Qobuz caps a page at 500). */
+  private async fetchAllItems(playlistId: string): Promise<QobuzTrack[]> {
     const api = await this.api();
-    // Qobuz deleteTracks works on per-playlist position ids, not track ids,
-    // so resolve them from the current playlist contents.
-    const raw = await api.request("GET", "playlist/get", {
-      playlist_id: playlistId,
-      limit: 500,
-      offset: 0,
-      extra: "tracks",
-    });
-    const items = ((raw.tracks as { items?: QobuzTrack[] })?.items) ?? [];
+    const pageSize = 500;
+    const out: QobuzTrack[] = [];
+    let offset = 0;
+    for (;;) {
+      const raw = await api.request("GET", "playlist/get", {
+        playlist_id: playlistId,
+        limit: pageSize,
+        offset,
+        extra: "tracks",
+      });
+      const t = raw.tracks as { items?: QobuzTrack[]; total?: number } | undefined;
+      const items = t?.items ?? [];
+      out.push(...items);
+      const total = t?.total ?? out.length;
+      offset += items.length;
+      if (items.length === 0 || offset >= total) break;
+    }
+    return out;
+  }
+
+  /** playlist_track_id for each requested catalog id, in playlist order. */
+  private positionIdsFor(items: QobuzTrack[], trackIds: string[]): string[] {
     const wanted = new Set(trackIds.map(String));
-    const positionIds = items
+    return items
       .filter((t) => wanted.has(String(t.id ?? "")))
       .map((t) => t.playlist_track_id)
       .filter((v): v is number | string => v !== undefined)
       .map(String);
+  }
+
+  async removeTracks(playlistId: string, trackIds: string[]): Promise<void> {
+    if (trackIds.length === 0) return;
+    const api = await this.api();
+    // deleteTracks works on per-playlist row ids, not catalog ids — resolve
+    // them from the full (paged) playlist so big playlists work too.
+    const items = await this.fetchAllItems(playlistId);
+    const positionIds = this.positionIdsFor(items, trackIds);
     if (positionIds.length === 0) {
       throw new ProviderError(
         "not_found",
@@ -177,6 +199,66 @@ export class QobuzProvider implements MusicProvider {
     await api.request("POST", "playlist/deleteTracks", {
       playlist_id: playlistId,
       playlist_track_ids: positionIds.join(","),
+    });
+  }
+
+  /**
+   * NOTE: Qobuz's playlist/updateTracksPosition `insert_before` is not a
+   * clean target index — probing shows its effective landing position
+   * shifts with move direction (it appears to operate on an internal
+   * post-removal representation). Treat toIndex as "near here", not exact.
+   * Verified good enough for restore/relocate; not for pixel-precise order.
+   */
+  async moveTracks(
+    playlistId: string,
+    trackIds: string[],
+    toIndex: number,
+  ): Promise<void> {
+    if (trackIds.length === 0) return;
+    const api = await this.api();
+    const items = await this.fetchAllItems(playlistId);
+    const positionIds = this.positionIdsFor(items, trackIds);
+    if (positionIds.length === 0) {
+      throw new ProviderError(
+        "not_found",
+        `None of the given tracks are in playlist ${playlistId}`,
+        "qobuz",
+      );
+    }
+    const idx = Math.max(0, Math.min(toIndex, items.length - 1));
+    await api.request("POST", "playlist/updateTracksPosition", {
+      playlist_id: playlistId,
+      playlist_track_ids: positionIds.join(","),
+      insert_before: idx,
+    });
+  }
+
+  async insertTracksAt(
+    playlistId: string,
+    trackIds: string[],
+    atIndex: number,
+  ): Promise<void> {
+    if (trackIds.length === 0) return;
+    const api = await this.api();
+    // Qobuz addTracks is append-only, so append then move the new rows.
+    const before = await this.fetchAllItems(playlistId);
+    await api.request("POST", "playlist/addTracks", {
+      playlist_id: playlistId,
+      track_ids: trackIds.join(","),
+    });
+    const after = await this.fetchAllItems(playlistId);
+    // New rows are the appended tail beyond the prior length.
+    const appended = after.slice(before.length);
+    const newPositionIds = appended
+      .map((t) => t.playlist_track_id)
+      .filter((v): v is number | string => v !== undefined)
+      .map(String);
+    if (newPositionIds.length === 0) return;
+    const idx = Math.max(0, Math.min(atIndex, after.length - 1));
+    await api.request("POST", "playlist/updateTracksPosition", {
+      playlist_id: playlistId,
+      playlist_track_ids: newPositionIds.join(","),
+      insert_before: idx,
     });
   }
 

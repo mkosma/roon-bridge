@@ -41,6 +41,12 @@ export class TidalProvider implements MusicProvider {
   async removeTracks(): Promise<void> {
     notImplemented("removeTracks");
   }
+  async moveTracks(): Promise<void> {
+    notImplemented("moveTracks");
+  }
+  async insertTracksAt(): Promise<void> {
+    notImplemented("insertTracksAt");
+  }
   async renamePlaylist(): Promise<void> {
     notImplemented("renamePlaylist");
   }

@@ -188,6 +188,56 @@ export function registerPlaylistTools(server: McpServer): void {
   );
 
   server.tool(
+    "reorder_playlist_tracks",
+    "Move tracks already in a playlist to a new 0-based position (to_index).",
+    {
+      playlist_id: z.string().describe("Provider playlist ID"),
+      track_ids: z.array(z.string()).min(1).describe("Track IDs to move (must already be in the playlist)"),
+      to_index: z
+        .number()
+        .int()
+        .min(0)
+        .describe("0-based index the tracks should land at"),
+      provider: providerArg,
+    },
+    async ({ playlist_id, track_ids, to_index, provider }) => {
+      try {
+        await resolve(provider).moveTracks(playlist_id, track_ids, to_index);
+        return ok(
+          `Moved ${track_ids.length} track(s) to index ${to_index} in playlist ${playlist_id}.`,
+        );
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+
+  server.tool(
+    "insert_tracks_at",
+    "Add tracks to a playlist at a specific 0-based position (append then move).",
+    {
+      playlist_id: z.string().describe("Provider playlist ID"),
+      track_ids: z.array(z.string()).min(1).describe("Track IDs to insert"),
+      at_index: z
+        .number()
+        .int()
+        .min(0)
+        .describe("0-based index where the inserted tracks should land"),
+      provider: providerArg,
+    },
+    async ({ playlist_id, track_ids, at_index, provider }) => {
+      try {
+        await resolve(provider).insertTracksAt(playlist_id, track_ids, at_index);
+        return ok(
+          `Inserted ${track_ids.length} track(s) at index ${at_index} in playlist ${playlist_id}.`,
+        );
+      } catch (e) {
+        return err(e);
+      }
+    },
+  );
+
+  server.tool(
     "delete_playlist",
     "Delete a playlist. IRREVERSIBLE — requires confirm: true.",
     {
