@@ -6,6 +6,7 @@
 
 import { getRegistry, type ProviderRegistry } from "./registry.js";
 import { QobuzProvider } from "./qobuz/index.js";
+import { TidalProvider } from "./tidal/index.js";
 
 let done = false;
 
@@ -17,7 +18,9 @@ export function initProviders(): ProviderRegistry {
   if (reg.enabledNames.includes("qobuz") && !reg.has("qobuz")) {
     reg.register(new QobuzProvider());
   }
-  // Tidal: when an adapter exists, register it here under the same guard.
+  if (reg.enabledNames.includes("tidal") && !reg.has("tidal")) {
+    reg.register(new TidalProvider());
+  }
 
   done = true;
   return reg;
