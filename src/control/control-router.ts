@@ -73,13 +73,17 @@ function buildZoneSnapshot(zone: Zone): ZoneSnapshot {
       ? Math.max(...numericOutputs.map((o) => o.volume!.value ?? 0))
       : null;
   const volumeOutputs = zone.outputs.filter((o) => o.volume);
-  const anyMuted = volumeOutputs.some((o) => o.volume?.is_muted);
+  // Zone counts as muted only when EVERY volume output is muted. A single
+  // member that hit its volume floor and auto-muted must not black out the
+  // whole group status while other members keep playing.
+  const allMuted =
+    volumeOutputs.length > 0 && volumeOutputs.every((o) => o.volume?.is_muted === true);
   const np = (zone as { now_playing?: { three_line?: { line1?: string; line2?: string; line3?: string } } }).now_playing;
   return {
     display_name: zone.display_name,
     state: (zone as { state?: string }).state ?? null,
     volume: maxVol,
-    muted: anyMuted,
+    muted: allMuted,
     outputs,
     now_playing_title: np?.three_line?.line1 ?? null,
     now_playing_artist: np?.three_line?.line2 ?? null,
