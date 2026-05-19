@@ -242,7 +242,7 @@ describe("VolumeRamper.rampAbsolute", () => {
 // ---------------------------------------------------------------------------
 
 describe("VolumeRamper.instantDelta", () => {
-  it("makes a single relative call per output", async () => {
+  it("makes a single clamped absolute call per numeric output", async () => {
     const ramper = new VolumeRamper(0);
     const out1 = makeOutput("A", 50);
     const out2 = makeOutput("B", 44);
@@ -252,10 +252,37 @@ describe("VolumeRamper.instantDelta", () => {
     await ramper.instantDelta(8, () => zone, transport);
 
     expect(transport.volumeCalls).toHaveLength(2);
-    transport.volumeCalls.forEach((c) => {
-      expect(c.how).toBe("relative");
-      expect(c.value).toBe(8);
-    });
+    const byName = Object.fromEntries(
+      transport.volumeCalls.map((c) => [c.output.display_name, c]),
+    );
+    expect(byName.A.how).toBe("absolute");
+    expect(byName.A.value).toBe(58);
+    expect(byName.B.how).toBe("absolute");
+    expect(byName.B.value).toBe(52);
+  });
+
+  it("clamps at the floor instead of pushing an output below min", async () => {
+    // Regression: rapid volume-down used to drive the Devialet past its
+    // floor, where it auto-mutes and desyncs the grouped zone.
+    const ramper = new VolumeRamper(0);
+    const zone = makeZone([makeOutput("Muse", 2)]);
+    const transport = makeMockTransport();
+
+    await ramper.instantDelta(-8, () => zone, transport);
+
+    expect(transport.volumeCalls).toHaveLength(1);
+    expect(transport.volumeCalls[0].how).toBe("absolute");
+    expect(transport.volumeCalls[0].value).toBe(0);
+  });
+
+  it("makes no call when already clamped at the floor", async () => {
+    const ramper = new VolumeRamper(0);
+    const zone = makeZone([makeOutput("Muse", 0)]);
+    const transport = makeMockTransport();
+
+    await ramper.instantDelta(-8, () => zone, transport);
+
+    expect(transport.volumeCalls).toHaveLength(0);
   });
 });
 

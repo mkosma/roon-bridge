@@ -44,6 +44,18 @@ function getNumericVolumeOutputs(zone: Zone): Output[] {
   );
 }
 
+/**
+ * Clamp an absolute target to an output's [min, max] range.
+ * Prevents rapid relative steps from driving a device (e.g. the Devialet)
+ * past its volume floor, where it auto-mutes and desyncs the group.
+ */
+function clampToOutput(output: Output, target: number): number {
+  const v = output.volume!;
+  const lo = typeof v.min === "number" ? v.min : 0;
+  const hi = typeof v.max === "number" ? v.max : 100;
+  return Math.min(hi, Math.max(lo, target));
+}
+
 export interface GetZoneFn {
   (): Zone | null;
 }
@@ -100,8 +112,9 @@ export class VolumeRamper {
       const startVol = Math.max(...numeric.map((o) => o.volume!.value ?? 0));
       for (let i = 1; i <= steps; i++) {
         if (this.generation !== captured) return;
-        const target = startVol + direction * i;
+        const rawTarget = startVol + direction * i;
         for (const output of numeric) {
+          const target = clampToOutput(output, rawTarget);
           transport.change_volume(output, "absolute", target, (err) => {
             if (err) console.error("[VolumeRamper] step failed:", err);
           });
@@ -167,11 +180,31 @@ export class VolumeRamper {
     const zone = getZone();
     if (!zone) return;
 
-    const outputs = getVolumeOutputs(zone);
-    if (outputs.length === 0) return;
+    const allVolume = getVolumeOutputs(zone);
+    if (allVolume.length === 0) return;
 
+    const numeric = getNumericVolumeOutputs(zone);
+
+    if (numeric.length === allVolume.length) {
+      // Compute a per-output absolute target and clamp to [min, max] so a
+      // burst of relative-down keypresses cannot push an output below its
+      // floor (where the Devialet auto-mutes and the group desyncs).
+      await Promise.all(
+        numeric.map((output) => {
+          const current = output.volume!.value ?? 0;
+          const target = clampToOutput(output, current + delta);
+          if (target === current) return Promise.resolve<false | string>(false);
+          return promisifyResult((cb) =>
+            transport.change_volume(output, "absolute", target, cb),
+          );
+        }),
+      );
+      return;
+    }
+
+    // Incremental-only outputs have no numeric level to clamp; relative path.
     await Promise.all(
-      outputs.map((output) =>
+      allVolume.map((output) =>
         promisifyResult((cb) =>
           transport.change_volume(output, "relative", delta, cb),
         ),
