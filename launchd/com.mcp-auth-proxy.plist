@@ -7,7 +7,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/monty/bin/mcp-auth-proxy-wrapper.sh</string>
+        <string>/Users/monty/dev/roon-bridge/launchd/mcp-auth-proxy-wrapper.sh</string>
     </array>
 
     <key>RunAtLoad</key>
