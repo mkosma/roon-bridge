@@ -87,5 +87,30 @@ async function dump(hierarchy, sk, item_key, label, depth = 0) {
     await dump("artists", "probe-art-" + Date.now(), null, "artists root");
   } catch (e) { console.log("  ERR:", e.message); }
 
+  // Roon-native playlists (P1-B): confirm the browse "Playlists" node path and
+  // that "Hearted Albums & Songs" / "Roon Discoveries" are reachable with a
+  // track count. This is the path get_roon_playlist navigates.
+  console.log("\n=== Roon-native Playlists node ===");
+  try {
+    const sk = "probe-pl-" + Date.now();
+    const rootItems = await dump("browse", sk, null, "browse root for playlists");
+    const pl = rootItems.find((i) => i.title && i.title.trim().toLowerCase() === "playlists");
+    if (pl) {
+      const plItems = await dump("browse", sk, pl.item_key, "Playlists", 1);
+      for (const name of ["Hearted Albums & Songs", "Roon Discoveries"]) {
+        const target = plItems.find((i) => i.title === name);
+        if (target) {
+          await pBrowse({ hierarchy: "browse", item_key: target.item_key, multi_session_key: sk });
+          const loaded = await pLoad({ hierarchy: "browse", multi_session_key: sk, offset: 0, count: 5 });
+          console.log(`    [${name}] count=${loaded?.list?.count} first=${(loaded?.items||[]).slice(0,3).map(i=>i.title).join(" | ")}`);
+        } else {
+          console.log(`    [${name}] NOT FOUND in Playlists node`);
+        }
+      }
+    } else {
+      console.log("  No 'Playlists' node at browse root; titles were:", rootItems.map((i) => i.title).join(", "));
+    }
+  } catch (e) { console.log("  ERR:", e.message); }
+
   process.exit(0);
 })().catch((e) => { console.error("FATAL", e); process.exit(1); });

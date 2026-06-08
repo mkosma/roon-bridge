@@ -264,7 +264,55 @@ All the same tools as [roon-mcp](https://github.com/AzureStackNerd/roon-mcp):
 - `change_volume` / `mute` / `get_volume` — volume controls
 - `search` — search the Roon library
 - `play_artist` / `play_album` / `play_playlist` / `play_track` — search and play
-- `add_to_queue` — search and queue
+- `add_to_queue` — search and queue (re-verified against a queue read)
+
+### Queue editing (stable item ids)
+
+- `get_queue` — now returns a stable `queue_item_id` per row plus structured
+  metadata (title, artist, album, length, `is_now_playing`), alongside the
+  human-readable list.
+- `queue_next` — insert a track/album/playlist immediately after the current
+  track (Roon "Add Next"); verified against a follow-up queue read.
+- `play_from_here` — jump playback to a queued item by `queue_item_id`.
+- `remove_from_queue` — remove a **contiguous block of next-up items** by
+  skipping past it (the only removal Roon's extension API permits). Fails
+  loudly for non-contiguous, now-playing, or stale-id removals.
+- `reorder_queue` — Roon's extension API exposes **no** queue-move primitive;
+  this tool reports that honestly rather than returning a false success. Use
+  `queue_next` / `play_from_here` instead.
+
+### Roon-native playlists
+
+- `list_roon_playlists` — list Roon's OWN playlists (e.g. "Hearted Albums &
+  Songs", "Roon Discoveries") that the Qobuz/Tidal tools cannot see.
+- `get_roon_playlist` — read a Roon-native playlist's full track list by name
+  or item_key, paginated (`offset`/`limit`) for large lists.
+
+## Monitor endpoint (cheap, script-callable)
+
+For a deterministic daemon that polls zone state frequently without an LLM or
+MCP session:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:3100/monitor/state?zone=WiiM%20%2B%201"
+```
+
+Returns, reading only the in-memory zone map (sub-150ms, negligible load):
+
+```json
+{
+  "ok": true,
+  "zone": "WiiM + 1",
+  "state": "playing",
+  "now_playing": { "title": "...", "artist": "...", "album": "..." },
+  "queue_remaining_count": 29,
+  "queue_time_remaining_seconds": 3600
+}
+```
+
+`GET /monitor/state/all` returns the same snapshot for every zone. Same bearer
+token as `/mcp` and `/control`. Unknown explicit zone → 404; Roon down → 503.
 
 ## REST control endpoint
 
@@ -336,6 +384,40 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.roon-bridge.plist
 
 Override the Roon Core address with `ROON_HOST` / `ROON_PORT` env vars
 (defaults: `127.0.0.1:9330`).
+
+## Deploy / coordinated restart (queue + monitor + roon-playlist build)
+
+The live daemon serves Maya's MCP connection and active playback, so deploy
+the `feat/queue-editing-and-state-read` work in a single coordinated restart:
+
+```bash
+# 1. Land the branch
+git -C ~/dev/roon-bridge checkout feat/queue-editing-and-state-read
+git -C ~/dev/roon-bridge merge --ff-only main   # or merge to main first
+
+# 2. Build + test green BEFORE touching the running daemon
+npm --prefix ~/dev/roon-bridge run build
+npm --prefix ~/dev/roon-bridge test
+
+# 3. (Optional, bridge stopped) confirm the Roon-native Playlists path.
+#    perf:probe pairs as the SAME extension, so stop the bridge first.
+launchctl bootout gui/$(id -u)/com.roon-bridge
+npm --prefix ~/dev/roon-bridge run perf:probe   # look for the Playlists node block
+# (skip step 3 to minimize downtime; go straight to restart)
+
+# 4. Restart the daemon onto the new build
+launchctl kickstart -k gui/$(id -u)/com.roon-bridge   # if you did NOT stop it
+# or, if you stopped it in step 3:
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.roon-bridge.plist
+
+# 5. Smoke-check
+curl -s http://localhost:3100/health
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:3100/monitor/state?zone=WiiM%20%2B%201"
+```
+
+Restarting drops in-flight MCP sessions (clients auto-reconnect) but does not
+disturb Roon playback. The new MCP tools appear after the client reconnects.
 
 ## Credits
 
