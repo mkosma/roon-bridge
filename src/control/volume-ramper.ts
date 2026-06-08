@@ -93,6 +93,7 @@ export class VolumeRamper {
     delta: number,
     getZone: GetZoneFn,
     transport: RoonApiTransport,
+    stepMs?: number,
   ): Promise<void> {
     if (delta === 0) return;
     this.generation++;
@@ -107,6 +108,10 @@ export class VolumeRamper {
     const numeric = getNumericVolumeOutputs(zone);
     const steps = Math.abs(delta);
     const direction = delta > 0 ? 1 : -1;
+    // Per-call cadence overrides the instance default without mutating shared
+    // state, so an MCP fade with a bespoke duration can't be clobbered by a
+    // concurrent HTTP keypress (which sets rampStepMs from roon-key config).
+    const stepDelay = stepMs ?? this.rampStepMs;
 
     if (numeric.length === allVolume.length) {
       const startVol = Math.max(...numeric.map((o) => o.volume!.value ?? 0));
@@ -119,7 +124,7 @@ export class VolumeRamper {
             if (err) console.error("[VolumeRamper] step failed:", err);
           });
         }
-        if (i < steps) await delay(this.rampStepMs);
+        if (i < steps) await delay(stepDelay);
       }
       return;
     }
@@ -139,7 +144,7 @@ export class VolumeRamper {
           ),
         ),
       );
-      if (i < steps - 1) await delay(this.rampStepMs);
+      if (i < steps - 1) await delay(stepDelay);
     }
   }
 
@@ -151,6 +156,7 @@ export class VolumeRamper {
     target: number,
     getZone: GetZoneFn,
     transport: RoonApiTransport,
+    stepMs?: number,
   ): Promise<void> {
     // Cancel current ramp generation so rampDelta starts fresh
     this.cancel();
@@ -164,7 +170,7 @@ export class VolumeRamper {
     const currentMax = Math.max(...outputs.map((o) => o.volume!.value ?? 0));
     const delta = target - currentMax;
 
-    await this.rampDelta(delta, getZone, transport);
+    await this.rampDelta(delta, getZone, transport, stepMs);
   }
 
   /**
@@ -264,5 +270,16 @@ export class VolumeRamper {
   /** Update ramp step delay (e.g. from config change). */
   setRampStepMs(ms: number): void {
     this.rampStepMs = ms;
+  }
+
+  /**
+   * Current max numeric volume across a zone's outputs, or null if the zone
+   * has no numeric-volume outputs. Callers use this to size a ramp (number of
+   * 1-unit steps) when deriving a step cadence from a target duration.
+   */
+  static currentMaxVolume(zone: Zone): number | null {
+    const numeric = getNumericVolumeOutputs(zone);
+    if (numeric.length === 0) return null;
+    return Math.max(...numeric.map((o) => o.volume!.value ?? 0));
   }
 }

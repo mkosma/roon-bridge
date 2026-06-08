@@ -167,9 +167,12 @@ export class RoonConnection extends EventEmitter {
               }
               zone.queue_time_remaining = update.queue_time_remaining;
             }
+            // Lightweight per-zone seek tick so the DeferredPlayer can track
+            // track progress event-driven (to tell a natural track-end from a
+            // manual skip). Deliberately NOT "zones-changed": SSE/state
+            // consumers must not be spammed at ~1Hz by seek-only updates.
+            this.emit("zone-seek", update.zone_id);
           }
-          // Seek-only updates fire frequently (~1Hz per playing zone) and
-          // don't affect state SSE consumers care about. Don't emit.
         }
       }
       if (changed) this.emit("zones-changed");

@@ -14,14 +14,12 @@ import type { Request, Response } from "express";
 import { exec } from "node:child_process";
 import { roonConnection } from "../roon-connection.js";
 import type { Zone } from "node-roon-api-transport";
-import { VolumeRamper } from "./volume-ramper.js";
 import {
   readRoonKeyConfig,
   writeRoonKeyConfig,
   validateRoonKeyConfig,
 } from "./roon-key-config.js";
-
-const ramper = new VolumeRamper();
+import { sharedRamper as ramper } from "./shared-ramper.js";
 
 // ---------------------------------------------------------------------------
 // Helper: get active zone by name from roon-key config, or default zone.

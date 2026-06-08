@@ -115,6 +115,56 @@ export function registerZoneTools(server: McpServer): void {
   );
 
   server.tool(
+    "zone_state",
+    "Cheap, fast snapshot of a zone's playback state and queue runway: state, now_playing (title/artist/album), queue_remaining_count, and queue_time_remaining_seconds. Reads only the in-memory zone map (no browse, no queue subscription), mirroring the HTTP /monitor/state read. Use this to watch queue runway and extend the set before it empties.",
+    {
+      zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
+    },
+    async ({ zone }) => {
+      try {
+        roonConnection.getTransport();
+        const z = roonConnection.findZoneOrThrow(zone);
+
+        const np = z.now_playing;
+        const payload = {
+          zone: z.display_name,
+          state: z.state,
+          now_playing: np
+            ? {
+                title: np.three_line.line1,
+                artist: np.three_line.line2 ?? null,
+                album: np.three_line.line3 ?? null,
+              }
+            : null,
+          queue_remaining_count: z.queue_items_remaining ?? 0,
+          queue_time_remaining_seconds: z.queue_time_remaining ?? null,
+        };
+
+        const npLine = payload.now_playing
+          ? `${payload.now_playing.title}${payload.now_playing.artist ? ` - ${payload.now_playing.artist}` : ""}`
+          : "Nothing playing";
+        const runway =
+          payload.queue_time_remaining_seconds != null
+            ? ` (${payload.queue_remaining_count} left, ${formatTime(payload.queue_time_remaining_seconds)} remaining)`
+            : ` (${payload.queue_remaining_count} left)`;
+        const human = `${z.display_name}: ${z.state} - ${npLine}${runway}`;
+
+        return {
+          content: [
+            { type: "text", text: human },
+            { type: "text", text: JSON.stringify(payload) },
+          ],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: String(error instanceof Error ? error.message : error) }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.tool(
     "get_queue",
     "Get the play queue for a Roon zone",
     {
