@@ -136,6 +136,72 @@ export function registerVolumeTools(server: McpServer): void {
   );
 
   server.tool(
+    "smooth_skip",
+    "Fake a crossfade across a manual track change: smoothly fade the zone out, change track (next or previous), then fade back to the original level. Roon's native crossfade only smooths natural track ends; a manual skip otherwise drops to silence. The original volume is always restored, even if the skip fails, so there is no stuck-at-0 failure mode. A new volume command supersedes the fades.",
+    {
+      zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
+      direction: z
+        .enum(["next", "previous"])
+        .default("next")
+        .describe("Which way to skip: 'next' track or 'previous' track"),
+      fade_ms: z
+        .number()
+        .int()
+        .positive()
+        .default(1500)
+        .describe("Duration in milliseconds of each fade leg (out, then in). Default 1500."),
+    },
+    async ({ zone, direction, fade_ms }): Promise<ToolResult> => {
+      try {
+        const transport = roonConnection.getTransport();
+        const foundZone = roonConnection.findZoneOrThrow(zone);
+        const getZone = () => roonConnection.findZone(foundZone.display_name);
+
+        const original = VolumeRamper.currentMaxVolume(foundZone);
+        if (original === null) {
+          return {
+            content: [{ type: "text", text: `No numeric-volume outputs in zone '${foundZone.display_name}'; cannot fade.` }],
+          };
+        }
+
+        const dir = direction === "previous" ? "previous" : "next";
+        const fadeMs = fade_ms ?? 1500;
+
+        try {
+          // Fade out to silence, then perform the manual skip.
+          await sharedRamper.rampAbsolute(0, getZone, transport, stepMsForDuration(original, fadeMs));
+          await new Promise<void>((resolve, reject) => {
+            transport.control(foundZone, dir, (err) => {
+              if (err) reject(new Error(String(err)));
+              else resolve();
+            });
+          });
+        } finally {
+          // Always fade back to the original level from wherever we ended up,
+          // so a failed skip never leaves the zone stuck at 0.
+          const cur = VolumeRamper.currentMaxVolume(getZone() ?? foundZone) ?? 0;
+          await sharedRamper.rampAbsolute(
+            original,
+            getZone,
+            transport,
+            stepMsForDuration(Math.abs(original - cur), fadeMs),
+          );
+        }
+
+        const verb = dir === "next" ? "skipped to next" : "went to previous";
+        return {
+          content: [{ type: "text", text: `Smooth skip: faded out, ${verb} track, faded back to ${original} in zone '${foundZone.display_name}'.` }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: String(error instanceof Error ? error.message : error) }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.tool(
     "mute",
     "Mute or unmute a Roon zone",
     {

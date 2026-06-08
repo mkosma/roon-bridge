@@ -38,6 +38,7 @@ const world = {
   controlCalls: [] as ControlCall[],
   queue_items_remaining: 0 as number,
   queue_time_remaining: 0 as number,
+  failControl: false,
 };
 
 function makeOutput(name: string, value: number, muted = false): Output {
@@ -89,7 +90,7 @@ const mockTransport = {
   },
   control: (_zone: Zone, action: string, cb?: (e: false | string) => void) => {
     world.controlCalls.push({ action });
-    cb?.(false);
+    cb?.(world.failControl ? "skip_failed" : false);
   },
 };
 
@@ -154,7 +155,13 @@ function reset(outputs: Output[], partial: Partial<typeof world> = {}) {
   world.controlCalls = [];
   world.queue_items_remaining = 0;
   world.queue_time_remaining = 0;
+  world.failControl = false;
   Object.assign(world, partial);
+}
+
+/** Max numeric output value currently in the world (the audible zone level). */
+function currentLevel(): number {
+  return Math.max(...world.outputs.map((o) => o.volume?.value ?? 0));
 }
 
 // ---------------------------------------------------------------------------
@@ -221,5 +228,52 @@ describe("ramp_volume", () => {
     const server = buildServer();
     const { isError } = await call(server, "ramp_volume", { zone: "Bedroom", value: 0 });
     expect(isError).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Objective 2: smooth_skip
+// ---------------------------------------------------------------------------
+
+describe("smooth_skip", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("fades out, skips next, and fades back to the original level", async () => {
+    reset([makeOutput("WiiM", 4)]);
+    const server = buildServer();
+    const { isError, text } = await call(server, "smooth_skip", { direction: "next", fade_ms: 4 });
+
+    expect(isError).toBe(false);
+    expect(text).toContain("faded back to 4");
+    expect(world.controlCalls).toEqual([{ action: "next" }]);
+    // Faded to silence at some point, and ended back at the original level.
+    expect(world.volumeCalls.some((c) => c.value === 0)).toBe(true);
+    expect(currentLevel()).toBe(4);
+  });
+
+  it("skips to the previous track when asked", async () => {
+    reset([makeOutput("WiiM", 4)]);
+    const server = buildServer();
+    await call(server, "smooth_skip", { direction: "previous", fade_ms: 4 });
+    expect(world.controlCalls).toEqual([{ action: "previous" }]);
+    expect(currentLevel()).toBe(4);
+  });
+
+  it("restores the original level even when the skip fails (no stuck-at-0)", async () => {
+    reset([makeOutput("WiiM", 4)], { failControl: true });
+    const server = buildServer();
+    const { isError } = await call(server, "smooth_skip", { direction: "next", fade_ms: 4 });
+
+    expect(isError).toBe(true);
+    // The skip threw, but the finally fade-in still brought the zone back up.
+    expect(currentLevel()).toBe(4);
+  });
+
+  it("fades both outputs of a grouped zone back to the original level", async () => {
+    reset([makeOutput("WiiM", 4), makeOutput("KEF", 2)]);
+    const server = buildServer();
+    await call(server, "smooth_skip", { direction: "next", fade_ms: 4 });
+    expect(world.outputs.find((o) => o.output_id === "out-WiiM")!.volume!.value).toBe(4);
+    expect(world.outputs.find((o) => o.output_id === "out-KEF")!.volume!.value).toBe(4);
   });
 });
