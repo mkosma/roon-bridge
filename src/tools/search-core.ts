@@ -200,8 +200,6 @@ export function scoreCandidates(
 
   const lower = query.toLowerCase().trim();
   const queryWords = lower.split(/\s+/).filter((w) => w.length > 1);
-  // Max title-only score: every query word found in the title (10 each).
-  const maxTitleScore = Math.max(1, queryWords.length * 10);
 
   const wantsMix = /\b(dj[-\s]?kicks|dj[-\s]?mix|mixed|fabriclive|essential mix|continuous)\b/i.test(lower);
 
@@ -210,13 +208,16 @@ export function scoreCandidates(
     const subtitleClean = stripRoonLinks(item.subtitle || "");
     const subtitleLower = subtitleClean.toLowerCase();
     let score = 0;
-    let titleHits = 0;
+    // Words accounted for by EITHER the title or the credited artist(s)/album in
+    // the subtitle. Multi-artist albums (e.g. "Promises" by Floating Points /
+    // Pharoah Sanders / LSO) put most query words in the subtitle, so a
+    // title-only confidence wrongly scored a correct, unambiguous hit at ~20%.
+    let matchedWords = 0;
 
     for (const word of queryWords) {
-      if (titleLower.includes(word)) {
-        score += 10;
-        titleHits += 1;
-      }
+      const inTitle = titleLower.includes(word);
+      if (inTitle) score += 10;
+      if (inTitle || subtitleLower.includes(word)) matchedWords += 1;
     }
     for (const word of queryWords) {
       if (subtitleLower.includes(word)) score += 5;
@@ -240,7 +241,7 @@ export function scoreCandidates(
     // Small positional tiebreak favoring Roon's own ranking.
     score += Math.max(0, 5 - i);
 
-    const confidence = Math.max(0, Math.min(1, (titleHits * 10) / maxTitleScore));
+    const confidence = Math.max(0, Math.min(1, matchedWords / Math.max(1, queryWords.length)));
 
     return {
       item,

@@ -47,6 +47,18 @@ describe("scoreCandidates", () => {
     expect(ranked[0].confidence).toBeLessThan(0.5);
   });
 
+  it("does not under-report confidence on a multi-artist album (FIX-4: Promises)", () => {
+    // The album's four credited artists live in the subtitle; a title-only
+    // confidence scored this correct, unambiguous hit at ~20%.
+    const items: BrowseItem[] = [
+      item("Promises", "Floating Points / Pharoah Sanders / London Symphony Orchestra", "p"),
+      item("Something Else", "Nobody In Particular", "x"),
+    ];
+    const ranked = scoreCandidates(items, "Promises Floating Points Pharoah Sanders", true);
+    expect(ranked[0].title).toBe("Promises");
+    expect(ranked[0].confidence).toBeGreaterThan(0.9);
+  });
+
   it("resolves an artist alias via subtitle match (Nocturnal Sunshine / Maya Jane Coles)", () => {
     const items: BrowseItem[] = [
       item("Meant To Be", "Nocturnal Sunshine / Maya Jane Coles", "a"),
