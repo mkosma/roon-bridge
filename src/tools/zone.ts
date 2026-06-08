@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { roonConnection } from "../roon-connection.js";
-import type { QueueItem } from "node-roon-api-transport";
+import { readQueueRows } from "./queue.js";
 
 export function registerZoneTools(server: McpServer): void {
   server.tool(
@@ -122,38 +122,38 @@ export function registerZoneTools(server: McpServer): void {
     },
     async ({ zone }) => {
       try {
-        const transport = roonConnection.getTransport();
+        roonConnection.getTransport();
         const z = roonConnection.findZoneOrThrow(zone);
 
-        const items = await new Promise<QueueItem[]>((resolve, reject) => {
-          const timeout = setTimeout(() => reject(new Error("Queue request timed out")), 5000);
+        const rows = await readQueueRows(z);
 
-          const sub = transport.subscribe_queue(z, 100, (response, msg) => {
-            if (response === "Subscribed") {
-              clearTimeout(timeout);
-              resolve(msg.items || []);
-              // Unsubscribe after getting the initial data
-              try { sub.unsubscribe(); } catch { /* ignore */ }
-            }
-          });
-        });
-
-        if (items.length === 0) {
+        if (rows.length === 0) {
           return {
             content: [{ type: "text", text: `Queue for '${z.display_name}' is empty.` }],
           };
         }
 
-        const lines = [`Queue for '${z.display_name}' (${items.length} items):\n`];
-        for (let i = 0; i < items.length; i++) {
-          const item = items[i];
-          const duration = item.length ? ` [${formatTime(item.length)}]` : "";
-          const artist = item.two_line.line2 ? ` - ${item.two_line.line2}` : "";
-          lines.push(`${i + 1}. ${item.two_line.line1}${artist}${duration}`);
+        // Emit a structured payload (stable queue_item_id per row) so callers
+        // can target items for queue_next / remove / reorder / play_from_here,
+        // followed by a human-readable rendering.
+        const payload = {
+          zone: z.display_name,
+          count: rows.length,
+          items: rows,
+        };
+        const lines = [`Queue for '${z.display_name}' (${rows.length} items):\n`];
+        for (const r of rows) {
+          const duration = r.length ? ` [${r.length}]` : "";
+          const artist = r.artist ? ` - ${r.artist}` : "";
+          const np = r.is_now_playing ? " ◀ now playing" : "";
+          lines.push(`${r.position}. [id ${r.queue_item_id}] ${r.title}${artist}${duration}${np}`);
         }
 
         return {
-          content: [{ type: "text", text: lines.join("\n") }],
+          content: [
+            { type: "text", text: lines.join("\n") },
+            { type: "text", text: JSON.stringify(payload) },
+          ],
         };
       } catch (error) {
         return {
