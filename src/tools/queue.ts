@@ -51,6 +51,15 @@ import {
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
+/**
+ * Hard wall-clock ceiling for a queue_next round trip (Maya's perf bar:
+ * search-and-act < ~1.5s, "return fast and report honestly rather than hang").
+ * The add-verify poll is anchored to the operation start so it can never push
+ * the call past this ceiling on any path.
+ */
+const PERF_CEILING_MS = 1500;
+const VERIFY_POLL_MS = 150;
+
 function jsonResult(payload: unknown, isError = false): ToolResult {
   return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }], isError };
 }
@@ -219,6 +228,7 @@ async function findAndQueue(
   intent: QueueAction,
   category?: string,
 ): Promise<ToolResult> {
+  const startedAt = Date.now();
   const resolved = await navigateToActionList(query, zone, category);
   if (resolved.kind === "no_match") {
     return jsonResult({ ok: false, error: "no_match", query, zone: zone.display_name }, true);
@@ -257,14 +267,19 @@ async function findAndQueue(
   }
 
   // Verify by re-reading. Roon applies queue changes asynchronously; poll
-  // briefly until the queue reflects the add or we time out.
+  // briefly until the queue reflects the add. The deadline is anchored to the
+  // operation start, so the verify loop never carries the call past the perf
+  // ceiling even if navigation was slow - we always do at least the one read
+  // above, then poll only within whatever budget remains.
   let after = await readQueueRows(zone);
-  const deadline = Date.now() + 2500;
+  const deadline = startedAt + PERF_CEILING_MS;
   while (Date.now() < deadline) {
     const grew = after.length > beforeCount;
     const newId = after.some((r) => !beforeIds.has(r.queue_item_id));
     if (grew || newId) break;
-    await new Promise((r) => setTimeout(r, 150));
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise((r) => setTimeout(r, Math.min(VERIFY_POLL_MS, remaining)));
     after = await readQueueRows(zone);
   }
 
@@ -277,12 +292,14 @@ async function findAndQueue(
         ok: false,
         error: "add_not_verified",
         detail:
-          "The browse action returned success but a follow-up queue read showed no new item. The add did NOT land.",
+          `The browse action returned success but no new queue item appeared within the ${PERF_CEILING_MS}ms verification window. The add likely did not land (a silent no-op); confirm with get_queue.`,
         matched: resolved.matchTitle,
         artist: resolved.matchArtist,
         action: action.matched,
         queue_count_before: beforeCount,
         queue_count_after: after.length,
+        verification_window_ms: PERF_CEILING_MS,
+        elapsed_ms: Date.now() - startedAt,
       },
       true,
     );

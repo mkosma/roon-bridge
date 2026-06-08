@@ -212,6 +212,20 @@ describe("queue_next", () => {
     expect(json.error).toBe("add_not_verified");
   });
 
+  it("returns within the 1.5s perf ceiling even when the add never lands", async () => {
+    // The verify poll is anchored to the operation start, so the worst case
+    // (add silently no-ops) must not hang past the ceiling.
+    resetWorld({ queue: [qi(1, "NP")], swallowNextAdd: true });
+    const server = buildServer();
+    const t0 = Date.now();
+    const { json } = await call(server, "queue_next", { query: "Resolved Track" });
+    const elapsed = Date.now() - t0;
+    expect(json.error).toBe("add_not_verified");
+    // Small scheduler slack over the 1500ms window; nowhere near the old 2500ms.
+    expect(elapsed).toBeLessThan(1800);
+    expect(json.verification_window_ms).toBe(1500);
+  });
+
   it("fails loudly on no-match, never silent", async () => {
     resetWorld({ queue: [qi(1, "NP")], resolveTitle: null });
     // With resolveTitle null the match list has an empty-title item; force a
