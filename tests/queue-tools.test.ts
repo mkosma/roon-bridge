@@ -5,8 +5,9 @@
  * Covers the adversarial edge cases Maya will re-run:
  *  - queue_next: nothing playing / paused / verified add / no-match loud fail.
  *  - play_from_here: valid jump + verification, stale id loud fail.
- *  - remove_from_queue: contiguous-head success, non-contiguous loud fail,
- *    now-playing removal refused, stale id loud fail.
+ *  - remove_from_queue: honest refusal on every target (no queue-delete
+ *    primitive exists; the skip-past approximation discards the now-playing
+ *    track), touching neither playback nor the queue.
  *  - reorder_queue: loud unsupported (never a false success).
  *  - add verification: an "add" that does not land fails loudly.
  */
@@ -152,6 +153,7 @@ vi.mock("../src/roon-connection.js", () => ({
 }));
 
 const { registerQueueTools } = await import("../src/tools/queue.js");
+const { roonConnection } = await import("../src/roon-connection.js");
 
 function buildServer() {
   const server = new McpServer({ name: "t", version: "0" });
@@ -246,39 +248,45 @@ describe("play_from_here", () => {
 describe("remove_from_queue", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("removes a contiguous head block by skipping past it", async () => {
-    resetWorld({ queue: [qi(1, "NP"), qi(2, "Drop1"), qi(3, "Drop2"), qi(4, "Keep")] });
+  // FIX-1: Roon has no queue-delete primitive. The skip-past approximation
+  // interrupts and discards the now-playing track, so remove_from_queue refuses
+  // honestly on EVERY target and touches neither playback nor the queue.
+
+  it("refuses any removal without touching playback or the queue (the live repro)", async () => {
+    // Before: Outlier(4909) playing, next-up Grains(4910), then Second Sun(4911).
+    resetWorld({
+      queue: [qi(4909, "Outlier"), qi(4910, "Grains"), qi(4911, "Second Sun")],
+    });
     const server = buildServer();
-    const { isError, json } = await call(server, "remove_from_queue", { queue_item_ids: [2, 3] });
-    expect(isError).toBe(false);
-    expect(json.ok).toBe(true);
-    expect(world.queue.find((q) => q.queue_item_id === 2)).toBeUndefined();
-    expect(world.queue.find((q) => q.queue_item_id === 3)).toBeUndefined();
-    expect(world.queue[0].queue_item_id).toBe(4);
+    const { isError, json } = await call(server, "remove_from_queue", { queue_item_ids: [4910] });
+    expect(isError).toBe(true);
+    expect(json.ok).toBe(false);
+    expect(json.error).toBe("unsupported_operation");
+    expect(json.alternatives).toBeTruthy();
+    expect((json.requested as Record<string, unknown>).queue_item_ids).toEqual([4910]);
+    // Playback never jumped and the queue is byte-for-byte unchanged.
+    expect(roonConnection.playFromHere).not.toHaveBeenCalled();
+    expect(world.queue.map((q) => q.queue_item_id)).toEqual([4909, 4910, 4911]);
   });
 
-  it("refuses to remove the now-playing item", async () => {
+  it("refuses a now-playing target the same way (no special-case path)", async () => {
     resetWorld({ queue: [qi(1, "NP"), qi(2, "X")] });
     const server = buildServer();
     const { isError, json } = await call(server, "remove_from_queue", { queue_item_ids: [1] });
     expect(isError).toBe(true);
-    expect(json.error).toBe("cannot_remove_now_playing");
+    expect(json.error).toBe("unsupported_operation");
+    expect(roonConnection.playFromHere).not.toHaveBeenCalled();
+    expect(world.queue.map((q) => q.queue_item_id)).toEqual([1, 2]);
   });
 
-  it("fails loudly for a non-contiguous removal", async () => {
-    resetWorld({ queue: [qi(1, "NP"), qi(2, "A"), qi(3, "B"), qi(4, "C")] });
-    const server = buildServer();
-    const { isError, json } = await call(server, "remove_from_queue", { queue_item_ids: [2, 4] });
-    expect(isError).toBe(true);
-    expect(json.error).toBe("unsupported_removal");
-  });
-
-  it("fails loudly on a stale id", async () => {
+  it("refuses a stale id without pretending to look it up", async () => {
     resetWorld({ queue: [qi(1, "NP"), qi(2, "A")] });
     const server = buildServer();
     const { isError, json } = await call(server, "remove_from_queue", { queue_item_ids: [999] });
     expect(isError).toBe(true);
-    expect(json.error).toBe("stale_id");
+    expect(json.error).toBe("unsupported_operation");
+    expect(roonConnection.playFromHere).not.toHaveBeenCalled();
+    expect(world.queue.map((q) => q.queue_item_id)).toEqual([1, 2]);
   });
 });
 

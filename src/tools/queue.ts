@@ -18,11 +18,15 @@
  * So this module delivers, honestly:
  *   - queue_next       : real, native "Add Next" semantics, post-verified.
  *   - play_from_here   : real, native jump.
- *   - remove_from_queue: implemented via the only mechanism Roon permits -
- *                        play_from_here past the removed block when the removal
- *                        is the contiguous run of upcoming items at the head of
- *                        the queue (the realistic "skip these next N" case);
- *                        otherwise it fails LOUDLY rather than pretending.
+ *   - remove_from_queue: Roon exposes no queue-delete primitive. The only
+ *                        approximation - play_from_here past the items - starts
+ *                        playback AT the landing item and abandons everything
+ *                        before it, so it interrupts and discards the
+ *                        now-playing track. That is destructive and dishonest
+ *                        (the verify-loop would still report success while the
+ *                        listened-to track was dropped), so this tool refuses
+ *                        outright, exactly like reorder_queue, and points at the
+ *                        supported alternatives.
  *   - reorder_queue    : Roon exposes no move primitive; this fails loudly with
  *                        a precise explanation and the supported alternative,
  *                        rather than returning a false success.
@@ -378,18 +382,24 @@ export function registerQueueTools(server: McpServer): void {
   );
 
   // ---------------------------------------------------------------------------
-  // remove_from_queue - remove upcoming items by id.
+  // remove_from_queue - refuse honestly.
   //
-  // Roon exposes no arbitrary queue-item delete. The one removal it DOES allow
-  // is "skip past" the contiguous run of upcoming items at the head: jumping
-  // playback (play_from_here) to the first item AFTER the removed block drops
-  // those items from what will play. We support exactly that case - removing a
-  // contiguous block starting at the next-up item - and FAIL LOUDLY otherwise,
-  // rather than silently no-op.
+  // Roon's extension API exposes NO queue-delete primitive. The only
+  // approximation is play_from_here past the targeted items - but that starts
+  // playback AT the landing item and abandons everything before it, so it
+  // interrupts and discards the currently-playing track as collateral. (Proven
+  // live: removing the single next-up item dropped both it AND the now-playing
+  // track.) A verify-loop checking only the requested ids would report success
+  // while having silently killed the track the user was listening to, so we do
+  // not keep that path even behind a flag. The Roon GUI can delete queue items
+  // because it uses a private service Roon does not grant to extensions.
+  //
+  // So this refuses outright, exactly like reorder_queue, touching neither
+  // playback nor the queue, and points at the supported alternatives.
   // ---------------------------------------------------------------------------
   server.tool(
     "remove_from_queue",
-    "Remove one or more UPCOMING queued items by queue_item_id. Note: Roon's extension API has no arbitrary queue-delete; this works by skipping past a contiguous block of next-up items (the realistic 'drop the next N' case) and fails loudly for non-contiguous or non-head removals. Verified by a follow-up queue read.",
+    "Remove upcoming queued items by queue_item_id. NOTE: Roon's extension API has no queue-delete primitive; the only approximation (jumping playback past the items) interrupts and discards the currently-playing track, so this tool refuses honestly rather than damaging playback. Supported alternatives: play_from_here (deliberately jump to a later item) and queue_next (insert right after the current track).",
     {
       queue_item_ids: z
         .array(z.coerce.number().int())
@@ -400,104 +410,21 @@ export function registerQueueTools(server: McpServer): void {
     async ({ queue_item_ids, zone }): Promise<ToolResult> => {
       try {
         const z = roonConnection.findZoneOrThrow(zone);
-        const rows = await readQueueRows(z);
-        if (!rows.length) {
-          return jsonResult({ ok: false, error: "empty_queue", detail: "Queue is empty." }, true);
-        }
-        const byId = new Map(rows.map((r) => [r.queue_item_id, r]));
-        const npIndex = rows.findIndex((r) => r.is_now_playing);
-        const firstUpcoming = npIndex >= 0 ? npIndex + 1 : 0;
-
-        const requested = new Set(queue_item_ids);
-        const missing = queue_item_ids.filter((id) => !byId.has(id));
-        if (missing.length) {
-          return jsonResult(
-            {
-              ok: false,
-              error: "stale_id",
-              detail: `These ids are not in the current queue: ${missing.join(", ")}.`,
-              queue_item_ids: rows.map((r) => r.queue_item_id),
-            },
-            true,
-          );
-        }
-        // Refuse to remove the now-playing item via this path.
-        const targets = rows.filter((r) => requested.has(r.queue_item_id));
-        if (targets.some((t) => t.is_now_playing)) {
-          return jsonResult(
-            {
-              ok: false,
-              error: "cannot_remove_now_playing",
-              detail: "Use next_track / play_from_here to leave the now-playing item; it cannot be removed in place.",
-            },
-            true,
-          );
-        }
-
-        // The targets must form a contiguous block starting at firstUpcoming.
-        const targetIndexes = targets.map((t) => rows.indexOf(t)).sort((a, b) => a - b);
-        const isContiguousHead =
-          targetIndexes[0] === firstUpcoming &&
-          targetIndexes.every((idx, i) => idx === firstUpcoming + i);
-
-        if (!isContiguousHead) {
-          return jsonResult(
-            {
-              ok: false,
-              error: "unsupported_removal",
-              detail:
-                "Roon's extension API cannot delete arbitrary queue items. Only a contiguous block of next-up items (starting at the item right after now-playing) can be removed, by skipping past it. Reorder so the items to drop are next-up, or use play_from_here to jump.",
-              now_playing_position: npIndex >= 0 ? npIndex + 1 : null,
-              first_upcoming_position: firstUpcoming + 1,
-              requested_positions: targets.map((t) => t.position),
-            },
-            true,
-          );
-        }
-
-        // Jump to the first item AFTER the removed block.
-        const afterIndex = targetIndexes[targetIndexes.length - 1] + 1;
-        const landingItem = rows[afterIndex];
-        const beforeCount = rows.length;
-
-        if (!landingItem) {
-          // Removing through the end of the queue: nothing left to land on.
-          return jsonResult(
-            {
-              ok: false,
-              error: "unsupported_removal",
-              detail:
-                "Removing the entire tail of the queue (no item left to play after) is not supported via skip-past. Use stop, or leave at least one upcoming item.",
-            },
-            true,
-          );
-        }
-
-        await roonConnection.playFromHere(z, landingItem.queue_item_id);
-
-        // Verify the removed ids are gone.
-        await new Promise((r) => setTimeout(r, 250));
-        let after = await readQueueRows(z);
-        const deadline = Date.now() + 2000;
-        while (Date.now() < deadline && targets.some((t) => after.find((r) => r.queue_item_id === t.queue_item_id && !r.is_now_playing))) {
-          await new Promise((r) => setTimeout(r, 150));
-          after = await readQueueRows(z);
-        }
-        const stillPresent = targets.filter((t) =>
-          after.find((r) => r.queue_item_id === t.queue_item_id && !r.is_now_playing),
+        return jsonResult(
+          {
+            ok: false,
+            error: "unsupported_operation",
+            detail:
+              "Roon's extension API has no queue-delete primitive. The only approximation jumps playback past the items, which interrupts and discards the currently-playing track. The Roon GUI can remove queue items via a private service Roon does not expose to extensions.",
+            alternatives: [
+              "play_from_here(queue_item_id) to deliberately jump to a later item",
+              "queue_next(query) to insert immediately after the current track",
+            ],
+            requested: { queue_item_ids },
+            zone: z.display_name,
+          },
+          true,
         );
-
-        return jsonResult({
-          ok: stillPresent.length === 0,
-          removed: targets.map((t) => ({ queue_item_id: t.queue_item_id, title: t.title })),
-          method: "skip_past_head_block",
-          verified: stillPresent.length === 0,
-          still_present: stillPresent.map((t) => t.queue_item_id),
-          queue_count_before: beforeCount,
-          queue_count_after: after.length,
-          now_playing: after[0] ? { queue_item_id: after[0].queue_item_id, title: after[0].title } : null,
-          zone: z.display_name,
-        }, stillPresent.length !== 0);
       } catch (e) {
         return jsonResult({ ok: false, error: e instanceof Error ? e.message : String(e) }, true);
       }
