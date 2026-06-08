@@ -1,220 +1,25 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { roonConnection } from "../roon-connection.js";
-import type RoonApiBrowse from "node-roon-api-browse";
-import type {
-  BrowseOptions,
-  BrowseResult,
-  LoadOptions,
-  LoadResult,
-  BrowseItem,
-} from "node-roon-api-browse";
+import {
+  newSessionKey,
+  promisifyBrowse,
+  promisifyLoad,
+  stripRoonLinks,
+  formatItems,
+  browseAndLoad,
+  scoreCandidates,
+  bestMatch,
+  resolveActionItem,
+  type BrowseItem,
+} from "./search-core.js";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
-let sessionCounter = 0;
-
-function newSessionKey(): string {
-  return `mcp-${++sessionCounter}`;
-}
-
-function promisifyBrowse(
-  browse: RoonApiBrowse,
-  opts: BrowseOptions,
-): Promise<{ error: false | string; body: BrowseResult }> {
-  return new Promise((resolve) =>
-    browse.browse(opts, (error, body) => resolve({ error, body })),
-  );
-}
-
-function promisifyLoad(
-  browse: RoonApiBrowse,
-  opts: LoadOptions,
-): Promise<{ error: false | string; body: LoadResult }> {
-  return new Promise((resolve) =>
-    browse.load(opts, (error, body) => resolve({ error, body })),
-  );
-}
-
-/**
- * Strip Roon's internal link format from text.
- * Roon subtitles may contain `[[12345|Artist Name]]` — extract just the name.
- */
-function stripRoonLinks(text: string): string {
-  return text.replace(/\[\[\d+\|([^\]]+)\]\]/g, "$1");
-}
-
-function formatItems(items: BrowseItem[]): string {
-  return items
-    .filter((item) => item.hint !== "header")
-    .map((item, i) => {
-      const sub = item.subtitle ? ` - ${stripRoonLinks(item.subtitle)}` : "";
-      return `${i + 1}. ${item.title}${sub}`;
-    })
-    .join("\n");
-}
-
-interface BrowseAndLoadResult {
-  error: string | null;
-  navigated: boolean;
-  list?: BrowseResult["list"];
-  items?: BrowseItem[];
-  message?: string;
-  total?: number;
-  nextOffset?: number | null;
-}
-
-const PAGE_SIZE = 100;
-
-async function loadPaginated(
-  browse: RoonApiBrowse,
-  hierarchy: string,
-  sessionKey: string | undefined,
-  limit: number,
-  offset: number,
-): Promise<{ error: string | null; items: BrowseItem[]; total: number; nextOffset: number | null }> {
-  const collected: BrowseItem[] = [];
-  let cursor = offset;
-  let total = 0;
-
-  while (collected.length < limit) {
-    const remaining = limit - collected.length;
-    const pageCount = Math.min(PAGE_SIZE, remaining);
-    const loaded = await promisifyLoad(browse, {
-      hierarchy,
-      multi_session_key: sessionKey,
-      offset: cursor,
-      count: pageCount,
-    });
-    if (loaded.error) {
-      return { error: String(loaded.error), items: collected, total, nextOffset: null };
-    }
-    const items = loaded.body.items || [];
-    total = loaded.body.list?.count ?? collected.length + items.length;
-    collected.push(...items);
-    cursor += items.length;
-    if (items.length < pageCount) break;
-    if (cursor >= total) break;
-  }
-
-  const nextOffset = cursor < total ? cursor : null;
-  return { error: null, items: collected, total, nextOffset };
-}
-
-async function browseAndLoad(
-  browse: RoonApiBrowse,
-  browseOpts: BrowseOptions,
-  loadCount = 100,
-  loadOffset = 0,
-): Promise<BrowseAndLoadResult> {
-  const result = await promisifyBrowse(browse, browseOpts);
-
-  if (result.error) {
-    return { error: String(result.error), navigated: false };
-  }
-
-  if (result.body.action === "message") {
-    return { error: null, navigated: false, message: result.body.message || "Done" };
-  }
-
-  if (result.body.action !== "list" || !result.body.list) {
-    return { error: null, navigated: false, list: result.body.list, items: [] };
-  }
-
-  const paged = await loadPaginated(
-    browse,
-    browseOpts.hierarchy,
-    browseOpts.multi_session_key,
-    loadCount,
-    loadOffset,
-  );
-
-  if (paged.error) {
-    return { error: paged.error, navigated: true };
-  }
-
-  return {
-    error: null,
-    navigated: true,
-    list: result.body.list,
-    items: paged.items,
-    total: paged.total,
-    nextOffset: paged.nextOffset,
-  };
-}
-
-function bestMatch(items: BrowseItem[], query: string): BrowseItem | undefined {
-  const playable = items.filter((item) => item.item_key && item.hint !== "header");
-  if (!playable.length) return undefined;
-
-  const lower = query.toLowerCase().trim();
-  const queryWords = lower.split(/\s+/).filter((w) => w.length > 1);
-
-  let topScore = -Infinity;
-  let topItem = playable[0];
-
-  for (let i = 0; i < playable.length; i++) {
-    const item = playable[i];
-    const titleLower = item.title.toLowerCase().trim();
-    const subtitleLower = stripRoonLinks(item.subtitle || "").toLowerCase();
-    let score = 0;
-
-    for (const word of queryWords) {
-      if (titleLower.includes(word)) score += 10;
-    }
-
-    for (const word of queryWords) {
-      if (subtitleLower.includes(word)) score += 5;
-    }
-
-    const firstArtist = subtitleLower.split(",")[0].trim();
-    for (const word of queryWords) {
-      if (word.length > 2 && firstArtist.includes(word)) score += 8;
-    }
-
-    if (/\b(tribute|cover[s]?|karaoke|medley|in the style of)\b/i.test(titleLower)) {
-      score -= 50;
-    }
-
-    score += Math.max(0, 5 - i);
-
-    if (score > topScore) {
-      topScore = score;
-      topItem = item;
-    }
-  }
-
-  return topItem;
-}
-
+/** Legacy play/queue intent mapped onto the search-core action vocabulary. */
 function findAction(items: BrowseItem[], type: "play" | "queue"): BrowseItem | undefined {
-  const actionable = items.filter((item) => item.item_key && item.hint !== "header");
-
-  if (type === "play") {
-    return (
-      actionable.find((item) => item.title.trim().toLowerCase() === "play now") ||
-      actionable.find((item) => item.title.trim().toLowerCase() === "play album") ||
-      actionable.find(
-        (item) =>
-          item.title.toLowerCase().startsWith("play") &&
-          !item.title.toLowerCase().includes("radio"),
-      ) ||
-      actionable[0]
-    );
-  }
-
-  return (
-    actionable.find((item) => item.title.trim().toLowerCase() === "queue") ||
-    actionable.find((item) => item.title.toLowerCase().includes("queue")) ||
-    actionable.find((item) => item.title.trim().toLowerCase() === "play album") ||
-    actionable.find(
-      (item) =>
-        item.title.toLowerCase().startsWith("play") &&
-        !item.title.toLowerCase().includes("radio"),
-    ) ||
-    actionable.find((item) => item.title.trim().toLowerCase() === "play now") ||
-    actionable[0]
-  );
+  const resolved = resolveActionItem(items, type === "play" ? "play_now" : "queue");
+  return resolved?.item;
 }
 
 async function searchAndPlay(
@@ -315,10 +120,14 @@ async function searchAndPlay(
       return { content: [{ type: "text", text: `No ${targetCategory.title.toLowerCase()} found for "${query}".` }] };
     }
 
-    // Step 4: Select best match
-    const matchedResult = bestMatch(categoryData.items, query);
+    // Step 4: Select best match (scored, with a confidence signal so a loose
+    // match is visible in the result rather than silently substituted).
+    const ranked = scoreCandidates(categoryData.items, query, category !== "playlist");
+    const matchedResult = ranked[0]?.item ?? bestMatch(categoryData.items, query);
+    const matchConfidence = ranked[0]?.confidence ?? 0;
+    const runnerUp = ranked[1];
 
-    log("step4-bestMatch", { selected: matchedResult?.title, subtitle: matchedResult?.subtitle, hint: matchedResult?.hint, item_key: matchedResult?.item_key });
+    log("step4-bestMatch", { selected: matchedResult?.title, subtitle: matchedResult?.subtitle, confidence: matchConfidence, hint: matchedResult?.hint, item_key: matchedResult?.item_key });
 
     if (!matchedResult?.item_key) {
       return {
@@ -421,7 +230,20 @@ async function searchAndPlay(
       };
     }
 
-    // Step 7: Execute
+    // Step 7: Execute. For a queue add, capture the pre-action queue so we can
+    // verify the add actually landed afterward.
+    let preAddIds: Set<number> | null = null;
+    let preAddCount = 0;
+    if (actionType === "queue") {
+      try {
+        const pre = await roonConnection.getQueueSnapshot(zone);
+        preAddIds = new Set(pre.map((i) => i.queue_item_id));
+        preAddCount = pre.length;
+      } catch {
+        preAddIds = null;
+      }
+    }
+
     let playResult = await promisifyBrowse(browse, {
       hierarchy,
       item_key: targetAction.item_key,
@@ -480,6 +302,37 @@ async function searchAndPlay(
       }
     }
 
+    // Step 7c: Verify a QUEUE add actually landed. The browse action can
+    // return success while the item never enters the queue (the "Tonight -
+    // RÜFÜS DU SOL" defect). Re-read the queue and confirm growth before
+    // claiming success.
+    if (actionType === "queue" && preAddIds) {
+      try {
+        const beforeIds = preAddIds;
+        let after = await roonConnection.getQueueSnapshot(zone);
+        const deadline = Date.now() + 2500;
+        while (Date.now() < deadline) {
+          if (after.length > preAddCount || after.some((i) => !beforeIds.has(i.queue_item_id))) break;
+          await new Promise((r) => setTimeout(r, 150));
+          after = await roonConnection.getQueueSnapshot(zone);
+        }
+
+        const landed = after.length > preAddCount || after.some((i) => !beforeIds.has(i.queue_item_id));
+        if (!landed) {
+          return {
+            content: [{
+              type: "text",
+              text: `Add NOT verified: the action reported success but "${matchedResult.title}" did not appear in the queue for '${zone.display_name}'. Try add_to_queue with category, or queue_next.`,
+            }],
+            isError: true,
+          };
+        }
+      } catch (verifyErr) {
+        log("step7c-verify-error", String(verifyErr));
+        // Fall through; we could not verify but won't falsely claim failure.
+      }
+    }
+
     // Step 8: Disable auto_radio
     try {
       const transport = roonConnection.getTransport();
@@ -492,8 +345,13 @@ async function searchAndPlay(
 
     const subtitle = matchedResult.subtitle ? ` by ${stripRoonLinks(matchedResult.subtitle)}` : "";
     const actionVerb = actionType === "queue" ? "Queued" : "Now playing";
+    const confPct = Math.round(matchConfidence * 100);
+    const confNote =
+      matchConfidence < 0.5 && runnerUp
+        ? ` [loose match, ${confPct}% confidence; runner-up: "${runnerUp.title}"${runnerUp.artist ? ` - ${runnerUp.artist}` : ""}]`
+        : ` [match confidence ${confPct}%]`;
     return {
-      content: [{ type: "text", text: `${actionVerb}: "${matchedResult.title}"${subtitle} in zone '${zone.display_name}'.` }],
+      content: [{ type: "text", text: `${actionVerb}: "${matchedResult.title}"${subtitle} in zone '${zone.display_name}'.${confNote}` }],
     };
   } catch (error) {
     return {
