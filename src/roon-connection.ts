@@ -3,7 +3,7 @@ import RoonApiTransport from "node-roon-api-transport";
 import RoonApiBrowse from "node-roon-api-browse";
 import RoonApiStatus from "node-roon-api-status";
 import type { RoonCore } from "node-roon-api";
-import type { Zone } from "node-roon-api-transport";
+import type { Zone, QueueItem } from "node-roon-api-transport";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -261,6 +261,48 @@ export class RoonConnection extends EventEmitter {
 
   getDefaultZone(): string {
     return this.defaultZone;
+  }
+
+  /**
+   * Read a one-shot snapshot of a zone's queue via subscribe_queue, then
+   * immediately unsubscribe. Returns the QueueItems (each carrying a stable
+   * queue_item_id). Shared by get_queue, the queue-edit verification step,
+   * and the monitor state read.
+   */
+  getQueueSnapshot(zone: Zone, maxItems = 200, timeoutMs = 5000): Promise<QueueItem[]> {
+    const transport = this.getTransport();
+    return new Promise<QueueItem[]>((resolve, reject) => {
+      let settled = false;
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error("Queue request timed out"));
+      }, timeoutMs);
+
+      const sub = transport.subscribe_queue(zone, maxItems, (response, msg) => {
+        if (response === "Subscribed") {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          resolve(msg.items || []);
+          try { sub.unsubscribe(); } catch { /* ignore */ }
+        }
+      });
+    });
+  }
+
+  /**
+   * Jump playback to a specific queued item by its stable queue_item_id.
+   * Thin promise wrapper over the native transport play_from_here.
+   */
+  playFromHere(zone: Zone, queueItemId: number): Promise<void> {
+    const transport = this.getTransport();
+    return new Promise<void>((resolve, reject) => {
+      transport.play_from_here(zone, queueItemId, (error: false | string) => {
+        if (error) reject(new Error(String(error)));
+        else resolve();
+      });
+    });
   }
 
   setDefaultZone(nameOrId: string): string {
