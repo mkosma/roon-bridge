@@ -20,8 +20,11 @@ import { registerZoneTools } from "./tools/zone.js";
 import { registerPlaybackTools } from "./tools/playback.js";
 import { registerVolumeTools } from "./tools/volume.js";
 import { registerBrowseTools } from "./tools/browse.js";
+import { registerQueueTools } from "./tools/queue.js";
+import { registerRoonPlaylistTools } from "./tools/roon-playlists.js";
 import { registerPlaylistTools } from "./tools/playlist.js";
 import { createControlRouter, createConfigRouter } from "./control/control-router.js";
+import { createMonitorRouter } from "./control/monitor-router.js";
 import express from "express";
 import { randomUUID } from "node:crypto";
 import { Bonjour } from "bonjour-service";
@@ -66,6 +69,8 @@ function createMcpServer(): McpServer {
   registerPlaybackTools(server);
   registerVolumeTools(server);
   registerBrowseTools(server);
+  registerQueueTools(server);
+  registerRoonPlaylistTools(server);
   registerPlaylistTools(server);
 
   return server;
@@ -133,6 +138,7 @@ async function startHttpServer(): Promise<void> {
   app.use("/mcp", authMiddleware);
   app.use("/control", authMiddleware);
   app.use("/config", authMiddleware);
+  app.use("/monitor", authMiddleware);
 
   // Health check (no auth required)
   app.get("/health", (_req, res) => {
@@ -151,6 +157,9 @@ async function startHttpServer(): Promise<void> {
 
   // roon-key config endpoints (GET/POST /config/roon-key)
   app.use("/config", createConfigRouter());
+
+  // Cheap script-callable monitor state read (GET /monitor/state)
+  app.use("/monitor", createMonitorRouter());
 
   // Legacy REST control endpoints for iOS Shortcuts and similar clients.
   // GET or POST both work so the iOS "Get Contents of URL" action can call
