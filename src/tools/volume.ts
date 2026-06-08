@@ -281,4 +281,87 @@ export function registerVolumeTools(server: McpServer): void {
       }
     },
   );
+
+  server.tool(
+    "mute_toggle",
+    "Toggle mute for a Roon zone: if every volume output is muted, unmute all; otherwise mute all. Mirrors the HTTP /control/mute_toggle used by roon-key. Use this when you want a single toggle rather than setting an explicit mute state.",
+    {
+      zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
+    },
+    async ({ zone }): Promise<ToolResult> => {
+      try {
+        const transport = roonConnection.getTransport();
+        const foundZone = roonConnection.findZoneOrThrow(zone);
+        const getZone = () => roonConnection.findZone(foundZone.display_name);
+
+        const volOutputs = foundZone.outputs.filter((o) => o.volume);
+        if (volOutputs.length === 0) {
+          return {
+            content: [{ type: "text", text: `No volume-controllable outputs in zone '${foundZone.display_name}'.` }],
+          };
+        }
+        // Mirror the ramper's own rule: all-muted -> unmute, else mute.
+        const willUnmute = volOutputs.every((o) => o.volume?.is_muted === true);
+
+        await sharedRamper.toggleMute(getZone, transport);
+
+        return {
+          content: [{ type: "text", text: `${willUnmute ? "Unmuted" : "Muted"} zone '${foundZone.display_name}'.` }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: String(error instanceof Error ? error.message : error) }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "volume_preset",
+    "Set a Roon zone to one of the configured roon-key volume presets, addressed by 1-based index. Smoothly ramps by default, or jumps instantly with instant=true. Presets are read from roon-key config; mirrors HTTP /control/volume_preset.",
+    {
+      zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
+      index: z.number().int().positive().describe("1-based preset index into the configured presets list"),
+      instant: z
+        .boolean()
+        .default(false)
+        .describe("If true, jump instantly; otherwise ramp smoothly to the preset level"),
+    },
+    async ({ zone, index, instant }): Promise<ToolResult> => {
+      try {
+        const cfg = readRoonKeyConfig();
+        if (index > cfg.presets.length) {
+          return {
+            content: [{ type: "text", text: `Preset index ${index} out of range (${cfg.presets.length} presets configured: ${cfg.presets.join(", ")}).` }],
+            isError: true,
+          };
+        }
+        const target = cfg.presets[index - 1];
+
+        const transport = roonConnection.getTransport();
+        const foundZone = roonConnection.findZoneOrThrow(zone);
+        const getZone = () => roonConnection.findZone(foundZone.display_name);
+        const useInstant = instant === true;
+
+        if (useInstant) {
+          await sharedRamper.instantAbsolute(target, getZone, transport);
+        } else {
+          // Fire and forget the ramp, like the HTTP preset path.
+          sharedRamper
+            .rampAbsolute(target, getZone, transport, cfg.ramp_step_ms)
+            .catch((e: unknown) => console.error("[volume_preset] error:", e));
+        }
+
+        return {
+          content: [{ type: "text", text: `Preset ${index} -> volume ${target}${useInstant ? " (instant)" : ""} in zone '${foundZone.display_name}'.` }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: String(error instanceof Error ? error.message : error) }],
+          isError: true,
+        };
+      }
+    },
+  );
 }

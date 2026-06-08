@@ -122,10 +122,12 @@ vi.mock("../src/control/roon-key-config.js", () => ({
 }));
 
 const { registerVolumeTools } = await import("../src/tools/volume.js");
+const { registerZoneTools } = await import("../src/tools/zone.js");
 
 function buildServer() {
   const server = new McpServer({ name: "t", version: "0" });
   registerVolumeTools(server);
+  registerZoneTools(server);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return server as any;
 }
@@ -275,5 +277,98 @@ describe("smooth_skip", () => {
     await call(server, "smooth_skip", { direction: "next", fade_ms: 4 });
     expect(world.outputs.find((o) => o.output_id === "out-WiiM")!.volume!.value).toBe(4);
     expect(world.outputs.find((o) => o.output_id === "out-KEF")!.volume!.value).toBe(4);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Objective 3: HTTP -> MCP parity tools (mute_toggle, volume_preset, zone_state)
+// ---------------------------------------------------------------------------
+
+describe("mute_toggle", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("mutes every output when none are muted", async () => {
+    reset([makeOutput("WiiM", 40, false), makeOutput("KEF", 40, false)]);
+    const server = buildServer();
+    const { isError, text } = await call(server, "mute_toggle", {});
+    expect(isError).toBe(false);
+    expect(text).toContain("Muted");
+    expect(world.muteCalls.map((c) => c.how)).toEqual(["mute", "mute"]);
+  });
+
+  it("unmutes every output when all are muted", async () => {
+    reset([makeOutput("WiiM", 40, true), makeOutput("KEF", 40, true)]);
+    const server = buildServer();
+    const { text } = await call(server, "mute_toggle", {});
+    expect(text).toContain("Unmuted");
+    expect(world.muteCalls.map((c) => c.how)).toEqual(["unmute", "unmute"]);
+  });
+
+  it("mutes all when only some are muted (partial -> mute)", async () => {
+    reset([makeOutput("WiiM", 40, true), makeOutput("KEF", 40, false)]);
+    const server = buildServer();
+    const { text } = await call(server, "mute_toggle", {});
+    expect(text).toContain("Muted");
+    expect(world.muteCalls.map((c) => c.how)).toEqual(["mute", "mute"]);
+  });
+});
+
+describe("volume_preset", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("ramps to the configured preset level (1-based index)", async () => {
+    // presets: [32, 40, 48, 56, 64, 72, 80]; index 5 -> 64.
+    reset([makeOutput("WiiM", 60)]);
+    const server = buildServer();
+    const { isError, text } = await call(server, "volume_preset", { index: 5 });
+    expect(isError).toBe(false);
+    expect(text).toContain("Preset 5 -> volume 64");
+
+    await waitFor(() => currentLevel() === 64);
+    world.volumeCalls.forEach((c) => expect(c.how).toBe("absolute"));
+  });
+
+  it("jumps instantly when instant=true", async () => {
+    reset([makeOutput("WiiM", 60)]);
+    const server = buildServer();
+    const { text } = await call(server, "volume_preset", { index: 7, instant: true });
+    expect(text).toContain("Preset 7 -> volume 80 (instant)");
+    // instantAbsolute issues a single relative call per output.
+    expect(world.volumeCalls).toHaveLength(1);
+    expect(world.volumeCalls[0].how).toBe("relative");
+    expect(world.volumeCalls[0].value).toBe(20);
+  });
+
+  it("fails loudly when the index is out of range", async () => {
+    reset([makeOutput("WiiM", 60)]);
+    const server = buildServer();
+    const { isError, text } = await call(server, "volume_preset", { index: 99 });
+    expect(isError).toBe(true);
+    expect(text).toContain("out of range");
+  });
+});
+
+describe("zone_state", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("returns a compact state + queue-runway snapshot with structured JSON", async () => {
+    reset([makeOutput("WiiM", 40)], { queue_items_remaining: 7, queue_time_remaining: 1830 });
+    const server = buildServer();
+    const { isError, text } = await call(server, "zone_state", {});
+    expect(isError).toBe(false);
+
+    const json = JSON.parse(text.split("\n").pop() as string);
+    expect(json.zone).toBe("WiiM + 1");
+    expect(json.state).toBe("playing");
+    expect(json.now_playing).toEqual({ title: "Track One", artist: "An Artist", album: "An Album" });
+    expect(json.queue_remaining_count).toBe(7);
+    expect(json.queue_time_remaining_seconds).toBe(1830);
+  });
+
+  it("fails loudly for an unknown zone", async () => {
+    reset([makeOutput("WiiM", 40)]);
+    const server = buildServer();
+    const { isError } = await call(server, "zone_state", { zone: "Garage" });
+    expect(isError).toBe(true);
   });
 });
