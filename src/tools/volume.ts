@@ -2,11 +2,32 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { roonConnection } from "../roon-connection.js";
 import type { ResultCallback } from "node-roon-api-transport";
+import { sharedRamper } from "../control/shared-ramper.js";
+import { VolumeRamper } from "../control/volume-ramper.js";
+import { readRoonKeyConfig } from "../control/roon-key-config.js";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
+/** Floor for derived ramp cadence; matches roon-key's ramp_step_ms minimum. */
+const MIN_STEP_MS = 5;
+
 function promisifyResult(fn: (cb: ResultCallback) => void): Promise<false | string> {
   return new Promise((resolve) => fn((error) => resolve(error)));
+}
+
+/** Per-step cadence (ms) to ramp `steps` 1-unit increments over durationMs. */
+function stepMsForDuration(steps: number, durationMs: number): number {
+  if (steps <= 0) return MIN_STEP_MS;
+  return Math.max(MIN_STEP_MS, Math.round(durationMs / steps));
+}
+
+/** Configured ramp cadence, or undefined to fall back to the ramper default. */
+function configuredStepMs(): number | undefined {
+  try {
+    return readRoonKeyConfig().ramp_step_ms;
+  } catch {
+    return undefined;
+  }
 }
 
 export function registerVolumeTools(server: McpServer): void {
@@ -46,6 +67,65 @@ export function registerVolumeTools(server: McpServer): void {
         }
 
         return { content: [{ type: "text", text: results.join("\n") }] };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: String(error instanceof Error ? error.message : error) }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "ramp_volume",
+    "Smoothly ramp a Roon zone's volume as an audible fade, instead of the instant jump change_volume produces. Set how='absolute' to ramp to a target level, or how='relative' to ramp by a signed delta. The ramp runs server-side and the call returns immediately; a new ramp or any volume command supersedes one in progress. Honors grouped zones (e.g. WiiM + 1) and each output's volume limits.",
+    {
+      zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
+      value: z.number().describe("Target level when how='absolute', or signed delta when how='relative'"),
+      how: z
+        .enum(["absolute", "relative"])
+        .default("absolute")
+        .describe("'absolute' ramps to the exact level; 'relative' ramps by the value (positive up, negative down)"),
+      duration_ms: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Total fade duration in milliseconds. If omitted, uses the configured ramp_step_ms cadence (~20ms per 1-unit step)."),
+    },
+    async ({ zone, value, how, duration_ms }): Promise<ToolResult> => {
+      try {
+        const transport = roonConnection.getTransport();
+        const foundZone = roonConnection.findZoneOrThrow(zone);
+        const getZone = () => roonConnection.findZone(foundZone.display_name);
+
+        const currentMax = VolumeRamper.currentMaxVolume(foundZone);
+        if (currentMax === null) {
+          return {
+            content: [{ type: "text", text: `No numeric-volume outputs in zone '${foundZone.display_name}' to ramp.` }],
+          };
+        }
+
+        const target = how === "absolute" ? value : currentMax + value;
+        const steps = Math.abs(target - currentMax);
+        if (steps === 0) {
+          return {
+            content: [{ type: "text", text: `Zone '${foundZone.display_name}' is already at ${target}; nothing to ramp.` }],
+          };
+        }
+
+        const stepMs = duration_ms != null ? stepMsForDuration(steps, duration_ms) : configuredStepMs();
+
+        // Fire and forget: kick the server-side ramp and return immediately,
+        // exactly like the HTTP /control/volume_ramp path.
+        sharedRamper
+          .rampAbsolute(target, getZone, transport, stepMs)
+          .catch((e: unknown) => console.error("[ramp_volume] error:", e));
+
+        const dur = duration_ms != null ? `${duration_ms}ms` : `${steps} steps`;
+        return {
+          content: [{ type: "text", text: `Ramping '${foundZone.display_name}' from ${currentMax} to ${target} over ${dur}.` }],
+        };
       } catch (error) {
         return {
           content: [{ type: "text", text: String(error instanceof Error ? error.message : error) }],
