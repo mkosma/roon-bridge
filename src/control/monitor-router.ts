@@ -12,7 +12,7 @@
  *
  * It reads ONLY the in-memory zone map that roon-bridge already keeps fresh via
  * its single subscribe_zones stream. No browse, no subscribe_queue round trip,
- * no LLM, no MCP session — so it returns in well under the 150ms budget and
+ * no LLM, no MCP session - so it returns in well under the 150ms budget and
  * adds negligible load on the bridge or Roon Core.
  *
  * queue_remaining_count comes straight from Roon's zone.queue_items_remaining,
@@ -60,7 +60,7 @@ export function createMonitorRouter(): Router {
     }
     const zoneParam = (req.query.zone as string | undefined)?.trim() ?? "";
     // Only fall back to the default zone when no zone was requested. An
-    // explicit-but-unknown zone is a 404, not a silent default — a polling
+    // explicit-but-unknown zone is a 404, not a silent default - a polling
     // daemon must see when its target zone disappears.
     const target = zoneParam || roonConnection.getDefaultZone();
     const zone = target ? roonConnection.findZone(target) : null;
@@ -76,7 +76,7 @@ export function createMonitorRouter(): Router {
     res.json(snapshot(zone));
   });
 
-  // GET /monitor/state/all  — snapshot of every zone in one call.
+  // GET /monitor/state/all  - snapshot of every zone in one call.
   router.get("/state/all", (_req, res) => {
     if (!roonConnection.isConnected()) {
       res.status(503).json({ ok: false, error: "roon_not_connected" });

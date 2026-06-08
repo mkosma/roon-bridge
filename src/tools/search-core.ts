@@ -49,7 +49,7 @@ export function promisifyLoad(
 
 /**
  * Strip Roon's internal link format from text.
- * Roon subtitles may contain `[[12345|Artist Name]]` — extract just the name.
+ * Roon subtitles may contain `[[12345|Artist Name]]` - extract just the name.
  */
 export function stripRoonLinks(text: string): string {
   return text.replace(/\[\[\d+\|([^\]]+)\]\]/g, "$1");
@@ -183,7 +183,7 @@ const VARIANT_PENALTY = /\b(tribute|cover[s]?|karaoke|medley|in the style of|dj[
 /**
  * Score and rank playable items against a query. Returns candidates sorted
  * best-first, each with a confidence signal. Does NOT silently collapse to a
- * single result — the caller decides whether the top match is good enough or
+ * single result - the caller decides whether the top match is good enough or
  * whether to disambiguate.
  *
  * @param penalizeVariants when true (default for album/track queries), DJ

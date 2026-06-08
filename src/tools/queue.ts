@@ -18,7 +18,7 @@
  * So this module delivers, honestly:
  *   - queue_next       : real, native "Add Next" semantics, post-verified.
  *   - play_from_here   : real, native jump.
- *   - remove_from_queue: implemented via the only mechanism Roon permits —
+ *   - remove_from_queue: implemented via the only mechanism Roon permits -
  *                        play_from_here past the removed block when the removal
  *                        is the contiguous run of upcoming items at the head of
  *                        the queue (the realistic "skip these next N" case);
@@ -85,7 +85,7 @@ export function toQueueRow(item: QueueItem, index: number, nowPlayingId: number 
 /**
  * Read the queue and return structured rows. The now-playing item is the first
  * queue item whose title matches the zone's now_playing line1 AND, when
- * available, length — Roon does not hand us the now-playing queue_item_id
+ * available, length - Roon does not hand us the now-playing queue_item_id
  * directly, so we infer it positionally (the now-playing item is the head of
  * the queue while playing).
  */
@@ -286,7 +286,7 @@ async function findAndQueue(
 
   return jsonResult({
     ok: true,
-    action: action.matched, // "Add Next" or "Queue" — what Roon actually did
+    action: action.matched, // "Add Next" or "Queue" - what Roon actually did
     intent,
     matched: {
       title: resolved.matchTitle,
@@ -309,7 +309,7 @@ async function findAndQueue(
 
 export function registerQueueTools(server: McpServer): void {
   // ---------------------------------------------------------------------------
-  // queue_next — insert a track/album/playlist immediately after current track.
+  // queue_next - insert a track/album/playlist immediately after current track.
   // ---------------------------------------------------------------------------
   server.tool(
     "queue_next",
@@ -333,7 +333,7 @@ export function registerQueueTools(server: McpServer): void {
   );
 
   // ---------------------------------------------------------------------------
-  // play_from_here — jump playback to a queued item by its stable id.
+  // play_from_here - jump playback to a queued item by its stable id.
   // ---------------------------------------------------------------------------
   server.tool(
     "play_from_here",
@@ -378,13 +378,13 @@ export function registerQueueTools(server: McpServer): void {
   );
 
   // ---------------------------------------------------------------------------
-  // remove_from_queue — remove upcoming items by id.
+  // remove_from_queue - remove upcoming items by id.
   //
   // Roon exposes no arbitrary queue-item delete. The one removal it DOES allow
   // is "skip past" the contiguous run of upcoming items at the head: jumping
   // playback (play_from_here) to the first item AFTER the removed block drops
-  // those items from what will play. We support exactly that case — removing a
-  // contiguous block starting at the next-up item — and FAIL LOUDLY otherwise,
+  // those items from what will play. We support exactly that case - removing a
+  // contiguous block starting at the next-up item - and FAIL LOUDLY otherwise,
   // rather than silently no-op.
   // ---------------------------------------------------------------------------
   server.tool(
@@ -505,7 +505,7 @@ export function registerQueueTools(server: McpServer): void {
   );
 
   // ---------------------------------------------------------------------------
-  // reorder_queue — move an upcoming item to a new position.
+  // reorder_queue - move an upcoming item to a new position.
   //
   // Roon's extension API exposes no queue-move primitive at all. We do not fake
   // it. This tool validates the request, then fails loudly with the precise

@@ -1,16 +1,16 @@
 # roon-bridge
 
-A persistent HTTP-based MCP server for controlling [Roon](https://roon.app) via Claude. Runs as a single background service on your Roon Core machine and serves any number of Claude sessions (Desktop, Cowork, Claude Code, Dispatch) simultaneously — over your local network or Tailscale.
+A persistent HTTP-based MCP server for controlling [Roon](https://roon.app) via Claude. Runs as a single background service on your Roon Core machine and serves any number of Claude sessions (Desktop, Cowork, Claude Code, Dispatch) simultaneously - over your local network or Tailscale.
 
 ## Why this exists
 
-The original [roon-mcp](https://github.com/AzureStackNerd/roon-mcp) by AzureStackNerd is an excellent MCP server for Roon, but it uses stdio transport — meaning every Claude session spawns its own process and Roon connection. Roon sees each connection as a separate extension requiring individual authorization. With multiple Claude entry points (Dispatch, Cowork, Claude Code), this quickly becomes unworkable: duplicate extensions pile up, each needing manual approval.
+The original [roon-mcp](https://github.com/AzureStackNerd/roon-mcp) by AzureStackNerd is an excellent MCP server for Roon, but it uses stdio transport - meaning every Claude session spawns its own process and Roon connection. Roon sees each connection as a separate extension requiring individual authorization. With multiple Claude entry points (Dispatch, Cowork, Claude Code), this quickly becomes unworkable: duplicate extensions pile up, each needing manual approval.
 
 **roon-bridge** solves this by decoupling the Roon connection from the MCP transport:
 
-- **One process, one Roon extension** — a persistent HTTP server holds the single WebSocket connection to Roon Core. Pair once, done forever.
-- **Many clients** — any Claude session on any device connects to the HTTP endpoint. No new Roon extensions, no re-authorization.
-- **Network-accessible** — works across your LAN or Tailscale mesh, with bearer token auth.
+- **One process, one Roon extension** - a persistent HTTP server holds the single WebSocket connection to Roon Core. Pair once, done forever.
+- **Many clients** - any Claude session on any device connects to the HTTP endpoint. No new Roon extensions, no re-authorization.
+- **Network-accessible** - works across your LAN or Tailscale mesh, with bearer token auth.
 
 The tool definitions (playback, volume, search, browse) are ported from roon-mcp with minimal changes. Full credit to [AzureStackNerd/roon-mcp](https://github.com/AzureStackNerd/roon-mcp) for the original implementation and Roon API integration patterns.
 
@@ -61,11 +61,11 @@ Qobuz is the only implemented provider. App credentials are extracted
 browser-free from the Qobuz web bundle. The user token is read from
 `~/.qobuz-mcp/token.json`, which is produced by the **standalone**
 `refresh_token.py` (Playwright + one-time reCAPTCHA login) in the
-`qobuz-mcp` repo — that script is intentionally **not** a dependency of
+`qobuz-mcp` repo - that script is intentionally **not** a dependency of
 roon-bridge. On token expiry the tools return an actionable error telling
 you to run it; `QOBUZ_AUTO_REFRESH=1` opts into auto-invoking it.
 
-Adding Tidal (or another service) is implementing one interface — see
+Adding Tidal (or another service) is implementing one interface - see
 `src/providers/tidal/README.md`. The standalone `qobuz-mcp` MCP server is
 now redundant for playlists; keep only its `refresh_token.py`.
 
@@ -210,7 +210,7 @@ macOS restricts network access for background processes when no user session is 
 3. **Prevent sleep:** System Settings → Energy Saver → turn on "Prevent automatic sleeping when the display is off"
 4. **Wake for network:** System Settings → Energy Saver → turn on "Wake for network access"
 5. **Roon Server:** Enable "Launch at startup" in the Roon Server menu bar icon
-6. **roon-bridge:** Handled by the LaunchAgent installed above — starts automatically on login
+6. **roon-bridge:** Handled by the LaunchAgent installed above - starts automatically on login
 
 With auto-login enabled, the Mac boots straight into your user session, both services start, and they stay running even when the screen locks.
 
@@ -238,7 +238,7 @@ launchctl print gui/$(id -u)/com.roon-bridge
 tail -f ~/Library/Logs/roon-bridge.log
 ```
 
-Log rotation is handled by macOS `newsyslog` — 5 rotated copies, compressed, up to 1MB each.
+Log rotation is handled by macOS `newsyslog` - 5 rotated copies, compressed, up to 1MB each.
 
 ## Stdio mode
 
@@ -254,38 +254,38 @@ This bypasses the HTTP server and speaks MCP over stdin/stdout. Not recommended 
 
 All the same tools as [roon-mcp](https://github.com/AzureStackNerd/roon-mcp):
 
-- `list_zones` — list all Roon zones and their playback status
-- `now_playing` — what's currently playing
-- `get_queue` — view the play queue
-- `play` / `pause` / `play_pause` / `stop` — transport controls
-- `next_track` / `previous_track` — track navigation
-- `seek` — seek within the current track
-- `shuffle` / `loop` — playback mode
-- `change_volume` / `mute` / `get_volume` — volume controls
-- `search` — search the Roon library
-- `play_artist` / `play_album` / `play_playlist` / `play_track` — search and play
-- `add_to_queue` — search and queue (re-verified against a queue read)
+- `list_zones` - list all Roon zones and their playback status
+- `now_playing` - what's currently playing
+- `get_queue` - view the play queue
+- `play` / `pause` / `play_pause` / `stop` - transport controls
+- `next_track` / `previous_track` - track navigation
+- `seek` - seek within the current track
+- `shuffle` / `loop` - playback mode
+- `change_volume` / `mute` / `get_volume` - volume controls
+- `search` - search the Roon library
+- `play_artist` / `play_album` / `play_playlist` / `play_track` - search and play
+- `add_to_queue` - search and queue (re-verified against a queue read)
 
 ### Queue editing (stable item ids)
 
-- `get_queue` — now returns a stable `queue_item_id` per row plus structured
+- `get_queue` - now returns a stable `queue_item_id` per row plus structured
   metadata (title, artist, album, length, `is_now_playing`), alongside the
   human-readable list.
-- `queue_next` — insert a track/album/playlist immediately after the current
+- `queue_next` - insert a track/album/playlist immediately after the current
   track (Roon "Add Next"); verified against a follow-up queue read.
-- `play_from_here` — jump playback to a queued item by `queue_item_id`.
-- `remove_from_queue` — remove a **contiguous block of next-up items** by
+- `play_from_here` - jump playback to a queued item by `queue_item_id`.
+- `remove_from_queue` - remove a **contiguous block of next-up items** by
   skipping past it (the only removal Roon's extension API permits). Fails
   loudly for non-contiguous, now-playing, or stale-id removals.
-- `reorder_queue` — Roon's extension API exposes **no** queue-move primitive;
+- `reorder_queue` - Roon's extension API exposes **no** queue-move primitive;
   this tool reports that honestly rather than returning a false success. Use
   `queue_next` / `play_from_here` instead.
 
 ### Roon-native playlists
 
-- `list_roon_playlists` — list Roon's OWN playlists (e.g. "Hearted Albums &
+- `list_roon_playlists` - list Roon's OWN playlists (e.g. "Hearted Albums &
   Songs", "Roon Discoveries") that the Qobuz/Tidal tools cannot see.
-- `get_roon_playlist` — read a Roon-native playlist's full track list by name
+- `get_roon_playlist` - read a Roon-native playlist's full track list by name
   or item_key, paginated (`offset`/`limit`) for large lists.
 
 ## Monitor endpoint (cheap, script-callable)
@@ -421,9 +421,9 @@ disturb Roon playback. The new MCP tools appear after the client reconnects.
 
 ## Credits
 
-- [AzureStackNerd/roon-mcp](https://github.com/AzureStackNerd/roon-mcp) — the original MCP server for Roon that this project is based on. Tool definitions, Roon API integration patterns, and the WebSocket patch are adapted from that project (MIT license).
-- [Roon Labs](https://roon.app) — for the Roon API and Node.js client libraries.
-- [Model Context Protocol](https://modelcontextprotocol.io) — the protocol that makes all of this work.
+- [AzureStackNerd/roon-mcp](https://github.com/AzureStackNerd/roon-mcp) - the original MCP server for Roon that this project is based on. Tool definitions, Roon API integration patterns, and the WebSocket patch are adapted from that project (MIT license).
+- [Roon Labs](https://roon.app) - for the Roon API and Node.js client libraries.
+- [Model Context Protocol](https://modelcontextprotocol.io) - the protocol that makes all of this work.
 
 ## License
 

@@ -83,7 +83,7 @@ export function registerRoonPlaylistTools(server: McpServer): void {
   // ---------------------------------------------------------------------------
   server.tool(
     "list_roon_playlists",
-    "List Roon's OWN playlists (e.g. 'Hearted Albums & Songs', 'Roon Discoveries') — the ones the Qobuz/Tidal playlist tools cannot see. Returns each playlist's name and a stable browse item_key usable with get_roon_playlist.",
+    "List Roon's OWN playlists (e.g. 'Hearted Albums & Songs', 'Roon Discoveries') - the ones the Qobuz/Tidal playlist tools cannot see. Returns each playlist's name and a stable browse item_key usable with get_roon_playlist.",
     {},
     async (): Promise<ToolResult> => {
       try {
