@@ -9,10 +9,14 @@ import type {
   LoadResult,
   BrowseItem,
 } from "node-roon-api-browse";
+import { DeferredPlayer } from "../control/deferred-player.js";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
 let sessionCounter = 0;
+
+// One shared scheduler for event-driven "play after the current track" (Obj 5).
+const deferredPlayer = new DeferredPlayer(roonConnection);
 
 function newSessionKey(): string {
   return `mcp-${++sessionCounter}`;
@@ -625,6 +629,51 @@ async function searchAndPlay(
   }
 }
 
+/**
+ * Play a match, honoring `when`. `now` replaces immediately (current behavior).
+ * `after_current` arms an event-driven deferral so the queue-replace fires at
+ * the end of the current track - clean queue AND no mid-track stomp - instead
+ * of the agent trying (and failing) to time it. If nothing is playing there is
+ * no seam to wait for, so it plays now.
+ */
+async function playWithWhen(
+  query: string,
+  zoneName: string,
+  category: "album" | "track",
+  when: "now" | "after_current",
+): Promise<ToolResult> {
+  if (when === "after_current") {
+    let zone;
+    try {
+      zone = roonConnection.findZoneOrThrow(zoneName);
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: String(error instanceof Error ? error.message : error) }],
+        isError: true,
+      };
+    }
+
+    const np = zone.now_playing;
+    if (zone.state === "playing" && np && np.length != null) {
+      // Fire and forget: the replace runs server-side at the track seam.
+      deferredPlayer
+        .scheduleAfterCurrent(zone, () => searchAndPlay(query, zoneName, category, "play"))
+        .catch((e: unknown) => console.error("[playWithWhen] schedule error:", e));
+      return {
+        content: [{
+          type: "text",
+          text: `Scheduled: "${query}" will replace the queue in '${zone.display_name}' when "${np.three_line.line1}" ends (no mid-track cut).`,
+        }],
+      };
+    }
+    // Nothing playing - no seam to wait for; play now.
+  }
+
+  // An immediate play supersedes any armed deferral.
+  deferredPlayer.cancel();
+  return searchAndPlay(query, zoneName, category, "play");
+}
+
 export function registerBrowseTools(server: McpServer): void {
   server.tool(
     "search",
@@ -769,12 +818,16 @@ export function registerBrowseTools(server: McpServer): void {
 
   server.tool(
     "play_album",
-    "Search for an album and start playing it in a Roon zone",
+    "Search for an album and play it in a Roon zone. when='now' (default) replaces the queue immediately; when='after_current' defers the replace until the current track ends - server-side and event-driven, so the queue stays clean and the playing track is never cut mid-way.",
     {
       album: z.string().describe("Album name to search for"),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
+      when: z
+        .enum(["now", "after_current"])
+        .default("now")
+        .describe("'now' replaces immediately; 'after_current' waits for the current track to end, then replaces"),
     },
-    async ({ album, zone }) => searchAndPlay(album, zone, "album"),
+    async ({ album, zone, when }) => playWithWhen(album, zone, "album", when ?? "now"),
   );
 
   server.tool(
@@ -789,12 +842,16 @@ export function registerBrowseTools(server: McpServer): void {
 
   server.tool(
     "play_track",
-    "Search for a specific track/song and start playing it in a Roon zone",
+    "Search for a specific track/song and play it in a Roon zone. when='now' (default) replaces the queue immediately; when='after_current' defers the replace until the current track ends - server-side and event-driven, so the queue stays clean and the playing track is never cut mid-way.",
     {
       track: z.string().describe("Track/song name to search for"),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
+      when: z
+        .enum(["now", "after_current"])
+        .default("now")
+        .describe("'now' replaces immediately; 'after_current' waits for the current track to end, then replaces"),
     },
-    async ({ track, zone }) => searchAndPlay(track, zone, "track"),
+    async ({ track, zone, when }) => playWithWhen(track, zone, "track", when ?? "now"),
   );
 
   server.tool(
@@ -813,47 +870,12 @@ export function registerBrowseTools(server: McpServer): void {
 
   server.tool(
     "play_after_current",
-    "Search for a track and play it immediately when the current track ends. Returns instantly — the play is scheduled in the background.",
+    "Search for a track and replace the queue with it when the current track ends. Event-driven (waits for the real track-change, robust to pause/seek/skip), not a wall-clock timer. Equivalent to play_track with when='after_current'.",
     {
       track: z.string().describe("Track/song name to search for and play when the current track ends"),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
     },
-    async ({ track, zone: zoneName }): Promise<ToolResult> => {
-      try {
-        const zoneObj = roonConnection.findZoneOrThrow(zoneName);
-        const np = zoneObj.now_playing;
-
-        if (!np || zoneObj.state !== "playing" || np.length == null || np.seek_position == null) {
-          // Nothing currently playing — fire immediately
-          return searchAndPlay(track, zoneName, "track", "play");
-        }
-
-        const remaining = Math.max(0, np.length - np.seek_position);
-        // Trigger slightly early so Roon has time to load and start seamlessly
-        const delayMs = Math.max(0, (remaining - 0.8) * 1000);
-        const nowPlayingTitle = np.three_line.line1;
-
-        setTimeout(() => {
-          searchAndPlay(track, zoneName, "track", "play").catch((err) =>
-            console.error(`[roon-bridge] play_after_current error:`, err),
-          );
-        }, delayMs);
-
-        const mins = Math.floor(remaining / 60);
-        const secs = Math.floor(remaining % 60);
-        return {
-          content: [{
-            type: "text",
-            text: `Scheduled: "${track}" will play in ~${mins}:${secs.toString().padStart(2, "0")} when "${nowPlayingTitle}" finishes in zone '${zoneObj.display_name}'.`,
-          }],
-        };
-      } catch (error) {
-        return {
-          content: [{ type: "text", text: String(error instanceof Error ? error.message : error) }],
-          isError: true,
-        };
-      }
-    },
+    async ({ track, zone: zoneName }) => playWithWhen(track, zoneName, "track", "after_current"),
   );
 
   server.tool(

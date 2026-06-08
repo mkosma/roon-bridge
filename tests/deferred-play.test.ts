@@ -1,0 +1,306 @@
+/**
+ * Tests for the event-driven deferred-replace feature (Objective 5):
+ *   Part A - DeferredPlayer boundary logic in isolation (fake event source).
+ *   Part B - play_album/play_track when='after_current' wiring through the
+ *            browse tool, with a mock roon-connection that emits the same
+ *            "zone-seek" / "zones-changed" events the real connection does.
+ *
+ * The whole point is that timing happens server-side off Roon's own events,
+ * not a wall-clock timer - so these drive synthetic track-change events rather
+ * than waiting on any clock.
+ */
+
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { EventEmitter } from "node:events";
+import type { Zone } from "node-roon-api-transport";
+import type { BrowseItem, BrowseResult, LoadResult } from "node-roon-api-browse";
+import { DeferredPlayer } from "../src/control/deferred-player.js";
+
+// ---------------------------------------------------------------------------
+// Part A: DeferredPlayer in isolation
+// ---------------------------------------------------------------------------
+
+class FakeSource extends EventEmitter {
+  zone: Zone | null = null;
+  findZone(): Zone | null {
+    return this.zone;
+  }
+}
+
+function playingZone(title: string, length: number, seek: number, state: Zone["state"] = "playing"): Zone {
+  return {
+    zone_id: "zone-1",
+    display_name: "WiiM + 1",
+    state,
+    outputs: [],
+    now_playing: {
+      one_line: { line1: title },
+      two_line: { line1: title, line2: "Artist" },
+      three_line: { line1: title, line2: "Artist" },
+      length,
+      seek_position: seek,
+    },
+  } as unknown as Zone;
+}
+
+function setTrack(src: FakeSource, title: string, length: number, seek: number) {
+  src.zone = playingZone(title, length, seek);
+}
+function setSeek(src: FakeSource, seek: number) {
+  if (src.zone?.now_playing) src.zone.now_playing.seek_position = seek;
+}
+
+describe("DeferredPlayer", () => {
+  it("fires immediately when nothing is playing", async () => {
+    const src = new FakeSource();
+    src.zone = playingZone("X", 100, 0, "stopped");
+    const player = new DeferredPlayer(src);
+    const action = vi.fn(async () => {});
+
+    const res = await player.scheduleAfterCurrent(src.zone, action);
+    expect(res).toBe("fired");
+    expect(action).toHaveBeenCalledTimes(1);
+    expect(player.isArmed()).toBe(false);
+  });
+
+  it("fires at a natural track end (outgoing track played to completion)", async () => {
+    const src = new FakeSource();
+    setTrack(src, "Track A", 100, 0);
+    const player = new DeferredPlayer(src);
+    const action = vi.fn(async () => {});
+
+    const res = await player.scheduleAfterCurrent(src.zone!, action);
+    expect(res).toBe("scheduled");
+    expect(action).not.toHaveBeenCalled();
+
+    // Progress to near the end, then the track changes -> natural end -> fire.
+    setSeek(src, 90);
+    src.emit("zone-seek", "zone-1");
+    setTrack(src, "Track B", 100, 0);
+    src.emit("zones-changed");
+
+    await Promise.resolve();
+    expect(action).toHaveBeenCalledTimes(1);
+    expect(player.isArmed()).toBe(false);
+  });
+
+  it("re-arms (does not fire) on a manual skip, then fires at the next natural end", async () => {
+    const src = new FakeSource();
+    setTrack(src, "Track A", 100, 0);
+    const player = new DeferredPlayer(src);
+    const action = vi.fn(async () => {});
+
+    await player.scheduleAfterCurrent(src.zone!, action);
+
+    // Skip early: only 20% elapsed when the track changes -> re-arm onto B.
+    setSeek(src, 20);
+    src.emit("zone-seek", "zone-1");
+    setTrack(src, "Track B", 100, 0);
+    src.emit("zones-changed");
+
+    expect(action).not.toHaveBeenCalled();
+    expect(player.isArmed()).toBe(true);
+
+    // Now let B finish naturally.
+    setSeek(src, 95);
+    src.emit("zone-seek", "zone-1");
+    setTrack(src, "Track C", 100, 0);
+    src.emit("zones-changed");
+
+    await Promise.resolve();
+    expect(action).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fire on a same-track change (pause/settings/queue edit)", async () => {
+    const src = new FakeSource();
+    setTrack(src, "Track A", 100, 30);
+    const player = new DeferredPlayer(src);
+    const action = vi.fn(async () => {});
+
+    await player.scheduleAfterCurrent(src.zone!, action);
+
+    // A zones-changed that does NOT change the track (e.g. volume/settings).
+    src.emit("zones-changed");
+    await Promise.resolve();
+
+    expect(action).not.toHaveBeenCalled();
+    expect(player.isArmed()).toBe(true);
+  });
+
+  it("cancel() disarms so the boundary no longer fires", async () => {
+    const src = new FakeSource();
+    setTrack(src, "Track A", 100, 90);
+    const player = new DeferredPlayer(src);
+    const action = vi.fn(async () => {});
+
+    await player.scheduleAfterCurrent(src.zone!, action);
+    player.cancel();
+    expect(player.isArmed()).toBe(false);
+
+    setTrack(src, "Track B", 100, 0);
+    src.emit("zones-changed");
+    await Promise.resolve();
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it("a second schedule supersedes the first (only the latest fires)", async () => {
+    const src = new FakeSource();
+    setTrack(src, "Track A", 100, 90);
+    const player = new DeferredPlayer(src);
+    const first = vi.fn(async () => {});
+    const second = vi.fn(async () => {});
+
+    await player.scheduleAfterCurrent(src.zone!, first);
+    await player.scheduleAfterCurrent(src.zone!, second);
+
+    setSeek(src, 95);
+    src.emit("zone-seek", "zone-1");
+    setTrack(src, "Track B", 100, 0);
+    src.emit("zones-changed");
+
+    await Promise.resolve();
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Part B: play_album/play_track when='after_current' through the browse tool
+// ---------------------------------------------------------------------------
+
+const world = {
+  executed: [] as string[],
+};
+
+let stage: "root" | "category" | "match" | "action" = "root";
+
+function stageItems(): BrowseItem[] {
+  switch (stage) {
+    case "category":
+      return [{ title: "Albums", item_key: "cat:album", hint: "list" }];
+    case "match":
+      return [{ title: "Some Album", item_key: "match:album", hint: "list", subtitle: "An Artist" }];
+    case "action":
+      return [
+        { title: "Play Now", item_key: "act:play", hint: "action" },
+        { title: "Queue", item_key: "act:queue", hint: "action" },
+      ];
+    default:
+      return [];
+  }
+}
+
+const mockBrowse = {
+  browse: (opts: Record<string, unknown>, cb: (e: false | string, b: BrowseResult) => void) => {
+    if (opts.pop_all) {
+      stage = "category";
+      cb(false, { action: "list", list: { title: "Search", count: 1, level: 0 } });
+      return;
+    }
+    const key = String(opts.item_key ?? "");
+    if (key === "cat:album") {
+      stage = "match";
+      cb(false, { action: "list", list: { title: "Albums", count: 1, level: 1 } });
+      return;
+    }
+    if (key === "match:album") {
+      stage = "action";
+      cb(false, { action: "list", list: { title: "Some Album", count: 2, level: 2, hint: "action_list" } });
+      return;
+    }
+    if (key.startsWith("act:")) {
+      world.executed.push(key);
+      cb(false, { action: "none" });
+      return;
+    }
+    cb(false, { action: "none" });
+  },
+  load: (_opts: Record<string, unknown>, cb: (e: false | string, b: LoadResult) => void) => {
+    const items = stageItems();
+    cb(false, { items, offset: 0, list: { title: "x", count: items.length, level: 0 } });
+  },
+};
+
+class MockConnection extends EventEmitter {
+  zone: Zone = playingZone("Now Playing", 100, 0);
+  getBrowse() {
+    return mockBrowse;
+  }
+  getTransport() {
+    return { change_settings: (_z: unknown, _s: unknown, cb: () => void) => cb() };
+  }
+  findZone() {
+    return this.zone;
+  }
+  findZoneOrThrow() {
+    return this.zone;
+  }
+}
+
+const mockConn = new MockConnection();
+
+vi.mock("../src/roon-connection.js", () => ({
+  roonConnection: mockConn,
+}));
+
+const { registerBrowseTools } = await import("../src/tools/browse.js");
+
+function buildServer() {
+  const server = new McpServer({ name: "t", version: "0" });
+  registerBrowseTools(server);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return server as any;
+}
+
+async function call(server: unknown, name: string, args: Record<string, unknown>) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const tool = (server as any)._registeredTools[name];
+  const res = await tool.handler(args, {});
+  const text = res.content.map((c: { text: string }) => c.text).join("\n");
+  return { isError: res.isError === true, text };
+}
+
+async function waitFor(cond: () => boolean, timeoutMs = 500): Promise<void> {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > timeoutMs) throw new Error("waitFor timed out");
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+describe("play_album when='after_current' (tool integration)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    world.executed = [];
+    stage = "root";
+    mockConn.zone = playingZone("Now Playing", 100, 0);
+  });
+
+  it("defers the replace until the track ends, then executes Play Now", async () => {
+    const server = buildServer();
+    const { isError, text } = await call(server, "play_album", { album: "Some Album", when: "after_current" });
+
+    expect(isError).toBe(false);
+    expect(text).toContain("Scheduled");
+    // The browse Play Now must NOT have run yet.
+    expect(world.executed).not.toContain("act:play");
+
+    // Drive the track to its end, then change track -> natural seam.
+    if (mockConn.zone.now_playing) mockConn.zone.now_playing.seek_position = 96;
+    mockConn.emit("zone-seek", "zone-1");
+    mockConn.zone = playingZone("Next Track", 100, 0);
+    mockConn.emit("zones-changed");
+
+    await waitFor(() => world.executed.includes("act:play"));
+  });
+
+  it("when='now' replaces immediately", async () => {
+    const server = buildServer();
+    const { isError, text } = await call(server, "play_album", { album: "Some Album", when: "now" });
+
+    expect(isError).toBe(false);
+    expect(text).toContain("Now playing");
+    expect(world.executed).toContain("act:play");
+  });
+});
