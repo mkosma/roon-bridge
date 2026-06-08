@@ -39,6 +39,21 @@ function jsonResult(payload: unknown, isError = false): ToolResult {
 const HIER = "browse";
 
 /**
+ * Roon's playlist browse node prepends action rows before the real tracks - the
+ * play-all controls ("Play Playlist", "Shuffle", "Start Radio", ...). They leak
+ * in as phantom tracks (e.g. position 1 = `{ title: "Play Playlist", artist:
+ * null }`). They carry an action-style title and no artist subtitle, so we drop
+ * any header row and any row whose title is a known browse action. Real tracks
+ * never collide with these titles in practice.
+ */
+const PLAYLIST_ACTION_TITLE =
+  /^(play playlist|play now|play album|play artist|play|shuffle|add next|queue|add to queue|start radio)$/i;
+
+function isPlaylistActionRow(i: BrowseItem): boolean {
+  return i.hint === "header" || PLAYLIST_ACTION_TITLE.test(i.title.trim());
+}
+
+/**
  * Reach the list of Roon-native playlists. Navigates browse root, finds the
  * "Playlists" node, and returns its loaded items plus the session key (so a
  * follow-up drill stays in the same browse session).
@@ -165,15 +180,38 @@ export function registerRoonPlaylistTools(server: McpServer): void {
         );
         if (entered.error) return jsonResult({ ok: false, error: entered.error, playlist: playlistName }, true);
 
-        const total = entered.list?.count ?? 0;
+        const rawTotal = entered.list?.count ?? 0;
         const listTitle = entered.list?.title ?? playlistName;
 
-        // Page the tracks with Roon load offset/count.
+        // Roon prepends action rows (e.g. "Play Playlist") at the head of the
+        // list. Probe the head to count them so positions, total, and
+        // pagination offsets are all expressed in terms of real tracks.
+        let leadingActionRows = 0;
+        const probe = await promisifyLoad(browse, {
+          hierarchy: HIER,
+          multi_session_key: sessionKey,
+          offset: 0,
+          count: 10,
+        });
+        if (probe.error) {
+          return jsonResult({ ok: false, error: String(probe.error), playlist: listTitle }, true);
+        }
+        for (const it of probe.body.items ?? []) {
+          if (isPlaylistActionRow(it)) leadingActionRows++;
+          else break;
+        }
+        const total = Math.max(0, rawTotal - leadingActionRows);
+
+        // Page the tracks with Roon load offset/count, shifted past the action
+        // rows so the caller's offset addresses real tracks.
         const pageItems: BrowseItem[] = [];
-        let cursor = offset;
-        const hardEnd = Math.min(offset + limit, total || offset + limit);
-        while (cursor < hardEnd) {
-          const count = Math.min(100, hardEnd - cursor);
+        let cursor = offset + leadingActionRows;
+        const rawHardEnd = Math.min(
+          offset + limit + leadingActionRows,
+          rawTotal || offset + limit + leadingActionRows,
+        );
+        while (cursor < rawHardEnd) {
+          const count = Math.min(100, rawHardEnd - cursor);
           const loaded = await promisifyLoad(browse, {
             hierarchy: HIER,
             multi_session_key: sessionKey,
@@ -190,7 +228,7 @@ export function registerRoonPlaylistTools(server: McpServer): void {
         }
 
         const tracks = pageItems
-          .filter((i) => i.hint !== "header")
+          .filter((i) => !isPlaylistActionRow(i))
           .map((i, idx) => ({
             position: offset + idx + 1,
             item_key: i.item_key ?? null,
