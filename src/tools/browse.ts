@@ -168,6 +168,7 @@ async function resolveActionItems(
   zoneId: string | undefined,
   category: string | undefined,
   sessionKey: string,
+  opts: { seekLibrary?: boolean } = {},
 ): Promise<ResolvedActions> {
   const hierarchy = "search";
 
@@ -218,10 +219,48 @@ async function resolveActionItems(
   if (!actionData.items?.length) return { matched, actionItems: [] };
 
   // Navigate deeper to the actual action list when Roon nests it one level.
+  //
+  // Two drill modes. A plain play/queue resolve stops as soon as any executable
+  // action is visible. A library add/remove (seekLibrary) must keep going until
+  // the *library* toggle is in hand: Roon frequently lands the first browse on
+  // the album/artist CONTENT page - a "Play Album" header action plus the
+  // numbered track rows - and tucks the full action menu (Play Now / Add Next /
+  // Queue / Start Radio / Add to Library) behind a nested action_list. The play
+  // path is satisfied by the content page's "Play Album" and would stop there;
+  // the library path is not, so it drills past the content page to the menu.
   let actionItems = actionData.items;
   let currentListHint = actionData.list?.hint;
   for (let depth = 0; depth < 3; depth++) {
     if (currentListHint === "action_list") break;
+
+    if (opts.seekLibrary) {
+      // Already on the action menu (it carries the library toggle)? Done.
+      if (findLibraryAction(actionItems, "add") || findLibraryAction(actionItems, "remove")) break;
+      // Otherwise drill into the nested action menu. The menu is an action_list;
+      // track/sub-album rows are hint:"list" and must be skipped. As a fallback
+      // for sources that present the album's menu as a plain list, drill the one
+      // list row whose title is the matched item itself (never a track row,
+      // which Roon titles "1. Walk On", "2. ...").
+      const matchTitle = matched.title.trim().toLowerCase();
+      const menu =
+        actionItems.find((i) => i.item_key && i.hint === "action_list") ||
+        actionItems.find(
+          (i) => i.item_key && i.hint === "list" && i.title.trim().toLowerCase() === matchTitle,
+        );
+      if (!menu) break;
+      const deeper = await browseAndLoad(browse, {
+        hierarchy,
+        item_key: menu.item_key!,
+        zone_or_output_id: zoneId,
+        multi_session_key: sessionKey,
+      });
+      if (deeper.message) return { matched, message: deeper.message };
+      if (deeper.error || !deeper.items?.length) break;
+      actionItems = deeper.items;
+      currentListHint = deeper.list?.hint;
+      continue;
+    }
+
     if (actionItems.some((i) => i.hint === "action")) break;
     const navigable = actionItems.filter(
       (i) => i.item_key && (i.hint === "action_list" || i.hint === "list"),
@@ -1197,7 +1236,9 @@ export function registerBrowseTools(server: McpServer): void {
         const zoneId = zoneObj.zone_id;
         const cat = category ?? "album";
 
-        const resolved = await resolveActionItems(browse, query, zoneId, cat, newSessionKey());
+        const resolved = await resolveActionItems(browse, query, zoneId, cat, newSessionKey(), {
+          seekLibrary: true,
+        });
         if (resolved.error) {
           return { content: [{ type: "text", text: resolved.error }], isError: true };
         }
@@ -1261,7 +1302,9 @@ export function registerBrowseTools(server: McpServer): void {
         }
 
         // Verify with a fresh navigation: the menu should now offer Remove, not Add.
-        const reResolved = await resolveActionItems(browse, query, zoneId, cat, newSessionKey());
+        const reResolved = await resolveActionItems(browse, query, zoneId, cat, newSessionKey(), {
+          seekLibrary: true,
+        });
         let verified = false;
         if (!reResolved.error && reResolved.actionItems) {
           verified =
