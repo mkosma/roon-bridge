@@ -5,7 +5,6 @@ import type { ResultCallback } from "node-roon-api-transport";
 import { sharedRamper } from "../control/shared-ramper.js";
 import { VolumeRamper } from "../control/volume-ramper.js";
 import { readRoonKeyConfig } from "../control/roon-key-config.js";
-import { waitForTrackStart, trackKeyOf } from "../control/track-gate.js";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
@@ -13,19 +12,31 @@ type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: bo
 const MIN_STEP_MS = 5;
 
 /**
- * smooth_skip fade-feel tuning (see Maya's 2026-06-08 ticket). These are the
- * starting points for the live FEEL pass; the out-leg is a quick clean fade,
- * the in-leg a slightly longer ride-in over the opening of the new track.
+ * smooth_skip fade-feel tuning. Iteration 2 (Maya's 2026-06-08 ticket + live
+ * re-verify): the iter-1 "wait for the new track to produce audio, THEN fade
+ * in" approach REGRESSED the gap - it sat at the floor through Roon's load
+ * window (which it cannot observe the true audible-start of), so the net effect
+ * was a longer silent gap and still a hard start. Roon cannot overlap two
+ * tracks on a manual skip, and there is no event for "audible audio started"
+ * (state=playing / seek>0 lead the endpoint's actual output by its buffer), so
+ * waiting can only ever lengthen the gap. We therefore do NOT wait: quick duck,
+ * skip, then fade straight back up so the fade-in OVERLAPS the natural load gap
+ * and rides the opening when the next track is pre-buffered. Worst case (a long
+ * load) it degrades to a plain skip's gap, never worse.
+ *
+ * out-leg quick (minimal added latency, just ducks the outgoing track); in-leg
+ * longer so an audible rise remains after the load gap. Tunable live by Maya.
  */
-const DEFAULT_FADE_OUT_MS = 1100;
-const DEFAULT_FADE_IN_MS = 1800;
+const DEFAULT_FADE_OUT_MS = 500;
+const DEFAULT_FADE_IN_MS = 2500;
 /**
- * Fade-out floor as a fraction of the original level: duck to a low bed rather
- * than full silence, so the gap between tracks reads as a dip, not dead air.
+ * Fade-out floor as a fraction of the original level: duck low (so the new
+ * track starts quiet and the fade-in has real range to ride up) without a hard
+ * cut to absolute silence on the outgoing track.
  */
-const FADE_FLOOR_RATIO = 0.12;
-/** Max wait for the new track to start producing audio before fading in anyway. */
-const TRACK_START_TIMEOUT_MS = 2500;
+const FADE_FLOOR_RATIO = 0.1;
+/** Set SMOOTH_SKIP_DEBUG=1 to log the full volume-vs-time timeline per step. */
+const DEBUG = process.env.SMOOTH_SKIP_DEBUG === "1";
 
 function promisifyResult(fn: (cb: ResultCallback) => void): Promise<false | string> {
   return new Promise((resolve) => fn((error) => resolve(error)));
@@ -164,7 +175,7 @@ export function registerVolumeTools(server: McpServer): void {
 
   server.tool(
     "smooth_skip",
-    "Fake a crossfade across a manual track change: smoothly fade the zone down, change track (next or previous), then fade back up as the new track starts. Roon's native crossfade only smooths natural track ends; a manual skip otherwise drops to silence. The fade-out is shaped (smooth, non-steppy tail) and ducks to a low floor rather than full silence; the fade-in is gated on the new track actually producing audio, so it rides the opening of the track instead of being wasted on the dead-air gap. The original volume is always restored, even if the skip fails, so there is no stuck-at-0 failure mode. A new volume command supersedes the fades.",
+    "Soften a manual track change: quickly duck the zone down, change track (next or previous), then fade straight back up so the rise overlaps the opening of the new track. Roon cannot overlap two tracks on a manual skip and exposes no 'audible audio started' signal, so this does NOT wait for the new track (waiting only lengthens the silent gap); it fades up blindly over the natural load gap and rides the opening when the next track is pre-buffered, degrading to a plain skip's gap in the worst case (never worse). Fades are shaped (smooth, non-steppy). The original volume is always restored, even if the skip fails, so there is no stuck-at-low failure mode. A new volume command supersedes the fades.",
     {
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
       direction: z
@@ -176,13 +187,19 @@ export function registerVolumeTools(server: McpServer): void {
         .int()
         .positive()
         .optional()
-        .describe(`Duration in ms of the fade-OUT leg. Default ${DEFAULT_FADE_OUT_MS} (a quick clean duck).`),
+        .describe(`Duration in ms of the fade-OUT duck. Default ${DEFAULT_FADE_OUT_MS} (quick, adds minimal latency).`),
       fade_in_ms: z
         .number()
         .int()
         .positive()
         .optional()
-        .describe(`Duration in ms of the fade-IN leg, riding the new track's start. Default ${DEFAULT_FADE_IN_MS}.`),
+        .describe(`Duration in ms of the fade-IN, overlapping the new track's start. Default ${DEFAULT_FADE_IN_MS}.`),
+      floor: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("Absolute volume to duck to before skipping. Lower = more headroom for an audible rise. Default ~10% of the current level."),
       fade_ms: z
         .number()
         .int()
@@ -190,7 +207,7 @@ export function registerVolumeTools(server: McpServer): void {
         .optional()
         .describe("Convenience: set both legs to this duration. Overridden by fade_out_ms / fade_in_ms when those are given."),
     },
-    async ({ zone, direction, fade_out_ms, fade_in_ms, fade_ms }): Promise<ToolResult> => {
+    async ({ zone, direction, fade_out_ms, fade_in_ms, floor: floorArg, fade_ms }): Promise<ToolResult> => {
       try {
         const transport = roonConnection.getTransport();
         const foundZone = roonConnection.findZoneOrThrow(zone);
@@ -206,35 +223,46 @@ export function registerVolumeTools(server: McpServer): void {
         const dir = direction === "previous" ? "previous" : "next";
         const outMs = fade_out_ms ?? fade_ms ?? DEFAULT_FADE_OUT_MS;
         const inMs = fade_in_ms ?? fade_ms ?? DEFAULT_FADE_IN_MS;
-        const floor = Math.round(original * FADE_FLOOR_RATIO);
-        const prevTrackKey = trackKeyOf(foundZone.now_playing);
+        const floor = Math.min(original, floorArg ?? Math.round(original * FADE_FLOOR_RATIO));
+
+        // Provable timeline: log volume vs the zone's reported state/seek so a
+        // live pass can show exactly when the rise happens relative to audio.
+        const t0 = Date.now();
+        const mark = (msg: string): void => {
+          const z = getZone();
+          const seek = z?.now_playing?.seek_position ?? "?";
+          console.error(`[smooth_skip +${Date.now() - t0}ms] ${msg} | state=${z?.state ?? "?"} seek=${seek}`);
+        };
+        const stepProbe = DEBUG
+          ? (level: number, i: number, n: number): void => mark(`vol=${level} (step ${i}/${n})`)
+          : undefined;
+        mark(`start: original=${original} floor=${floor} out=${outMs}ms in=${inMs}ms dir=${dir}`);
 
         try {
-          // Shaped fade-out (easeIn) to a low floor, not full silence, so the
-          // tail stays smooth and the inter-track gap reads as a dip, not dead air.
-          await sharedRamper.rampShaped(floor, getZone, transport, outMs, "in");
-          // Perform the manual skip.
+          // Quick shaped duck (easeIn) to the floor on the OUTGOING track. This
+          // does not add silence - the old track just plays quieter for outMs.
+          await sharedRamper.rampShaped(floor, getZone, transport, outMs, "in", stepProbe);
+          mark("ducked, issuing skip");
+          // Perform the manual skip. No wait after this: fading up immediately
+          // overlaps Roon's load gap rather than sitting silent through it.
           await new Promise<void>((resolve, reject) => {
             transport.control(foundZone, dir, (err) => {
               if (err) reject(new Error(String(err)));
               else resolve();
             });
           });
-          // Wait for the NEW track to actually start producing audio before
-          // fading in, so the fade-in rides the opening instead of the dead gap.
-          await waitForTrackStart(roonConnection, getZone, foundZone.zone_id, prevTrackKey, {
-            timeoutMs: TRACK_START_TIMEOUT_MS,
-          });
+          mark("skip issued, fading up");
         } finally {
           // Always fade back up to the original level from wherever we ended up,
           // so a failed skip never leaves the zone stuck low. Shaped easeOut so
           // the new track swells up smoothly out of the floor.
-          await sharedRamper.rampShaped(original, getZone, transport, inMs, "out");
+          await sharedRamper.rampShaped(original, getZone, transport, inMs, "out", stepProbe);
+          mark(`fade-in done, restored to ${original}`);
         }
 
         const verb = dir === "next" ? "skipped to next" : "went to previous";
         return {
-          content: [{ type: "text", text: `Smooth skip: ducked to ${floor}, ${verb} track, rode the fade-in back to ${original} in zone '${foundZone.display_name}'.` }],
+          content: [{ type: "text", text: `Smooth skip: ducked to ${floor}, ${verb} track, faded back up to ${original} in zone '${foundZone.display_name}'.` }],
         };
       } catch (error) {
         return {
