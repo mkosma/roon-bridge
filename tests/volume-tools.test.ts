@@ -10,6 +10,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { EventEmitter } from "node:events";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Zone, Output } from "node-roon-api-transport";
 
@@ -39,6 +40,15 @@ const world = {
   queue_items_remaining: 0 as number,
   queue_time_remaining: 0 as number,
   failControl: false,
+  // smooth_skip fade-in gate: the current track identity and its seek progress.
+  // A skip flips `track` to a new title; `seek` > 0 means the new track is
+  // producing audio (what waitForTrackStart gates the fade-in on).
+  track: "Track One",
+  seek: 5,
+  // When true, control() lands the new track already producing audio (the
+  // common case). When false, the new track sits at seek 0 until a test drives
+  // a zone-seek event, exercising the event-driven gate path.
+  advanceOnControl: true,
 };
 
 function makeOutput(name: string, value: number, muted = false): Output {
@@ -65,9 +75,11 @@ function makeZone(): Zone {
     queue_items_remaining: world.queue_items_remaining,
     queue_time_remaining: world.queue_time_remaining,
     now_playing: {
-      one_line: { line1: "Track One" },
-      two_line: { line1: "Track One", line2: "An Artist" },
-      three_line: { line1: "Track One", line2: "An Artist", line3: "An Album" },
+      one_line: { line1: world.track },
+      two_line: { line1: world.track, line2: "An Artist" },
+      three_line: { line1: world.track, line2: "An Artist", line3: "An Album" },
+      length: 200,
+      seek_position: world.seek,
     },
   } as unknown as Zone;
 }
@@ -90,26 +102,38 @@ const mockTransport = {
   },
   control: (_zone: Zone, action: string, cb?: (e: false | string) => void) => {
     world.controlCalls.push({ action });
-    cb?.(world.failControl ? "skip_failed" : false);
+    if (world.failControl) {
+      cb?.("skip_failed");
+      return;
+    }
+    // A successful skip lands a NEW track; advanceOnControl decides whether it
+    // already has audio (seek > 0) or waits for a driven zone-seek event.
+    world.track = action === "next" ? "Track Two" : "Track Zero";
+    world.seek = world.advanceOnControl ? 5 : 0;
+    mockRoon.emit("zones-changed");
+    if (world.seek > 0) mockRoon.emit("zone-seek", "zone-1");
+    cb?.(false);
   },
 };
 
-vi.mock("../src/roon-connection.js", () => ({
-  roonConnection: {
-    getTransport: vi.fn(() => mockTransport),
-    findZone: vi.fn((name: string) => {
-      if (!name || name.toLowerCase().includes("wiim")) return makeZone();
-      return null;
-    }),
-    findZoneOrThrow: vi.fn((name?: string) => {
-      if (!name || name.toLowerCase().includes("wiim")) return makeZone();
-      throw new Error(`Zone '${name}' not found.`);
-    }),
-    getDefaultZone: vi.fn(() => "WiiM + 1"),
-    getZones: vi.fn(() => [makeZone()]),
-    isConnected: vi.fn(() => true),
-  },
-}));
+// roonConnection is an EventEmitter in production (zone-seek / zones-changed);
+// the smooth_skip fade-in gate attaches to it, so the mock must be one too.
+const mockRoon = Object.assign(new EventEmitter(), {
+  getTransport: vi.fn(() => mockTransport),
+  findZone: vi.fn((name: string) => {
+    if (!name || name.toLowerCase().includes("wiim")) return makeZone();
+    return null;
+  }),
+  findZoneOrThrow: vi.fn((name?: string) => {
+    if (!name || name.toLowerCase().includes("wiim")) return makeZone();
+    throw new Error(`Zone '${name}' not found.`);
+  }),
+  getDefaultZone: vi.fn(() => "WiiM + 1"),
+  getZones: vi.fn(() => [makeZone()]),
+  isConnected: vi.fn(() => true),
+});
+
+vi.mock("../src/roon-connection.js", () => ({ roonConnection: mockRoon }));
 
 vi.mock("../src/control/roon-key-config.js", () => ({
   readRoonKeyConfig: vi.fn(() => ({
@@ -158,6 +182,9 @@ function reset(outputs: Output[], partial: Partial<typeof world> = {}) {
   world.queue_items_remaining = 0;
   world.queue_time_remaining = 0;
   world.failControl = false;
+  world.track = "Track One";
+  world.seek = 5;
+  world.advanceOnControl = true;
   Object.assign(world, partial);
 }
 
@@ -281,43 +308,85 @@ describe("ramp_volume", () => {
 describe("smooth_skip", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("fades out, skips next, and fades back to the original level", async () => {
-    reset([makeOutput("WiiM", 4)]);
+  it("ducks to the floor (not silence), skips next, and rides the fade-in back to the original", async () => {
+    reset([makeOutput("WiiM", 48)]);
     const server = buildServer();
+    // fade_ms is the back-compat convenience knob: sets both legs.
     const { isError, text } = await call(server, "smooth_skip", { direction: "next", fade_ms: 4 });
 
     expect(isError).toBe(false);
-    expect(text).toContain("faded back to 4");
+    // floor = round(48 * 0.12) = 6: ducks to a low bed, never to full silence.
+    expect(text).toContain("ducked to 6");
+    expect(text).toContain("back to 48");
     expect(world.controlCalls).toEqual([{ action: "next" }]);
-    // Faded to silence at some point, and ended back at the original level.
-    expect(world.volumeCalls.some((c) => c.value === 0)).toBe(true);
-    expect(currentLevel()).toBe(4);
+    expect(Math.min(...world.volumeCalls.map((c) => c.value))).toBe(6);
+    expect(world.volumeCalls.some((c) => c.value === 0)).toBe(false);
+    expect(currentLevel()).toBe(48);
+  });
+
+  it("fade-out tail eases (more steps lower down) rather than stepping linearly", async () => {
+    reset([makeOutput("WiiM", 48)]);
+    const server = buildServer();
+    await call(server, "smooth_skip", { direction: "next", fade_out_ms: 4, fade_in_ms: 4 });
+
+    // The fade-out leg is the descending run from 48 down to the floor of 6.
+    const values = world.volumeCalls.map((c) => c.value);
+    const floorIdx = values.indexOf(6);
+    const fadeOut = values.slice(0, floorIdx + 1);
+    // Strictly monotonic 1-unit descent, ending exactly at the floor.
+    expect(fadeOut[0]).toBe(47);
+    expect(fadeOut[fadeOut.length - 1]).toBe(6);
+    for (let i = 1; i < fadeOut.length; i++) {
+      expect(fadeOut[i - 1] - fadeOut[i]).toBe(1);
+    }
   });
 
   it("skips to the previous track when asked", async () => {
-    reset([makeOutput("WiiM", 4)]);
+    reset([makeOutput("WiiM", 48)]);
     const server = buildServer();
     await call(server, "smooth_skip", { direction: "previous", fade_ms: 4 });
     expect(world.controlCalls).toEqual([{ action: "previous" }]);
-    expect(currentLevel()).toBe(4);
+    expect(currentLevel()).toBe(48);
   });
 
-  it("restores the original level even when the skip fails (no stuck-at-0)", async () => {
-    reset([makeOutput("WiiM", 4)], { failControl: true });
+  it("restores the original level even when the skip fails (no stuck-low)", async () => {
+    reset([makeOutput("WiiM", 48)], { failControl: true });
     const server = buildServer();
     const { isError } = await call(server, "smooth_skip", { direction: "next", fade_ms: 4 });
 
     expect(isError).toBe(true);
     // The skip threw, but the finally fade-in still brought the zone back up.
-    expect(currentLevel()).toBe(4);
+    expect(currentLevel()).toBe(48);
   });
 
   it("fades both outputs of a grouped zone back to the original level", async () => {
-    reset([makeOutput("WiiM", 4), makeOutput("KEF", 2)]);
+    reset([makeOutput("WiiM", 48), makeOutput("KEF", 40)]);
     const server = buildServer();
     await call(server, "smooth_skip", { direction: "next", fade_ms: 4 });
-    expect(world.outputs.find((o) => o.output_id === "out-WiiM")!.volume!.value).toBe(4);
-    expect(world.outputs.find((o) => o.output_id === "out-KEF")!.volume!.value).toBe(4);
+    expect(world.outputs.find((o) => o.output_id === "out-WiiM")!.volume!.value).toBe(48);
+    expect(world.outputs.find((o) => o.output_id === "out-KEF")!.volume!.value).toBe(48);
+  });
+
+  it("gates the fade-in on the new track producing audio (event-driven)", async () => {
+    // advanceOnControl=false: the skip lands the new track at seek 0 (silent),
+    // so the fade-in must WAIT for a zone-seek event before running.
+    reset([makeOutput("WiiM", 48)], { advanceOnControl: false });
+    const server = buildServer();
+    const tool = server._registeredTools["smooth_skip"];
+    const p = tool.handler({ direction: "next", fade_out_ms: 4, fade_in_ms: 4 }, {});
+
+    // Once the skip has fired, the fade-in is gated: volume sits at the floor.
+    await waitFor(() => world.controlCalls.length === 1);
+    await waitFor(() => currentLevel() === 6);
+    // Give the gate a beat to confirm it does NOT fade in without an audio event.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(currentLevel()).toBe(6);
+
+    // New track starts producing audio -> the gate releases the fade-in.
+    world.seek = 5;
+    mockRoon.emit("zone-seek", "zone-1");
+    await p;
+    expect(currentLevel()).toBe(48);
   });
 });
 
