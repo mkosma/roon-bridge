@@ -149,6 +149,287 @@ async function resolveActionItems(
   return { matched, actionItems };
 }
 
+/**
+ * Drill an item's browse node to its action list and execute the "add to end
+ * of queue" action - the same steps 5b/6/7/7b that searchAndPlay runs, factored
+ * so the artist-queue path can enqueue each of an artist's albums through the
+ * exact mechanism that already works for a direct album add. Returns true only
+ * when a queue action was found and executed without error.
+ */
+async function executeQueueAction(
+  browse: RoonApiBrowse,
+  itemKey: string,
+  zoneId: string | undefined,
+  sessionKey: string,
+  log: (step: string, data: unknown) => void,
+): Promise<boolean> {
+  const hierarchy = "search";
+
+  const actionData = await browseAndLoad(browse, {
+    hierarchy,
+    item_key: itemKey,
+    zone_or_output_id: zoneId,
+    multi_session_key: sessionKey,
+  });
+  if (actionData.error || actionData.message || !actionData.items?.length) {
+    log("queueAction-no-actions", { error: actionData.error, message: actionData.message });
+    return false;
+  }
+
+  // Navigate deeper if Roon nests the action list one level (step 5b parity).
+  let actionItems = actionData.items;
+  let currentListHint = actionData.list?.hint;
+  for (let depth = 0; depth < 3; depth++) {
+    if (currentListHint === "action_list") break;
+    if (actionItems.some((i) => i.hint === "action")) break;
+    const navigable = actionItems.filter(
+      (i) => i.item_key && (i.hint === "action_list" || i.hint === "list"),
+    );
+    if (navigable.length !== 1) break;
+    const deeper = await browseAndLoad(browse, {
+      hierarchy,
+      item_key: navigable[0].item_key!,
+      zone_or_output_id: zoneId,
+      multi_session_key: sessionKey,
+    });
+    if (deeper.error || deeper.message || !deeper.items?.length) break;
+    actionItems = deeper.items;
+    currentListHint = deeper.list?.hint;
+  }
+
+  const target = findAction(actionItems, "queue");
+  if (!target?.item_key) {
+    log("queueAction-no-queue-action", { available: actionItems.map((i) => i.title) });
+    return false;
+  }
+
+  let exec = await promisifyBrowse(browse, {
+    hierarchy,
+    item_key: target.item_key,
+    zone_or_output_id: zoneId,
+    multi_session_key: sessionKey,
+  });
+  if (exec.error) {
+    log("queueAction-exec-error", { error: exec.error });
+    return false;
+  }
+
+  // Handle a sub-menu (step 7b parity).
+  if (exec.body.action === "list" && exec.body.list) {
+    const sub = await promisifyLoad(browse, { hierarchy, multi_session_key: sessionKey, count: 20 });
+    if (!sub.error && sub.body.items?.length) {
+      const subAction = findAction(sub.body.items, "queue");
+      if (subAction?.item_key) {
+        exec = await promisifyBrowse(browse, {
+          hierarchy,
+          item_key: subAction.item_key,
+          zone_or_output_id: zoneId,
+          multi_session_key: sessionKey,
+        });
+        if (exec.error) {
+          log("queueAction-submenu-exec-error", { error: exec.error });
+          return false;
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+/**
+ * How many of an artist's albums to enqueue for a "more of this artist" add.
+ * Enough for a varied, cross-album stretch; capped so one add does not flood
+ * the queue (the music-monitor daemon extends repeatedly). Tunable.
+ */
+const ARTIST_QUEUE_ALBUM_CAP = 2;
+
+/** Play-all control rows Roon prepends to an artist page; skipped when harvesting albums. */
+const ARTIST_PAGE_ACTION_TITLE =
+  /^(play|play now|play artist|play album|shuffle|add next|queue|add to queue|start radio|start artist radio)$/i;
+
+/** Artist-page section headers that hold the artist's own releases. */
+const ALBUM_SECTION = /\b(album|albums|single|singles|ep|eps|release|releases|discography|compilation|compilations)\b/i;
+/** Sections that are NOT the artist's own work (other artists' material). */
+const EXCLUDE_SECTION = /\b(similar|related|associated|appears on|influenced|inspired)\b/i;
+
+/**
+ * Harvest the artist's own albums from their browse detail page. The page is a
+ * flat item list with `header` rows delimiting sections (Top Tracks, Main
+ * Albums, Appears On, Similar Artists, ...). We prefer rows under an album-ish
+ * section, excluding cross-artist sections. If no album section is present
+ * (flat discography or unlabeled page), fall back to navigable rows that look
+ * like the artist's own content (subtitle credits the artist or is empty),
+ * skipping rows that are just the artist's own name.
+ */
+function pickArtistAlbums(pageItems: BrowseItem[], artistTitle: string): BrowseItem[] {
+  const artistLc = artistTitle.trim().toLowerCase();
+  let section = "";
+  const rows: Array<{ item: BrowseItem; section: string }> = [];
+  for (const it of pageItems) {
+    if (it.hint === "header") {
+      section = it.title.trim().toLowerCase();
+      continue;
+    }
+    if (!it.item_key) continue;
+    if (ARTIST_PAGE_ACTION_TITLE.test(it.title.trim())) continue;
+    rows.push({ item: it, section });
+  }
+
+  const albumRows = rows.filter(
+    (r) => ALBUM_SECTION.test(r.section) && !EXCLUDE_SECTION.test(r.section),
+  );
+  if (albumRows.length) return albumRows.map((r) => r.item);
+
+  const own = rows
+    .filter((r) => !EXCLUDE_SECTION.test(r.section))
+    .filter((r) => {
+      if (r.item.title.trim().toLowerCase() === artistLc) return false;
+      const sub = stripRoonLinks(r.item.subtitle || "").toLowerCase();
+      return sub === "" || sub.includes(artistLc);
+    });
+  return own.map((r) => r.item);
+}
+
+/** Does a queued item credit the given artist in either of its label lines? */
+function queueItemMatchesArtist(item: { two_line?: { line2?: string }; three_line?: { line2?: string; line3?: string } }, artistLc: string): boolean {
+  const lines = [item.two_line?.line2, item.three_line?.line2, item.three_line?.line3];
+  return lines.some((l) => !!l && l.toLowerCase().includes(artistLc));
+}
+
+/**
+ * Queue "more of this artist": resolve the artist, then enqueue up to
+ * ARTIST_QUEUE_ALBUM_CAP of their albums through the proven album action-list
+ * path. A direct artist-node "Queue" action is unreliable (it reports success
+ * but enqueues nothing - the defect this fixes), so we queue real albums and
+ * verify by queue growth plus an artist-field match, never by the query string
+ * appearing in track titles (which it never can for an artist add).
+ */
+async function queueArtist(query: string, zoneName: string): Promise<ToolResult> {
+  try {
+    const browse = roonConnection.getBrowse();
+    const zone = roonConnection.findZoneOrThrow(zoneName);
+    const sessionKey = newSessionKey();
+    const log = (step: string, data: unknown) =>
+      console.error(`[roon-bridge] queueArtist[${sessionKey}] ${step}:`, JSON.stringify(data, null, 2));
+
+    log("start", { query, zone: zone.display_name });
+
+    const resolved = await resolveActionItems(browse, query, zone.zone_id, "artist", sessionKey);
+    if (resolved.error) {
+      return { content: [{ type: "text", text: resolved.error }], isError: true };
+    }
+    if (resolved.message) {
+      return {
+        content: [{ type: "text", text: `${resolved.message} (for "${resolved.matched?.title ?? query}")` }],
+        isError: true,
+      };
+    }
+
+    const artist = resolved.matched!;
+    const albums = pickArtistAlbums(resolved.actionItems ?? [], artist.title);
+    log("albums", { artist: artist.title, found: albums.length, titles: albums.slice(0, 6).map((a) => a.title) });
+
+    if (!albums.length) {
+      return {
+        content: [{
+          type: "text",
+          text: `Matched artist "${artist.title}" but found none of their albums to queue in '${zone.display_name}'.`,
+        }],
+        isError: true,
+      };
+    }
+
+    // Snapshot the queue so we can verify real growth, not a reported success.
+    let preCount = 0;
+    let preIds = new Set<number>();
+    try {
+      const pre = await roonConnection.getQueueSnapshot(zone);
+      preCount = pre.length;
+      preIds = new Set(pre.map((i) => i.queue_item_id));
+    } catch {
+      // Can't snapshot - proceed, but we'll only be able to soft-verify.
+    }
+
+    const queuedTitles: string[] = [];
+    for (const album of albums.slice(0, ARTIST_QUEUE_ALBUM_CAP)) {
+      const ok = await executeQueueAction(browse, album.item_key!, zone.zone_id, sessionKey, log);
+      if (ok) queuedTitles.push(album.title);
+    }
+
+    if (!queuedTitles.length) {
+      return {
+        content: [{
+          type: "text",
+          text: `Could not queue any albums for artist "${artist.title}" in '${zone.display_name}'.`,
+        }],
+        isError: true,
+      };
+    }
+
+    // Verify the add actually landed: re-read the queue and confirm growth.
+    const artistLc = artist.title.trim().toLowerCase();
+    let added = 0;
+    let byArtist = 0;
+    try {
+      let after = await roonConnection.getQueueSnapshot(zone);
+      const deadline = Date.now() + 2500;
+      while (Date.now() < deadline) {
+        const newItems = after.filter((i) => !preIds.has(i.queue_item_id));
+        if (after.length > preCount || newItems.length > 0) break;
+        await new Promise((r) => setTimeout(r, 150));
+        after = await roonConnection.getQueueSnapshot(zone);
+      }
+      const newItems = after.filter((i) => !preIds.has(i.queue_item_id));
+      added = Math.max(newItems.length, after.length - preCount);
+      byArtist = newItems.filter((i) => queueItemMatchesArtist(i, artistLc)).length;
+
+      if (added <= 0 && newItems.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: `Add NOT verified: queued ${queuedTitles.length} album(s) for "${artist.title}" but the queue in '${zone.display_name}' did not grow.`,
+          }],
+          isError: true,
+        };
+      }
+    } catch (verifyErr) {
+      log("verify-error", String(verifyErr));
+      // Could not re-read; don't falsely claim failure, but say so.
+      return {
+        content: [{
+          type: "text",
+          text: `Queued ${queuedTitles.length} album(s) for artist "${artist.title}" in '${zone.display_name}' (queue growth unverified: ${String(verifyErr)}).`,
+        }],
+      };
+    }
+
+    // Best-effort auto_radio off, matching the play/queue paths.
+    try {
+      const transport = roonConnection.getTransport();
+      await new Promise<void>((resolve) => {
+        transport.change_settings(zone, { auto_radio: false }, () => resolve());
+      });
+    } catch {
+      // Non-critical
+    }
+
+    const albumList = queuedTitles.map((t) => `"${t}"`).join(", ");
+    const artistNote = byArtist > 0 ? ` (${byArtist} confirmed by ${artist.title})` : "";
+    return {
+      content: [{
+        type: "text",
+        text: `Queued more of "${artist.title}" in '${zone.display_name}': added ${added} track(s) from ${queuedTitles.length} album(s) ${albumList}${artistNote}.`,
+      }],
+    };
+  } catch (error) {
+    return {
+      content: [{ type: "text", text: String(error instanceof Error ? error.message : error) }],
+      isError: true,
+    };
+  }
+}
+
 async function searchAndPlay(
   query: string,
   zoneName: string,
@@ -715,7 +996,7 @@ export function registerBrowseTools(server: McpServer): void {
 
   server.tool(
     "add_to_queue",
-    "Search for a track, album, artist, or playlist and add it to the queue in a Roon zone",
+    "Search for a track, album, artist, or playlist and add it to the queue in a Roon zone. category='artist' enqueues a varied stretch of that artist (their albums), not a single track.",
     {
       query: z.string().describe("Search query (track name, album title, artist name, etc.)"),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
@@ -724,7 +1005,11 @@ export function registerBrowseTools(server: McpServer): void {
         .optional()
         .describe("Category to search in (optional, auto-detects if not specified)"),
     },
-    async ({ query, zone, category }) => searchAndPlay(query, zone, category, "queue"),
+    async ({ query, zone, category }) =>
+      // An artist add means "more of this artist" - enqueue their albums, not a
+      // single matched row. A direct artist-node Queue action reports success
+      // but enqueues nothing, so this takes a dedicated, verified path.
+      category === "artist" ? queueArtist(query, zone) : searchAndPlay(query, zone, category, "queue"),
   );
 
   server.tool(
