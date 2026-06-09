@@ -156,129 +156,191 @@ interface ResolvedActions {
   actionItems?: BrowseItem[];
 }
 
+/** A Roon track row like "1. Walk On" - never carries the album-level library
+ * toggle, and descending into one explodes the search space. */
+function isTrackRow(item: BrowseItem): boolean {
+  return /^\s*\d+\.\s/.test(item.title);
+}
+
 /**
- * Search for an item, pick the best match, and navigate to its action list -
- * the same steps 1-5b that searchAndPlay performs, factored so add_to_library
- * can reach (and re-read, for verification) an item's action menu without
- * executing a playback action.
+ * Depth-first search of an item's reachable action menus for the Add/Remove
+ * -from-Library toggle.
+ *
+ * "Add to Library" is NOT on the album quick popup (Play Now / Add Next / Queue
+ * / Start Radio). Depending on the source it sits on the album detail page or
+ * behind a different nested action_list, so we explore every action_list/list
+ * child (skipping track rows) up to `depth` extra levels, bounded by a shared
+ * browse `budget`.
+ *
+ * Roon item_keys are scoped to their browse session AND stack position, so this
+ * navigates a single session: descending pushes a level, and a branch that does
+ * not contain the toggle is popped (pop_levels:1) before the next sibling is
+ * tried. On success the stack is LEFT positioned at the menu that carries the
+ * toggle, so the caller can execute it in the same session without re-navigating.
  */
-async function resolveActionItems(
+async function dfsFindLibraryNode(
+  browse: RoonApiBrowse,
+  zoneId: string | undefined,
+  sessionKey: string,
+  items: BrowseItem[],
+  depth: number,
+  budget: { calls: number },
+): Promise<{ found: boolean; items: BrowseItem[] }> {
+  const hierarchy = "search";
+  if (findLibraryAction(items, "add") || findLibraryAction(items, "remove")) {
+    return { found: true, items };
+  }
+  if (depth <= 0) return { found: false, items };
+
+  let lastItems = items;
+  const children = items.filter(
+    (i) => i.item_key && (i.hint === "action_list" || i.hint === "list") && !isTrackRow(i),
+  );
+  for (const child of children) {
+    if (budget.calls <= 0) break;
+    budget.calls -= 1;
+    const deeper = await browseAndLoad(browse, {
+      hierarchy,
+      item_key: child.item_key!,
+      zone_or_output_id: zoneId,
+      multi_session_key: sessionKey,
+    });
+    if (deeper.error || deeper.message || !deeper.items?.length) {
+      // Dead end (error, terminal message, or empty). Pop back, try next sibling.
+      await promisifyBrowse(browse, { hierarchy, pop_levels: 1, multi_session_key: sessionKey });
+      continue;
+    }
+    const sub = await dfsFindLibraryNode(browse, zoneId, sessionKey, deeper.items, depth - 1, budget);
+    if (sub.found) return { found: true, items: sub.items };
+    lastItems = sub.items.length ? sub.items : deeper.items;
+    await promisifyBrowse(browse, { hierarchy, pop_levels: 1, multi_session_key: sessionKey });
+  }
+  return { found: false, items: lastItems };
+}
+
+/**
+ * Ordered search-root section titles to try when hunting the library toggle:
+ * the requested category first, then a primary-match card titled like the query
+ * (Roon surfaces the focused album as its own top section, distinct from the
+ * "Albums" category, and that card is where the library action often lives),
+ * then anything else playable. Titles, not item_keys, because keys go stale
+ * across the fresh searches resolveLibraryActions runs per entry.
+ */
+function libraryEntryTitles(rootItems: BrowseItem[], query: string, category: string | undefined): string[] {
+  const playable = rootItems.filter((i) => i.item_key && i.hint !== "header");
+  const titles: string[] = [];
+  const push = (t?: string) => { if (t && !titles.includes(t)) titles.push(t); };
+
+  if (category) {
+    const cl = category.toLowerCase();
+    const cat =
+      playable.find((i) => i.title.toLowerCase() === cl + "s" || i.title.toLowerCase() === cl) ||
+      playable.find((i) => i.title.toLowerCase().includes(cl));
+    push(cat?.title);
+  }
+
+  const categoryWords = new Set([
+    "albums", "album", "artists", "artist", "tracks", "track", "songs",
+    "composers", "composer", "genres", "genre", "playlists", "playlist",
+  ]);
+  const qWords = query.toLowerCase().split(/\s+/).filter((w) => w.length > 2);
+  for (const it of playable) {
+    if (categoryWords.has(it.title.toLowerCase())) continue;
+    if (qWords.some((w) => it.title.toLowerCase().includes(w))) push(it.title);
+  }
+  for (const it of playable) push(it.title);
+  return titles;
+}
+
+/**
+ * Resolve the action menu that carries the Add/Remove-from-Library toggle for an
+ * album or artist match, leaving the browse session positioned at that menu so
+ * the caller can execute the toggle in the SAME session.
+ *
+ * Unlike the play/queue resolve (satisfied by the album quick popup), this tries
+ * each search-root entry that could be the album - the requested category AND
+ * the primary-match card - and depth-first searches each one's reachable action
+ * menus for the library toggle. The quick popup carries Play Now / Add Next /
+ * Queue / Start Radio but not the library action; the toggle lives on the album
+ * detail page (reached via the primary-match card, or by drilling the detail
+ * page's full menu), so a single linear drill down the category path misses it.
+ * If no entry exposes a library action we return the last menu seen, so the
+ * caller can report unsupported_operation with the actions that WERE available.
+ */
+async function resolveLibraryActions(
   browse: RoonApiBrowse,
   query: string,
   zoneId: string | undefined,
   category: string | undefined,
   sessionKey: string,
-  opts: { seekLibrary?: boolean } = {},
 ): Promise<ResolvedActions> {
   const hierarchy = "search";
+  const budget = { calls: 18 };
 
-  const searchData = await browseAndLoad(browse, {
-    hierarchy,
-    input: query,
-    pop_all: true,
-    zone_or_output_id: zoneId,
-    multi_session_key: sessionKey,
-  });
-  if (searchData.error) return { error: `Search error: ${searchData.error}` };
-  if (!searchData.items?.length) return { error: `No results found for "${query}".` };
-
-  let targetCategory: BrowseItem | undefined;
-  if (category) {
-    const catLower = category.toLowerCase();
-    targetCategory =
-      searchData.items.find(
-        (i) => i.item_key && (i.title.toLowerCase() === catLower + "s" || i.title.toLowerCase() === catLower),
-      ) ||
-      searchData.items.find(
-        (i) => i.item_key && i.title.toLowerCase().includes(catLower) && i.hint !== "header",
-      );
-  }
-  targetCategory ??= searchData.items.find((i) => i.item_key && i.hint !== "header");
-  if (!targetCategory?.item_key) return { error: `No "${category ?? "playable"}" results for "${query}".` };
-
-  const categoryData = await browseAndLoad(browse, {
-    hierarchy,
-    item_key: targetCategory.item_key,
-    zone_or_output_id: zoneId,
-    multi_session_key: sessionKey,
-  });
-  if (categoryData.error) return { error: `Error browsing ${targetCategory.title}: ${categoryData.error}` };
-  if (!categoryData.items?.length) return { error: `No ${targetCategory.title.toLowerCase()} found for "${query}".` };
-
-  const matched = bestMatch(categoryData.items, query);
-  if (!matched?.item_key) return { error: `No playable match for "${query}".` };
-
-  const actionData = await browseAndLoad(browse, {
-    hierarchy,
-    item_key: matched.item_key,
-    zone_or_output_id: zoneId,
-    multi_session_key: sessionKey,
-  });
-  if (actionData.message) return { matched, message: actionData.message };
-  if (actionData.error) return { error: `Error: ${actionData.error}` };
-  if (!actionData.items?.length) return { matched, actionItems: [] };
-
-  // Navigate deeper to the actual action list when Roon nests it one level.
-  //
-  // Two drill modes. A plain play/queue resolve stops as soon as any executable
-  // action is visible. A library add/remove (seekLibrary) must keep going until
-  // the *library* toggle is in hand: Roon frequently lands the first browse on
-  // the album/artist CONTENT page - a "Play Album" header action plus the
-  // numbered track rows - and tucks the full action menu (Play Now / Add Next /
-  // Queue / Start Radio / Add to Library) behind a nested action_list. The play
-  // path is satisfied by the content page's "Play Album" and would stop there;
-  // the library path is not, so it drills past the content page to the menu.
-  let actionItems = actionData.items;
-  let currentListHint = actionData.list?.hint;
-  for (let depth = 0; depth < 3; depth++) {
-    if (currentListHint === "action_list") break;
-
-    if (opts.seekLibrary) {
-      // Already on the action menu (it carries the library toggle)? Done.
-      if (findLibraryAction(actionItems, "add") || findLibraryAction(actionItems, "remove")) break;
-      // Otherwise drill into the nested action menu. The menu is an action_list;
-      // track/sub-album rows are hint:"list" and must be skipped. As a fallback
-      // for sources that present the album's menu as a plain list, drill the one
-      // list row whose title is the matched item itself (never a track row,
-      // which Roon titles "1. Walk On", "2. ...").
-      const matchTitle = matched.title.trim().toLowerCase();
-      const menu =
-        actionItems.find((i) => i.item_key && i.hint === "action_list") ||
-        actionItems.find(
-          (i) => i.item_key && i.hint === "list" && i.title.trim().toLowerCase() === matchTitle,
-        );
-      if (!menu) break;
-      const deeper = await browseAndLoad(browse, {
-        hierarchy,
-        item_key: menu.item_key!,
-        zone_or_output_id: zoneId,
-        multi_session_key: sessionKey,
-      });
-      if (deeper.message) return { matched, message: deeper.message };
-      if (deeper.error || !deeper.items?.length) break;
-      actionItems = deeper.items;
-      currentListHint = deeper.list?.hint;
-      continue;
-    }
-
-    if (actionItems.some((i) => i.hint === "action")) break;
-    const navigable = actionItems.filter(
-      (i) => i.item_key && (i.hint === "action_list" || i.hint === "list"),
-    );
-    if (navigable.length !== 1) break;
-    const deeper = await browseAndLoad(browse, {
+  const searchRoot = () =>
+    browseAndLoad(browse, {
       hierarchy,
-      item_key: navigable[0].item_key!,
+      input: query,
+      pop_all: true,
       zone_or_output_id: zoneId,
       multi_session_key: sessionKey,
     });
-    if (deeper.message) return { matched, message: deeper.message };
-    if (deeper.error || !deeper.items?.length) break;
-    actionItems = deeper.items;
-    currentListHint = deeper.list?.hint;
+
+  const first = await searchRoot();
+  if (first.error) return { error: `Search error: ${first.error}` };
+  if (!first.items?.length) return { error: `No results found for "${query}".` };
+
+  const titles = libraryEntryTitles(first.items, query, category);
+  if (!titles.length) return { error: `No "${category ?? "playable"}" results for "${query}".` };
+
+  let lastMatched: BrowseItem | undefined;
+  let lastItems: BrowseItem[] = [];
+
+  for (let t = 0; t < titles.length; t++) {
+    if (budget.calls <= 0) break;
+    // Fresh search per entry so we navigate from a clean root with valid keys.
+    const root = t === 0 ? first : await searchRoot();
+    const section = root.items?.find((i) => i.item_key && i.title === titles[t]);
+    if (!section?.item_key) continue;
+
+    budget.calls -= 1;
+    const secData = await browseAndLoad(browse, {
+      hierarchy,
+      item_key: section.item_key,
+      zone_or_output_id: zoneId,
+      multi_session_key: sessionKey,
+    });
+    if (secData.error || !secData.items?.length) continue;
+
+    // The section is either the album's own page/menu (a primary-match card -
+    // it carries action items and/or track rows) or a LIST of albums (the
+    // category). Only the latter needs one more descent to reach the album.
+    const isAlbumPage = secData.items.some((i) => i.hint === "action" || isTrackRow(i));
+    let matched = section;
+    let albumItems = secData.items;
+    if (!isAlbumPage) {
+      const best = bestMatch(secData.items, query);
+      if (!best?.item_key) continue;
+      matched = best;
+      budget.calls -= 1;
+      const albumData = await browseAndLoad(browse, {
+        hierarchy,
+        item_key: best.item_key,
+        zone_or_output_id: zoneId,
+        multi_session_key: sessionKey,
+      });
+      if (albumData.message) { lastMatched ??= best; continue; }
+      if (albumData.error || !albumData.items?.length) continue;
+      albumItems = albumData.items;
+    }
+
+    lastMatched = matched;
+    const dfs = await dfsFindLibraryNode(browse, zoneId, sessionKey, albumItems, 3, budget);
+    lastItems = dfs.items.length ? dfs.items : albumItems;
+    if (dfs.found) return { matched, actionItems: dfs.items };
   }
 
-  return { matched, actionItems };
+  return { matched: lastMatched, actionItems: lastItems };
 }
 
 /**
@@ -1236,21 +1298,19 @@ export function registerBrowseTools(server: McpServer): void {
         const zoneId = zoneObj.zone_id;
         const cat = category ?? "album";
 
-        const resolved = await resolveActionItems(browse, query, zoneId, cat, newSessionKey(), {
-          seekLibrary: true,
-        });
+        // One session for resolve + execute: resolveLibraryActions leaves the
+        // browse stack positioned at the menu carrying the toggle, and Roon
+        // item_keys are only valid in the session/stack where they were loaded.
+        const sessionKey = newSessionKey();
+        const resolved = await resolveLibraryActions(browse, query, zoneId, cat, sessionKey);
         if (resolved.error) {
           return { content: [{ type: "text", text: resolved.error }], isError: true };
         }
-        if (resolved.message) {
-          // Roon returned a terminal message instead of an action list.
-          return {
-            content: [{ type: "text", text: `${resolved.message} (for "${resolved.matched?.title ?? query}")` }],
-            isError: true,
-          };
+        if (!resolved.matched) {
+          return { content: [{ type: "text", text: `No match for "${query}".` }], isError: true };
         }
 
-        const matched = resolved.matched!;
+        const matched = resolved.matched;
         const actionItems = resolved.actionItems ?? [];
         const matchedInfo = {
           title: matched.title,
@@ -1287,12 +1347,12 @@ export function registerBrowseTools(server: McpServer): void {
           };
         }
 
-        // Execute the add.
+        // Execute the add in the SAME session resolveLibraryActions positioned.
         const exec = await promisifyBrowse(browse, {
           hierarchy: "search",
           item_key: addAction.item_key!,
           zone_or_output_id: zoneId,
-          multi_session_key: newSessionKey(),
+          multi_session_key: sessionKey,
         });
         if (exec.error) {
           return {
@@ -1302,9 +1362,7 @@ export function registerBrowseTools(server: McpServer): void {
         }
 
         // Verify with a fresh navigation: the menu should now offer Remove, not Add.
-        const reResolved = await resolveActionItems(browse, query, zoneId, cat, newSessionKey(), {
-          seekLibrary: true,
-        });
+        const reResolved = await resolveLibraryActions(browse, query, zoneId, cat, newSessionKey());
         let verified = false;
         if (!reResolved.error && reResolved.actionItems) {
           verified =
