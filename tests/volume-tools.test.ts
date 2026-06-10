@@ -212,9 +212,50 @@ describe("ramp_volume", () => {
     const server = buildServer();
     const { text } = await call(server, "ramp_volume", { value: 0, how: "absolute", duration_ms: 40 });
     expect(text).toContain("over 40ms");
+    expect(text).toContain("(linear)");
 
     await waitFor(() => world.volumeCalls.length === 4);
     expect(world.volumeCalls[world.volumeCalls.length - 1].value).toBe(0);
+  });
+
+  it("shapes a long ramp with curve='ease' and lands exactly on the target", async () => {
+    // The sunrise-wake shape: 30 -> 52 over a long duration, eased. Short
+    // duration here so the test flushes fast; the contract is every integer
+    // step in order, ending on 52.
+    reset([makeOutput("WiiM", 30)]);
+    const server = buildServer();
+    const { isError, text } = await call(server, "ramp_volume", {
+      value: 52,
+      how: "absolute",
+      duration_ms: 60,
+      curve: "ease",
+    });
+    expect(isError).toBe(false);
+    expect(text).toContain("from 30 to 52");
+    expect(text).toContain("(ease)");
+
+    await waitFor(() => currentLevel() === 52);
+    const vals = world.volumeCalls.map((c) => c.value);
+    expect(vals).toHaveLength(22);
+    expect(vals[0]).toBe(31);
+    expect(vals[vals.length - 1]).toBe(52);
+    world.volumeCalls.forEach((c) => expect(c.how).toBe("absolute"));
+  });
+
+  it("accepts curve='perceptual' and reaches the target", async () => {
+    reset([makeOutput("WiiM", 30)]);
+    const server = buildServer();
+    const { isError, text } = await call(server, "ramp_volume", {
+      value: 52,
+      how: "absolute",
+      duration_ms: 60,
+      curve: "perceptual",
+    });
+    expect(isError).toBe(false);
+    expect(text).toContain("(perceptual)");
+
+    await waitFor(() => currentLevel() === 52);
+    expect(world.volumeCalls[world.volumeCalls.length - 1].value).toBe(52);
   });
 
   it("no-ops when already at the target", async () => {

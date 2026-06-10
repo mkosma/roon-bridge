@@ -78,7 +78,7 @@ export function registerVolumeTools(server: McpServer): void {
 
   server.tool(
     "ramp_volume",
-    "Smoothly ramp a Roon zone's volume as an audible fade, instead of the instant jump change_volume produces. Set how='absolute' to ramp to a target level, or how='relative' to ramp by a signed delta. The ramp runs server-side and the call returns immediately; a new ramp or any volume command supersedes one in progress. Honors grouped zones (e.g. WiiM + 1) and each output's volume limits.",
+    "Smoothly ramp a Roon zone's volume as an audible fade, instead of the instant jump change_volume produces. Set how='absolute' to ramp to a target level, or how='relative' to ramp by a signed delta. The ramp runs server-side and the call returns immediately; a new ramp or any volume command supersedes one in progress. Honors grouped zones (e.g. WiiM + 1) and each output's volume limits. For a long, ultra-gradual fade (e.g. a sunrise wake over 20-45 min) pass a large duration_ms with curve='ease' or 'perceptual'. Roon volume is integer-stepped, so the finest possible change is 1 unit; curve and duration spread those unit steps to where the ear least notices them, but cannot make them sub-unit.",
     {
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
       value: z.number().describe("Target level when how='absolute', or signed delta when how='relative'"),
@@ -91,9 +91,13 @@ export function registerVolumeTools(server: McpServer): void {
         .int()
         .positive()
         .optional()
-        .describe("Total fade duration in milliseconds. If omitted, uses the configured ramp_step_ms cadence (~20ms per 1-unit step)."),
+        .describe("Total fade duration in milliseconds. If omitted, uses the configured ramp_step_ms cadence (~20ms per 1-unit step). Supports long durations (to ~45 min / 2,700,000ms) without drift; a superseding volume command still cancels it."),
+      curve: z
+        .enum(["linear", "ease", "perceptual"])
+        .default("linear")
+        .describe("How to distribute the integer steps across duration_ms. 'linear': even spacing. 'ease': gentle S-curve, slow at both ends (the wake feel). 'perceptual': dwell weighted by each step's dB jump, slower in the low range where steps are most audible. Only takes effect when duration_ms is given."),
     },
-    async ({ zone, value, how, duration_ms }): Promise<ToolResult> => {
+    async ({ zone, value, how, duration_ms, curve }): Promise<ToolResult> => {
       try {
         const transport = roonConnection.getTransport();
         const foundZone = roonConnection.findZoneOrThrow(zone);
@@ -114,15 +118,22 @@ export function registerVolumeTools(server: McpServer): void {
           };
         }
 
-        const stepMs = duration_ms != null ? stepMsForDuration(steps, duration_ms) : configuredStepMs();
-
         // Fire and forget: kick the server-side ramp and return immediately,
-        // exactly like the HTTP /control/volume_ramp path.
-        sharedRamper
-          .rampAbsolute(target, getZone, transport, stepMs)
-          .catch((e: unknown) => console.error("[ramp_volume] error:", e));
+        // exactly like the HTTP /control/volume_ramp path. With an explicit
+        // duration, shape the integer steps across it via rampCurve (drift-free,
+        // curve-aware); otherwise keep the configured even-cadence path.
+        const rampShape = curve ?? "linear";
+        if (duration_ms != null) {
+          sharedRamper
+            .rampCurve(target, getZone, transport, duration_ms, rampShape)
+            .catch((e: unknown) => console.error("[ramp_volume] error:", e));
+        } else {
+          sharedRamper
+            .rampAbsolute(target, getZone, transport, configuredStepMs())
+            .catch((e: unknown) => console.error("[ramp_volume] error:", e));
+        }
 
-        const dur = duration_ms != null ? `${duration_ms}ms` : `${steps} steps`;
+        const dur = duration_ms != null ? `${duration_ms}ms (${rampShape})` : `${steps} steps`;
         return {
           content: [{ type: "text", text: `Ramping '${foundZone.display_name}' from ${currentMax} to ${target} over ${dur}.` }],
         };
