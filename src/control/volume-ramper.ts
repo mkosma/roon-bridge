@@ -13,8 +13,64 @@ import type { Zone, Output } from "node-roon-api-transport";
 /** Milliseconds between each 1-unit step when ramping. */
 const DEFAULT_RAMP_STEP_MS = 20;
 
+/**
+ * Longest single uninterrupted sleep inside a shaped ramp. A long ramp can put
+ * minutes between integer steps; we sleep in slices no longer than this so the
+ * generation-counter cancel stays responsive (a superseding volume command
+ * takes effect within ~one slice, not after a multi-minute wait).
+ */
+const CANCEL_POLL_MS = 250;
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Easing curve for a duration-shaped ramp. Roon volume is integer units, so we
+ * cannot move in sub-unit increments - the only freedom over a fixed total
+ * duration is *when* each 1-unit step fires. A curve is the mapping
+ *   cadence(p) = fraction of total time elapsed when fraction p of the steps
+ *                have fired,  with cadence(0)=0 and cadence(1)=1.
+ * Stretching time at one end spaces those steps further apart there, so the
+ * volume changes more slowly through that part of the range.
+ *
+ *  - "linear":     even time per step. Constant unit/sec.
+ *  - "ease":       raised-cosine S-curve - slow at both ends, faster in the
+ *                  middle. The gentle "wake" feel: it drifts up out of the
+ *                  start level and settles into the target without a hard edge.
+ *  - "perceptual": dwell on each step proportional to its loudness (dB) jump,
+ *                  treating the Roon unit as ~linear-amplitude (so a unit near
+ *                  the floor is a far bigger perceptual jump than one up top).
+ *                  Spends more time low, less time high, for a constant
+ *                  perceived-loudness rate. Requires both endpoints > 0;
+ *                  falls back to "ease" when either is <= 0 (log is undefined).
+ */
+export type RampCurve = "linear" | "ease" | "perceptual";
+
+/**
+ * Cumulative elapsed-time fraction at which the step that lands on integer
+ * level `levelAfter` (the i-th of `steps`, p = i/steps) should fire.
+ * `start`/`target` bound the ramp and let "perceptual" weight by dB.
+ */
+export function cadence(curve: RampCurve, p: number, start: number, target: number): number {
+  if (p <= 0) return 0;
+  if (p >= 1) return 1;
+  switch (curve) {
+    case "linear":
+      return p;
+    case "ease":
+      // Inverse of the raised-cosine volume curve v(t)=(1-cos(pi*t))/2.
+      return Math.acos(1 - 2 * p) / Math.PI;
+    case "perceptual": {
+      // Time so far proportional to cumulative |dB| from start to this level.
+      if (start <= 0 || target <= 0 || start === target) {
+        return Math.acos(1 - 2 * p) / Math.PI; // undefined dB ratio -> ease
+      }
+      const level = start + (target - start) * p;
+      if (level <= 0) return Math.acos(1 - 2 * p) / Math.PI;
+      return Math.log(level / start) / Math.log(target / start);
+    }
+  }
 }
 
 /**
@@ -171,6 +227,108 @@ export class VolumeRamper {
     const delta = target - currentMax;
 
     await this.rampDelta(delta, getZone, transport, stepMs);
+  }
+
+  /**
+   * Sleep `ms`, but in slices no longer than CANCEL_POLL_MS, bailing out the
+   * moment the ramp generation moves on. Returns true if the wait completed
+   * while still current, false if a superseding ramp/cancel intervened.
+   */
+  private async waitCancellable(ms: number, captured: number): Promise<boolean> {
+    let remaining = ms;
+    while (remaining > 0) {
+      if (this.generation !== captured) return false;
+      const chunk = Math.min(CANCEL_POLL_MS, remaining);
+      await delay(chunk);
+      remaining -= chunk;
+    }
+    return this.generation === captured;
+  }
+
+  /**
+   * Ramp to an absolute target over a fixed total duration, distributing the
+   * integer steps across that duration according to a curve (see RampCurve)
+   * rather than at an even cadence. This is the long-fade path: for the sunrise
+   * wake a 30->52 climb over 20-45 min reads as continuous because the steps
+   * are paced to where the ear is least sensitive to them.
+   *
+   * Reuses the same mechanics as rampDelta: on the numeric fast path the steps
+   * are absolute and fire-and-forget (self-correcting if Roon coalesces one),
+   * and the whole ramp is cancellable via the generation counter, so any
+   * superseding volume command stops it - here within ~CANCEL_POLL_MS even mid
+   * a multi-minute gap between steps. Step *timing* is anchored to a wall clock
+   * so a 45-min ramp does not accumulate setTimeout drift or stall.
+   *
+   * Incremental-only zones have no numeric level to shape against and fall back
+   * to an even cadence over totalMs. `onStep(level, index, steps)` is an
+   * optional per-step probe for logging the real volume-vs-time timeline.
+   *
+   * NOTE: shares its eased-cadence technique with the (separately in-flight)
+   * smooth_skip `rampShaped` helper; the two should be unified once that work
+   * merges. This method is curve-driven and duration-anchored for long fades.
+   */
+  async rampCurve(
+    target: number,
+    getZone: GetZoneFn,
+    transport: RoonApiTransport,
+    totalMs: number,
+    curve: RampCurve = "linear",
+    onStep?: (level: number, index: number, steps: number) => void,
+  ): Promise<void> {
+    this.generation++;
+    const captured = this.generation;
+
+    const zone = getZone();
+    if (!zone) return;
+
+    const allVolume = getVolumeOutputs(zone);
+    if (allVolume.length === 0) return;
+
+    const numeric = getNumericVolumeOutputs(zone);
+    const startVol = numeric.length > 0 ? Math.max(...numeric.map((o) => o.volume!.value ?? 0)) : 0;
+    const delta = target - startVol;
+    const steps = Math.abs(delta);
+    if (steps === 0) return;
+    const direction = delta > 0 ? 1 : -1;
+
+    // Numeric fast path: absolute, fire-and-forget, curve-shaped cadence,
+    // anchored to a wall clock so long durations don't drift or stall.
+    if (numeric.length === allVolume.length) {
+      const startedAt = Date.now();
+      for (let i = 1; i <= steps; i++) {
+        const dueAt = totalMs * cadence(curve, i / steps, startVol, target);
+        const wait = dueAt - (Date.now() - startedAt);
+        if (wait > 0 && !(await this.waitCancellable(wait, captured))) return;
+        if (this.generation !== captured) return;
+        const rawTarget = startVol + direction * i;
+        for (const output of numeric) {
+          const stepTarget = clampToOutput(output, rawTarget);
+          transport.change_volume(output, "absolute", stepTarget, (err) => {
+            if (err) console.error("[VolumeRamper] curve step failed:", err);
+          });
+        }
+        onStep?.(rawTarget, i, steps);
+      }
+      return;
+    }
+
+    // Incremental-only fallback: even cadence over totalMs (no level to shape).
+    const stepDelay = Math.max(0, Math.round(totalMs / steps));
+    for (let i = 0; i < steps; i++) {
+      if (this.generation !== captured) return;
+      const currentZone = getZone();
+      if (!currentZone) return;
+      const outputs = getVolumeOutputs(currentZone);
+      if (outputs.length === 0) return;
+      await Promise.all(
+        outputs.map((output) =>
+          promisifyResult((cb) =>
+            transport.change_volume(output, "relative", direction, cb),
+          ),
+        ),
+      );
+      if (i < steps - 1 && !(await this.waitCancellable(stepDelay, captured))) return;
+    }
   }
 
   /**
