@@ -333,6 +333,61 @@ export function bestMatch(items: BrowseItem[], query: string): BrowseItem | unde
   return ranked[0]?.item;
 }
 
+/**
+ * Run a search and return the scored candidate list for a single category,
+ * without drilling into any action list. This is the read-only half of the
+ * find-and-act flow: it powers the version picker (which needs to SHOW the
+ * candidates and their is_live/is_compilation flags) and any deterministic
+ * re-resolution that selects an exact recording rather than the top match.
+ *
+ * `hierarchy` defaults to "search" (universal: library + streaming). Pass a
+ * library-only hierarchy ("albums"/"artists") to scope to Monty's library.
+ */
+export async function searchScoredCandidates(
+  browse: RoonApiBrowse,
+  query: string,
+  zoneId: string | undefined,
+  category: string | undefined,
+  sessionKey: string,
+  hierarchy = "search",
+): Promise<{ error?: string; categoryTitle?: string; candidates: ScoredCandidate[] }> {
+  const searchData = await browseAndLoad(browse, {
+    hierarchy,
+    input: query,
+    pop_all: true,
+    zone_or_output_id: zoneId,
+    multi_session_key: sessionKey,
+  });
+  if (searchData.error) return { error: searchData.error, candidates: [] };
+  if (!searchData.items?.length) return { candidates: [] };
+
+  // Pick the category bucket (Tracks/Albums/...). When unspecified, take the
+  // first playable category Roon offers (its own best guess).
+  const cats = searchData.items;
+  let targetCategory: BrowseItem | undefined;
+  if (category) {
+    const catLower = category.toLowerCase();
+    targetCategory =
+      cats.find((c) => c.item_key && (c.title.toLowerCase() === catLower + "s" || c.title.toLowerCase() === catLower)) ||
+      cats.find((c) => c.item_key && c.title.toLowerCase().includes(catLower) && c.hint !== "header");
+  }
+  targetCategory ??= cats.find((c) => c.item_key && c.hint !== "header");
+  if (!targetCategory?.item_key) return { candidates: [] };
+
+  const categoryData = await browseAndLoad(browse, {
+    hierarchy,
+    item_key: targetCategory.item_key,
+    zone_or_output_id: zoneId,
+    multi_session_key: sessionKey,
+  });
+  if (categoryData.error) return { error: categoryData.error, candidates: [] };
+  if (!categoryData.items?.length) return { categoryTitle: targetCategory.title, candidates: [] };
+
+  const penalize = category !== "playlist";
+  const ranked = scoreCandidates(categoryData.items, query, penalize);
+  return { categoryTitle: categoryData.list?.title || targetCategory.title, candidates: ranked };
+}
+
 /** The action vocabulary Roon exposes on a track/album/artist action list. */
 export type QueueAction = "play_now" | "add_next" | "queue" | "shuffle";
 

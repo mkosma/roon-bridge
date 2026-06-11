@@ -21,6 +21,7 @@ import { registerPlaybackTools } from "./tools/playback.js";
 import { registerVolumeTools } from "./tools/volume.js";
 import { registerBrowseTools } from "./tools/browse.js";
 import { registerQueueTools } from "./tools/queue.js";
+import { registerVersionTools } from "./tools/versions.js";
 import { registerRoonPlaylistTools } from "./tools/roon-playlists.js";
 import { registerPlaylistTools } from "./tools/playlist.js";
 import { createControlRouter, createConfigRouter } from "./control/control-router.js";
@@ -70,6 +71,7 @@ function createMcpServer(): McpServer {
   registerVolumeTools(server);
   registerBrowseTools(server);
   registerQueueTools(server);
+  registerVersionTools(server);
   registerRoonPlaylistTools(server);
   registerPlaylistTools(server);
 
