@@ -264,7 +264,30 @@ All the same tools as [roon-mcp](https://github.com/AzureStackNerd/roon-mcp):
 - `change_volume` / `mute` / `get_volume` - volume controls
 - `search` - search the Roon library
 - `play_artist` / `play_album` / `play_playlist` / `play_track` - search and play
-- `add_to_queue` - search and queue (re-verified against a queue read)
+- `add_to_queue` - search and queue (re-verified against a queue read). Prefers
+  the studio cut by default - live takes, compilations, and tributes are
+  demoted unless the query asks for one.
+
+### Version selection (studio vs live, precise pick)
+
+The universal Roon search mixes studio, live, and compilation recordings of the
+same song. The scorer demotes live/comp by default; these two tools let you see
+and pin an exact recording.
+
+- `find_versions` - search and return the ranked candidate **versions** of a
+  track/album, each with `is_live`, `is_compilation`, `confidence`, and an
+  opaque `ref`. `exclude_live` drops live takes; `source: library|all` scopes to
+  the library (album/artist only - see note below).
+- `queue_version` - queue/play the EXACT recording named by a `ref` from
+  `find_versions`, re-resolved by exact title+subtitle (never a fresh fuzzy
+  pick) and verified by queue growth. `when: queue|next|now`.
+
+> Roon's browse API exposes only title/subtitle/item_key per row - no structured
+> year, format, or library-membership flag - and Roon's Focus filtering is
+> GUI-only (no focus param). So studio preference is done by result scoring, not
+> Focus; `is_live`/`is_compilation` are inferred from text; and `source:library`
+> uses Roon's library-only browse hierarchies, which cover albums/artists but
+> not tracks.
 
 ### Queue editing (stable item ids)
 
