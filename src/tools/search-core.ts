@@ -171,6 +171,10 @@ export interface ScoredCandidate {
    * loose match is visible.
    */
   confidence: number;
+  /** True when the title/subtitle marks a live performance (see LIVE_MARKER). */
+  is_live: boolean;
+  /** True when the subtitle marks a compilation / greatest-hits album. */
+  is_compilation: boolean;
 }
 
 /**
@@ -179,6 +183,54 @@ export interface ScoredCandidate {
  * "DJ-Kicks" / "DJ Kicks" specifically caused the Comfort-vs-DJ-Kicks defect.
  */
 const VARIANT_PENALTY = /\b(tribute|cover[s]?|karaoke|medley|in the style of|dj[-\s]?kicks|dj[-\s]?mix|mixed by|continuous mix|fabriclive|essential mix)\b/i;
+
+/**
+ * Detect a LIVE recording from a title (or album subtitle). This is the P0
+ * defect: Roon's universal search ranks "Twist & Crawl (Live 1982)" and
+ * "Save It For Later (Live)" above the studio cut, which wrecked sets.
+ *
+ * Crucially this must NOT fire on studio titles that merely contain the letters
+ * "live": "Live Forever" (Oasis), "Live And Let Die", "Livin' On A Prayer",
+ * "Alive". So we never match a bare word "live" - only the markers that
+ * actually denote a live performance:
+ *   - parenthetical/bracketed:  (Live), [Live 1982], (Live at Wembley)
+ *   - trailing dash/comma:       Song - Live, Song, Live 1982
+ *   - "Live at/in/from/on ...":  Live At Madstock
+ *   - "Live Version/Edit/Recording", BBC/Peel Session, Unplugged, In Concert
+ */
+const LIVE_MARKER =
+  /[([]\s*live\b[^)\]]*[)\]]|[-–,]\s*live\b|\blive\s+(at|in|from|on|version|edit|recording|session)\b|\b(bbc|peel)\s+session(s)?\b|\bunplugged\b|\bin concert\b|\blive\s+(?:19|20)\d{2}\b/i;
+
+/**
+ * Detect a compilation / greatest-hits / anthology album from a subtitle. These
+ * are lightly demoted so a bare track query resolves to the track's original
+ * studio album rather than a hits package, when both exist. Light by design:
+ * a comp is still a valid studio recording and may be the only source.
+ */
+const COMPILATION_MARKER =
+  /\b(greatest hits|best of|the best of|anthology|collection|compilation|the essential|essentials|gold|singles collection|20th century masters|now that's what i call|b-sides|rarities|box set)\b/i;
+
+/** Query intent that legitimately wants a live/alt recording - suppresses the live penalty. */
+const WANTS_LIVE = /[([]\s*live\b|\blive\s+(at|in|from|on|version|edit|recording|session|album)\b|\b(bbc|peel)\s+session|\bunplugged\b|\bin concert\b|\blive\b\s*$|^\s*live\b/i;
+
+export interface VariantFlags {
+  is_live: boolean;
+  is_compilation: boolean;
+}
+
+/**
+ * Classify a candidate's title + subtitle for live / compilation markers. Pure
+ * and exported so the version-picker tool and tests can share the exact logic
+ * the scorer uses.
+ */
+export function classifyVariant(title: string, subtitle = ""): VariantFlags {
+  const t = title || "";
+  const s = stripRoonLinks(subtitle || "");
+  return {
+    is_live: LIVE_MARKER.test(t) || LIVE_MARKER.test(s),
+    is_compilation: COMPILATION_MARKER.test(s) || COMPILATION_MARKER.test(t),
+  };
+}
 
 /**
  * Score and rank playable items against a query. Returns candidates sorted
@@ -202,11 +254,14 @@ export function scoreCandidates(
   const queryWords = lower.split(/\s+/).filter((w) => w.length > 1);
 
   const wantsMix = /\b(dj[-\s]?kicks|dj[-\s]?mix|mixed|fabriclive|essential mix|continuous)\b/i.test(lower);
+  // Only suppress the live penalty when the QUERY itself asks for a live take.
+  const wantsLive = WANTS_LIVE.test(lower);
 
   const scored: ScoredCandidate[] = playable.map((item, i) => {
     const titleLower = item.title.toLowerCase().trim();
     const subtitleClean = stripRoonLinks(item.subtitle || "");
     const subtitleLower = subtitleClean.toLowerCase();
+    const flags = classifyVariant(item.title, item.subtitle);
     let score = 0;
     // Words accounted for by EITHER the title or the credited artist(s)/album in
     // the subtitle. Multi-artist albums (e.g. "Promises" by Floating Points /
@@ -238,6 +293,18 @@ export function scoreCandidates(
       score -= 20;
     }
 
+    // Studio-preference (the P0 fix). Demote live takes hard when the query did
+    // not ask for one - a live marker in the TITLE is the headline defect
+    // ("Twist & Crawl (Live 1982)" outranking the studio cut). A compilation
+    // album is demoted only lightly: still a valid studio recording, just not
+    // the original release when both are present.
+    if (penalizeVariants && !wantsLive && flags.is_live) {
+      score -= LIVE_MARKER.test(titleLower) ? 60 : 25;
+    }
+    if (penalizeVariants && flags.is_compilation) {
+      score -= 12;
+    }
+
     // Small positional tiebreak favoring Roon's own ranking.
     score += Math.max(0, 5 - i);
 
@@ -251,6 +318,8 @@ export function scoreCandidates(
       item_key: item.item_key!,
       score,
       confidence,
+      is_live: flags.is_live,
+      is_compilation: flags.is_compilation,
     };
   });
 

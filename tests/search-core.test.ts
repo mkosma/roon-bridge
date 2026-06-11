@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { scoreCandidates, resolveActionItem, stripRoonLinks } from "../src/tools/search-core.js";
+import { scoreCandidates, resolveActionItem, stripRoonLinks, classifyVariant } from "../src/tools/search-core.js";
 import type { BrowseItem } from "../src/tools/search-core.js";
 
 function item(title: string, subtitle?: string, key = title): BrowseItem {
@@ -83,6 +83,87 @@ describe("scoreCandidates", () => {
   it("returns empty for no playable items (loud no-match, not a silent pick)", () => {
     const items: BrowseItem[] = [{ title: "Header", hint: "header" }];
     expect(scoreCandidates(items, "anything", true)).toHaveLength(0);
+  });
+
+  // --- Studio-over-live (the P0 defect that wrecked sets, 2026-06-10) ---------
+
+  it("ranks the studio 'Twist & Crawl' above the live take (acceptance case)", () => {
+    const items: BrowseItem[] = [
+      item("Twist & Crawl (Live 1982)", "The Beat", "live"),
+      item("Twist & Crawl", "The Beat / I Just Can't Stop It", "studio"),
+    ];
+    const ranked = scoreCandidates(items, "Twist & Crawl", true);
+    expect(ranked[0].title).toBe("Twist & Crawl");
+    expect(ranked[0].is_live).toBe(false);
+  });
+
+  it("demotes the other live cuts that ruined sets (Save It For Later / Start Me Up / Our House)", () => {
+    const cases: Array<[string, string, string]> = [
+      ["Save It For Later", "Save It For Later (Live)", "The Beat"],
+      ["Start Me Up", "Start Me Up - Live", "The Rolling Stones"],
+      ["Our House", "Our House (Live At Madstock)", "Madness"],
+    ];
+    for (const [query, liveTitle, artist] of cases) {
+      const ranked = scoreCandidates(
+        [item(liveTitle, artist, "live"), item(query, artist, "studio")],
+        query,
+        true,
+      );
+      expect(ranked[0].title, `studio should win for "${query}"`).toBe(query);
+    }
+  });
+
+  it("does NOT demote a live take when the query explicitly asks for live", () => {
+    const ranked = scoreCandidates(
+      [item("Twist & Crawl", "The Beat", "studio"), item("Twist & Crawl (Live 1982)", "The Beat", "live")],
+      "Twist & Crawl Live",
+      true,
+    );
+    expect(ranked[0].title).toBe("Twist & Crawl (Live 1982)");
+  });
+
+  it("does NOT misfire on studio titles that merely contain the letters 'live'", () => {
+    // "Live Forever" is a studio Oasis song; must not be flagged or demoted.
+    expect(classifyVariant("Live Forever", "Oasis").is_live).toBe(false);
+    expect(classifyVariant("Live And Let Die", "Wings").is_live).toBe(false);
+    expect(classifyVariant("Livin' On A Prayer", "Bon Jovi").is_live).toBe(false);
+    const ranked = scoreCandidates(
+      [item("Live Forever", "Oasis / Definitely Maybe", "studio")],
+      "Live Forever Oasis",
+      true,
+    );
+    expect(ranked[0].is_live).toBe(false);
+    expect(ranked[0].confidence).toBeGreaterThan(0.9);
+  });
+
+  it("lightly demotes a greatest-hits compilation below the original album", () => {
+    const ranked = scoreCandidates(
+      [
+        item("Wonderwall", "Oasis / The Best Of Oasis", "comp"),
+        item("Wonderwall", "Oasis / (What's the Story) Morning Glory?", "studio"),
+      ],
+      "Wonderwall Oasis",
+      true,
+    );
+    expect(ranked[0].is_compilation).toBe(false);
+    expect(ranked[0].subtitle).toContain("Morning Glory");
+    expect(ranked.find((c) => c.subtitle.includes("Best Of"))?.is_compilation).toBe(true);
+  });
+});
+
+describe("classifyVariant", () => {
+  it("flags bracketed/dashed/at-phrase live markers", () => {
+    expect(classifyVariant("Song (Live)").is_live).toBe(true);
+    expect(classifyVariant("Song [Live 1982]").is_live).toBe(true);
+    expect(classifyVariant("Song - Live").is_live).toBe(true);
+    expect(classifyVariant("Song", "Album (Live at Wembley)").is_live).toBe(true);
+    expect(classifyVariant("Hey Jude", "MTV Unplugged").is_live).toBe(true);
+  });
+
+  it("flags compilation albums via subtitle", () => {
+    expect(classifyVariant("Track", "Artist / Greatest Hits").is_compilation).toBe(true);
+    expect(classifyVariant("Track", "Artist / The Essential Artist").is_compilation).toBe(true);
+    expect(classifyVariant("Track", "Artist / Definitely Maybe").is_compilation).toBe(false);
   });
 });
 
