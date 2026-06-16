@@ -277,6 +277,102 @@ describe("ramp_volume", () => {
 });
 
 // ---------------------------------------------------------------------------
+// change_volume: ramps by default, snap opts into the instant jump
+// ---------------------------------------------------------------------------
+
+describe("change_volume", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("ramps a large absolute change as an audible fade by default", async () => {
+    reset([makeOutput("WiiM", 24)]);
+    const server = buildServer();
+    const { isError, text } = await call(server, "change_volume", { value: 64, how: "absolute" });
+    expect(isError).toBe(false);
+    expect(text).toContain("Fading");
+    expect(text).toContain("from 24 to 64");
+
+    // 40 one-unit steps, all absolute writes, ending exactly at the target.
+    await waitFor(() => currentLevel() === 64, 1500);
+    expect(world.volumeCalls.length).toBe(40);
+    world.volumeCalls.forEach((c) => expect(c.how).toBe("absolute"));
+    expect(world.volumeCalls.map((c) => c.value)).toEqual(
+      Array.from({ length: 40 }, (_, i) => 25 + i),
+    );
+  });
+
+  it("ramps a relative change too", async () => {
+    reset([makeOutput("WiiM", 24)]);
+    const server = buildServer();
+    const { text } = await call(server, "change_volume", { value: 40, how: "relative" });
+    expect(text).toContain("from 24 to 64");
+
+    await waitFor(() => currentLevel() === 64, 1500);
+    world.volumeCalls.forEach((c) => expect(c.how).toBe("absolute"));
+  });
+
+  it("snap=true jumps instantly, indistinguishable from the old behavior", async () => {
+    reset([makeOutput("WiiM", 24)]);
+    const server = buildServer();
+    const { isError, text } = await call(server, "change_volume", { value: 64, how: "absolute", snap: true });
+    expect(isError).toBe(false);
+    expect(text).toContain("Volume set to 64");
+    // A single direct absolute write per output - no ramp.
+    expect(world.volumeCalls).toHaveLength(1);
+    expect(world.volumeCalls[0]).toMatchObject({ how: "absolute", value: 64 });
+    expect(currentLevel()).toBe(64);
+  });
+
+  it("applies a small change (<=2 units) instantly even without snap", async () => {
+    reset([makeOutput("WiiM", 24)]);
+    const server = buildServer();
+    const { text } = await call(server, "change_volume", { value: 26, how: "absolute" });
+    expect(text).toContain("Volume set to 26");
+    expect(world.volumeCalls).toHaveLength(1);
+    expect(world.volumeCalls[0]).toMatchObject({ how: "absolute", value: 26 });
+  });
+
+  it("applies a small relative nudge (<=2 units) instantly", async () => {
+    reset([makeOutput("WiiM", 24)]);
+    const server = buildServer();
+    const { text } = await call(server, "change_volume", { value: 2, how: "relative" });
+    expect(text).toContain("adjusted by 2");
+    expect(world.volumeCalls).toHaveLength(1);
+    expect(world.volumeCalls[0]).toMatchObject({ how: "relative", value: 2 });
+  });
+
+  it("treats relative_step as an instant hardware nudge", async () => {
+    reset([makeOutput("WiiM", 24)]);
+    const server = buildServer();
+    const { text } = await call(server, "change_volume", { value: 3, how: "relative_step" });
+    expect(text).toContain("adjusted by 3");
+    expect(world.volumeCalls).toHaveLength(1);
+    expect(world.volumeCalls[0]).toMatchObject({ how: "relative_step", value: 3 });
+  });
+
+  it("ramps every output of a grouped zone to the same target", async () => {
+    reset([makeOutput("WiiM", 24), makeOutput("KEF", 20)]);
+    const server = buildServer();
+    await call(server, "change_volume", { value: 64, how: "absolute" });
+
+    await waitFor(() =>
+      world.outputs.every((o) => o.volume?.value === 64),
+    1500);
+    const byOut = (id: string) =>
+      world.volumeCalls.filter((c) => c.output_id === id).map((c) => c.value);
+    // Step count is sized off the zone max (24), so both land on 64.
+    expect(byOut("out-WiiM").at(-1)).toBe(64);
+    expect(byOut("out-KEF").at(-1)).toBe(64);
+  });
+
+  it("fails loudly for an unknown zone", async () => {
+    reset([makeOutput("WiiM", 24)]);
+    const server = buildServer();
+    const { isError } = await call(server, "change_volume", { zone: "Bedroom", value: 64 });
+    expect(isError).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Objective 2: smooth_skip
 // ---------------------------------------------------------------------------
 

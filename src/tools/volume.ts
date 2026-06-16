@@ -38,6 +38,21 @@ const FADE_FLOOR_RATIO = 0.1;
 /** Set SMOOTH_SKIP_DEBUG=1 to log the full volume-vs-time timeline per step. */
 const DEBUG = process.env.SMOOTH_SKIP_DEBUG === "1";
 
+/**
+ * Per-1-unit-step cadence for the default `change_volume` fade. The fade scales
+ * with the size of the change: a routine nudge (~8 units) is ~120ms and reads as
+ * immediate, while a large, dangerous jump (24 -> 64 = 40 units) is ~600ms - a
+ * fast but clearly audible fade, never a slam. This is the mistake-proofing.
+ */
+const CHANGE_VOLUME_STEP_MS = 15;
+
+/**
+ * A change of this magnitude (in volume units) or smaller is applied instantly
+ * even without `snap`. Ramping a 1-2 unit nudge is pointless overhead, and a tiny
+ * change is never the blast-the-room danger the default fade exists to prevent.
+ */
+const SMALL_CHANGE_UNITS = 2;
+
 function promisifyResult(fn: (cb: ResultCallback) => void): Promise<false | string> {
   return new Promise((resolve) => fn((error) => resolve(error)));
 }
@@ -60,40 +75,87 @@ function configuredStepMs(): number | undefined {
 export function registerVolumeTools(server: McpServer): void {
   server.tool(
     "change_volume",
-    "Change the volume of a Roon zone. Each output in a zone may have independent volume controls.",
+    "Change the volume of a Roon zone. By DEFAULT the change applies as a short audible fade (a fast server-side ramp), not an instant jump, so a large change can never slam the room - this is the mistake-proofing for the paused-at-100, hit-play class of accident. The fade scales with the size of the change (a small nudge is near-instant; a big jump like 24->64 is a ~600ms fade). Set snap=true to apply the change instantly (the old behavior). Changes of 2 units or less apply instantly even without snap. A new volume command supersedes any ramp in progress. Honors grouped zones (e.g. WiiM + 1).",
     {
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
       value: z.number().describe("Volume value (absolute level, or relative adjustment)"),
       how: z
         .enum(["absolute", "relative", "relative_step"])
         .default("absolute")
-        .describe("How to interpret the value: 'absolute' sets exact level, 'relative' adds/subtracts, 'relative_step' adjusts by step increments"),
+        .describe("How to interpret the value: 'absolute' sets exact level, 'relative' adds/subtracts, 'relative_step' adjusts by hardware step increments (always instant)"),
+      snap: z
+        .boolean()
+        .default(false)
+        .describe("If true, jump to the new level instantly (the old behavior); otherwise apply it as a short audible fade. Small changes (<=2 units) snap regardless."),
     },
-    async ({ zone, value, how }): Promise<ToolResult> => {
+    async ({ zone, value, how, snap }): Promise<ToolResult> => {
       try {
         const transport = roonConnection.getTransport();
         const foundZone = roonConnection.findZoneOrThrow(zone);
+        const getZone = () => roonConnection.findZone(foundZone.display_name);
 
-        const results: string[] = [];
-        for (const output of foundZone.outputs) {
-          if (!output.volume) continue;
-          const error = await promisifyResult((cb) =>
-            transport.change_volume(output, how, value, cb),
-          );
-          if (error) {
-            results.push(`${output.display_name}: Error - ${error}`);
-          } else {
-            results.push(`${output.display_name}: Volume ${how === "absolute" ? "set to" : "adjusted by"} ${value}`);
+        // Decide instant vs ramp. relative_step is a hardware-style incremental
+        // nudge with no numeric unit we can ramp; it is always applied instantly.
+        // A zone with no numeric-volume outputs likewise can only be set directly.
+        const currentMax = VolumeRamper.currentMaxVolume(foundZone);
+        const canRamp = how !== "relative_step" && currentMax !== null;
+        const magnitude = canRamp
+          ? how === "absolute"
+            ? Math.abs(value - (currentMax as number))
+            : Math.abs(value)
+          : null;
+        const instant =
+          snap === true || !canRamp || (magnitude !== null && magnitude <= SMALL_CHANGE_UNITS);
+
+        if (instant) {
+          // Cancel any ramp in progress so this command supersedes it, then apply
+          // the change immediately - exactly today's per-output transport call.
+          sharedRamper.cancel();
+
+          const results: string[] = [];
+          for (const output of foundZone.outputs) {
+            if (!output.volume) continue;
+            const error = await promisifyResult((cb) =>
+              transport.change_volume(output, how, value, cb),
+            );
+            if (error) {
+              results.push(`${output.display_name}: Error - ${error}`);
+            } else {
+              results.push(`${output.display_name}: Volume ${how === "absolute" ? "set to" : "adjusted by"} ${value}`);
+            }
           }
+
+          if (results.length === 0) {
+            return {
+              content: [{ type: "text", text: `No volume-controllable outputs in zone '${foundZone.display_name}'.` }],
+            };
+          }
+
+          return { content: [{ type: "text", text: results.join("\n") }] };
         }
 
-        if (results.length === 0) {
-          return {
-            content: [{ type: "text", text: `No volume-controllable outputs in zone '${foundZone.display_name}'.` }],
-          };
+        // Default: ramp as a short audible fade. rampAbsolute/rampDelta increment
+        // the ramper generation, so this also supersedes an in-progress ramp.
+        // Fire and forget; the ramp runs server-side and we return immediately.
+        if (how === "absolute") {
+          sharedRamper
+            .rampAbsolute(value, getZone, transport, CHANGE_VOLUME_STEP_MS)
+            .catch((e: unknown) => console.error("[change_volume] error:", e));
+        } else {
+          sharedRamper
+            .rampDelta(value, getZone, transport, CHANGE_VOLUME_STEP_MS)
+            .catch((e: unknown) => console.error("[change_volume] error:", e));
         }
 
-        return { content: [{ type: "text", text: results.join("\n") }] };
+        const target = how === "absolute" ? value : (currentMax as number) + value;
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Fading '${foundZone.display_name}' from ${currentMax} to ${target} (snap=true to jump instantly).`,
+            },
+          ],
+        };
       } catch (error) {
         return {
           content: [{ type: "text", text: String(error instanceof Error ? error.message : error) }],
