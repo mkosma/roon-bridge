@@ -66,6 +66,89 @@ function findLibraryAction(items: BrowseItem[], kind: "add" | "remove"): BrowseI
   );
 }
 
+/**
+ * Find the native Shuffle action on an item's OPENED page.
+ *
+ * Roon's first action level for a playlist/album (the search-result popup) often
+ * exposes only Play Now / Queue / Add Next / Start Radio - NO Shuffle. The
+ * native Shuffle action lives one level deeper: either inside a navigable "Play"
+ * submenu (Play Now / Shuffle / Play From Here ...), or on the item's opened
+ * content page reached by browsing the matched item's own node. This only runs
+ * when shuffle is requested AND wasn't found at level one, so it never adds a
+ * round-trip to the default play/queue path.
+ *
+ * Returns the Shuffle BrowseItem to execute (already resolved to its own
+ * item_key), or undefined if Shuffle is genuinely absent even one level in.
+ */
+async function findShuffleDeeper(
+  browse: RoonApiBrowse,
+  level1Items: BrowseItem[],
+  matchedKey: string,
+  zoneId: string | undefined,
+  sessionKey: string,
+  log: (step: string, data: unknown) => void,
+): Promise<BrowseItem | undefined> {
+  const hierarchy = "search";
+
+  // Candidate sub-lists to open: every navigable action/list row at level one
+  // (e.g. a "Play" submenu that nests Shuffle), plus the matched item's own
+  // node again (its opened content page, where some sources put the Shuffle
+  // header action). De-duped by item_key; the matched key goes last so a real
+  // "Play" submenu is preferred over re-opening the content page.
+  const candidates: BrowseItem[] = [];
+  const seen = new Set<string>();
+  for (const it of level1Items) {
+    if (!it.item_key || it.hint === "header") continue;
+    if (it.hint !== "action_list" && it.hint !== "list" && it.hint !== "action") continue;
+    if (seen.has(it.item_key)) continue;
+    seen.add(it.item_key);
+    candidates.push(it);
+  }
+  if (matchedKey && !seen.has(matchedKey)) {
+    candidates.push({ title: "(opened item page)", item_key: matchedKey, hint: "list" });
+  }
+
+  for (const child of candidates) {
+    const opened = await browseAndLoad(browse, {
+      hierarchy,
+      item_key: child.item_key!,
+      zone_or_output_id: zoneId,
+      multi_session_key: sessionKey,
+    });
+    if (opened.error || opened.message || !opened.items?.length) continue;
+
+    const direct = resolveActionItem(opened.items, "shuffle");
+    if (direct?.item) {
+      log("shuffle-found-deeper", { via: child.title, depth: 2, title: direct.item.title });
+      return direct.item;
+    }
+
+    // One more hop: a single nested action sub-list (Roon occasionally double-
+    // nests Play -> Shuffle). Bounded to a single navigable child so we never
+    // walk a content (track) list.
+    const navigable = opened.items.filter(
+      (i) => i.item_key && (i.hint === "action_list" || i.hint === "list"),
+    );
+    if (navigable.length === 1) {
+      const deeper = await browseAndLoad(browse, {
+        hierarchy,
+        item_key: navigable[0].item_key!,
+        zone_or_output_id: zoneId,
+        multi_session_key: sessionKey,
+      });
+      if (!deeper.error && !deeper.message && deeper.items?.length) {
+        const pick = resolveActionItem(deeper.items, "shuffle");
+        if (pick?.item) {
+          log("shuffle-found-deeper", { via: `${child.title} > ${navigable[0].title}`, depth: 3, title: pick.item.title });
+          return pick.item;
+        }
+      }
+    }
+  }
+
+  return undefined;
+}
+
 interface ResolvedActions {
   error?: string;
   message?: string;
@@ -644,12 +727,32 @@ async function searchAndPlay(
     let shuffleUnavailable = false;
     let targetAction = findAction(actionItems, actionType);
 
+    // Shuffle requested but not at level one (the search-result popup commonly
+    // exposes only Play Now / Queue / Add Next). The native Shuffle action lives
+    // on the item's OPENED page - inside a "Play" submenu or the item's content
+    // page. Navigate INTO the matched item to find it before giving up. Only
+    // runs in this not-found-at-level-one branch, so the default play/queue path
+    // never pays for the extra round-trips.
+    if (actionType === "shuffle" && !targetAction?.item_key) {
+      const deepShuffle = await findShuffleDeeper(
+        browse,
+        actionItems,
+        matchedResult.item_key,
+        zone.zone_id,
+        sessionKey,
+        log,
+      );
+      if (deepShuffle?.item_key) {
+        targetAction = deepShuffle;
+      }
+    }
+
     if (actionType === "shuffle" && !targetAction?.item_key) {
       shuffleUnavailable = true;
       effectiveActionType = "play";
       targetAction = findAction(actionItems, "play");
       log("step6-shuffle-fallback", {
-        reason: "no native Shuffle action on this item; falling back to Play Now",
+        reason: "no native Shuffle action on this item (level one or opened page); falling back to Play Now",
         available: actionItems.filter((i) => i.hint !== "header").map((i) => i.title),
       });
     }
