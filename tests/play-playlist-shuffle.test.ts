@@ -1,0 +1,178 @@
+/**
+ * Tests for play_playlist shuffle=true (native Roon Shuffle action).
+ *
+ * play_playlist normally fires "Play Now", which loads the queue in playlist
+ * order and ignores the zone shuffle flag. shuffle=true must instead execute
+ * Roon's native "Shuffle" action item (random first track, one action, no extra
+ * transport events). When the matched item exposes no Shuffle action, the tool
+ * must fall back to Play Now and SAY SO - never assert "shuffled" when it wasn't.
+ *
+ * The mock models: search -> Playlists category -> playlist match -> action list
+ * (with or without a Shuffle action), and records which action item executed.
+ */
+
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { BrowseItem, BrowseResult, LoadResult } from "node-roon-api-browse";
+
+const world = {
+  hasShuffleAction: true,
+  executed: [] as string[],
+};
+
+// The playlist's action list. Includes a native Shuffle action unless the
+// world says this item exposes none.
+function playlistActions(): BrowseItem[] {
+  const actions: BrowseItem[] = [
+    { title: "Play Now", item_key: "act:play", hint: "action" },
+    { title: "Queue", item_key: "act:queue", hint: "action" },
+    { title: "Start Radio", item_key: "act:radio", hint: "action" },
+  ];
+  if (world.hasShuffleAction) {
+    // Roon orders Shuffle right after Play Now in the real menu.
+    actions.splice(1, 0, { title: "Shuffle", item_key: "act:shuffle", hint: "action" });
+  }
+  return actions;
+}
+
+let lastBrowse = "root";
+
+function loadItems(): BrowseItem[] {
+  switch (lastBrowse) {
+    case "root":
+      return [{ title: "Playlists", item_key: "cat:playlist", hint: "list" }];
+    case "cat:playlist":
+      return [{ title: "Discovered", item_key: "match:playlist", hint: "list", subtitle: "" }];
+    case "match:playlist":
+      return playlistActions();
+    default:
+      return [];
+  }
+}
+
+const mockBrowse = {
+  browse: (opts: Record<string, unknown>, cb: (e: false | string, b: BrowseResult) => void) => {
+    if (opts.pop_all) {
+      lastBrowse = "root";
+      cb(false, { action: "list", list: { title: "Search", count: 1, level: 0 } });
+      return;
+    }
+    const key = String(opts.item_key ?? "");
+    if (key.startsWith("act:")) {
+      // Action execution: record which one fired, report plain success.
+      world.executed.push(key);
+      cb(false, { action: "none" });
+      return;
+    }
+    // Navigation into a list node. The action list is hinted action_list.
+    lastBrowse = key;
+    const isActionList = key === "match:playlist";
+    cb(false, {
+      action: "list",
+      list: { title: key, count: loadItems().length, level: 1, hint: isActionList ? "action_list" : undefined },
+    });
+  },
+  load: (_opts: Record<string, unknown>, cb: (e: false | string, b: LoadResult) => void) => {
+    const items = loadItems();
+    cb(false, { items, offset: 0, list: { title: lastBrowse, count: items.length, level: 0 } });
+  },
+};
+
+vi.mock("../src/roon-connection.js", () => ({
+  roonConnection: {
+    getBrowse: vi.fn(() => mockBrowse),
+    getTransport: vi.fn(() => ({
+      change_settings: (_z: unknown, _s: unknown, cb: () => void) => cb(),
+    })),
+    findZoneOrThrow: vi.fn(() => ({ zone_id: "zone-1", display_name: "WiiM + 1" })),
+    getQueueSnapshot: vi.fn(async () => []),
+  },
+}));
+
+const { registerBrowseTools } = await import("../src/tools/browse.js");
+
+function buildServer() {
+  const server = new McpServer({ name: "t", version: "0" });
+  registerBrowseTools(server);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return server as any;
+}
+
+async function call(server: unknown, name: string, args: Record<string, unknown>) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const tool = (server as any)._registeredTools[name];
+  const res = await tool.handler(args, {});
+  const text = res.content.map((c: { text: string }) => c.text).join("\n");
+  return { isError: res.isError === true, text };
+}
+
+function reset(partial: Partial<typeof world> = {}) {
+  world.hasShuffleAction = true;
+  world.executed = [];
+  lastBrowse = "root";
+  Object.assign(world, partial);
+}
+
+describe("play_playlist shuffle", () => {
+  beforeEach(() => {
+    reset();
+    vi.clearAllMocks();
+  });
+
+  it("shuffle:true executes the native Shuffle action when present", async () => {
+    const server = buildServer();
+    const { isError, text } = await call(server, "play_playlist", {
+      playlist: "Discovered",
+      shuffle: true,
+    });
+
+    expect(isError).toBe(false);
+    // The Shuffle action fired, NOT Play Now.
+    expect(world.executed).toContain("act:shuffle");
+    expect(world.executed).not.toContain("act:play");
+    expect(text).toMatch(/^Shuffling:/);
+    expect(text).not.toMatch(/shuffle unavailable/i);
+  });
+
+  it("shuffle:true falls back to Play Now and SAYS SO when no Shuffle action exists", async () => {
+    reset({ hasShuffleAction: false });
+    const server = buildServer();
+    const { isError, text } = await call(server, "play_playlist", {
+      playlist: "Discovered",
+      shuffle: true,
+    });
+
+    expect(isError).toBe(false);
+    // No native Shuffle -> Play Now fired, and the text is honest about it.
+    expect(world.executed).toContain("act:play");
+    expect(world.executed).not.toContain("act:shuffle");
+    expect(text).toMatch(/^Now playing:/);
+    expect(text).toMatch(/shuffle unavailable/i);
+  });
+
+  it("shuffle omitted behaves exactly as before: Play Now, no shuffle, no shuffle note", async () => {
+    const server = buildServer();
+    const { isError, text } = await call(server, "play_playlist", {
+      playlist: "Discovered",
+    });
+
+    expect(isError).toBe(false);
+    expect(world.executed).toContain("act:play");
+    expect(world.executed).not.toContain("act:shuffle");
+    expect(text).toMatch(/^Now playing:/);
+    expect(text).not.toMatch(/shuffle/i);
+  });
+
+  it("shuffle:false behaves exactly as before: Play Now, never the Shuffle action", async () => {
+    const server = buildServer();
+    const { isError, text } = await call(server, "play_playlist", {
+      playlist: "Discovered",
+      shuffle: false,
+    });
+
+    expect(isError).toBe(false);
+    expect(world.executed).toContain("act:play");
+    expect(world.executed).not.toContain("act:shuffle");
+    expect(text).toMatch(/^Now playing:/);
+  });
+});

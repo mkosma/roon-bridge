@@ -21,9 +21,19 @@ type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: bo
 // One shared scheduler for event-driven "play after the current track" (Obj 5).
 const deferredPlayer = new DeferredPlayer(roonConnection);
 
-/** Legacy play/queue intent mapped onto the search-core action vocabulary. */
-function findAction(items: BrowseItem[], type: "play" | "queue"): BrowseItem | undefined {
-  const resolved = resolveActionItem(items, type === "play" ? "play_now" : "queue");
+/** What kind of action a play-path caller wants to execute. */
+type ActionType = "play" | "queue" | "shuffle";
+
+/** Map the play-path action vocabulary onto search-core's intents. */
+function intentFor(type: ActionType): "play_now" | "queue" | "shuffle" {
+  if (type === "queue") return "queue";
+  if (type === "shuffle") return "shuffle";
+  return "play_now";
+}
+
+/** Legacy play/queue/shuffle intent mapped onto the search-core action vocabulary. */
+function findAction(items: BrowseItem[], type: ActionType): BrowseItem | undefined {
+  const resolved = resolveActionItem(items, intentFor(type));
   return resolved?.item;
 }
 
@@ -434,7 +444,7 @@ async function searchAndPlay(
   query: string,
   zoneName: string,
   category?: string,
-  actionType: "play" | "queue" = "play",
+  actionType: ActionType = "play",
 ): Promise<ToolResult> {
   try {
     const browse = roonConnection.getBrowse();
@@ -627,10 +637,24 @@ async function searchAndPlay(
       currentListHint = deeper.list?.hint;
     }
 
-    // Step 6: Find and execute action
-    const targetAction = findAction(actionItems, actionType);
+    // Step 6: Find and execute action. For a shuffle request, prefer the native
+    // Shuffle action; if this item exposes none, fall back to Play Now and
+    // record that so the result text reports honestly which path executed.
+    let effectiveActionType = actionType;
+    let shuffleUnavailable = false;
+    let targetAction = findAction(actionItems, actionType);
 
-    log("step6-action", { actionType, selected: targetAction?.title, hint: targetAction?.hint, item_key: targetAction?.item_key });
+    if (actionType === "shuffle" && !targetAction?.item_key) {
+      shuffleUnavailable = true;
+      effectiveActionType = "play";
+      targetAction = findAction(actionItems, "play");
+      log("step6-shuffle-fallback", {
+        reason: "no native Shuffle action on this item; falling back to Play Now",
+        available: actionItems.filter((i) => i.hint !== "header").map((i) => i.title),
+      });
+    }
+
+    log("step6-action", { actionType, effectiveActionType, selected: targetAction?.title, hint: targetAction?.hint, item_key: targetAction?.item_key });
 
     if (!targetAction?.item_key) {
       return {
@@ -686,7 +710,7 @@ async function searchAndPlay(
           items: subItems.body.items.map((i) => ({ title: i.title, hint: i.hint, item_key: i.item_key })),
         });
 
-        const subAction = findAction(subItems.body.items, actionType);
+        const subAction = findAction(subItems.body.items, effectiveActionType);
         if (subAction?.item_key) {
           log("step7-submenu-action", { selected: subAction.title, hint: subAction.hint });
 
@@ -752,14 +776,25 @@ async function searchAndPlay(
     }
 
     const subtitle = matchedResult.subtitle ? ` by ${stripRoonLinks(matchedResult.subtitle)}` : "";
-    const actionVerb = actionType === "queue" ? "Queued" : "Now playing";
+    // Report the path that actually executed, not the one requested. A shuffle
+    // request that found the native action says "Shuffling"; one that fell back
+    // says so explicitly, so we never assert "shuffled" when it wasn't.
+    const actionVerb =
+      actionType === "queue"
+        ? "Queued"
+        : effectiveActionType === "shuffle"
+          ? "Shuffling"
+          : "Now playing";
+    const shuffleNote = shuffleUnavailable
+      ? ` [shuffle unavailable for this item - no native Shuffle action; played in playlist order instead]`
+      : "";
     const confPct = Math.round(matchConfidence * 100);
     const confNote =
       matchConfidence < 0.5 && runnerUp
         ? ` [loose match, ${confPct}% confidence; runner-up: "${runnerUp.title}"${runnerUp.artist ? ` - ${runnerUp.artist}` : ""}]`
         : ` [match confidence ${confPct}%]`;
     return {
-      content: [{ type: "text", text: `${actionVerb}: "${matchedResult.title}"${subtitle} in zone '${zone.display_name}'.${confNote}` }],
+      content: [{ type: "text", text: `${actionVerb}: "${matchedResult.title}"${subtitle} in zone '${zone.display_name}'.${shuffleNote}${confNote}` }],
     };
   } catch (error) {
     return {
@@ -781,7 +816,9 @@ async function playWithWhen(
   zoneName: string,
   category: "album" | "track",
   when: "now" | "after_current",
+  shuffle = false,
 ): Promise<ToolResult> {
+  const playActionType: ActionType = shuffle ? "shuffle" : "play";
   if (when === "after_current") {
     let zone;
     try {
@@ -797,7 +834,7 @@ async function playWithWhen(
     if (zone.state === "playing" && np && np.length != null) {
       // Fire and forget: the replace runs server-side at the track seam.
       deferredPlayer
-        .scheduleAfterCurrent(zone, () => searchAndPlay(query, zoneName, category, "play"))
+        .scheduleAfterCurrent(zone, () => searchAndPlay(query, zoneName, category, playActionType))
         .catch((e: unknown) => console.error("[playWithWhen] schedule error:", e));
       return {
         content: [{
@@ -811,7 +848,7 @@ async function playWithWhen(
 
   // An immediate play supersedes any armed deferral.
   deferredPlayer.cancel();
-  return searchAndPlay(query, zoneName, category, "play");
+  return searchAndPlay(query, zoneName, category, playActionType);
 }
 
 export function registerBrowseTools(server: McpServer): void {
@@ -948,12 +985,18 @@ export function registerBrowseTools(server: McpServer): void {
 
   server.tool(
     "play_artist",
-    "Search for an artist and start playing their music in a Roon zone",
+    "Search for an artist and start playing their music in a Roon zone. shuffle=true executes Roon's native Shuffle action; if the matched artist exposes no Shuffle action, it falls back to Play Now and the result text says so.",
     {
       artist: z.string().describe("Artist name to search for"),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
+      shuffle: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Play in shuffled order via Roon's native Shuffle action (default false)"),
     },
-    async ({ artist, zone }) => searchAndPlay(artist, zone, "artist"),
+    async ({ artist, zone, shuffle }) =>
+      searchAndPlay(artist, zone, "artist", shuffle ? "shuffle" : "play"),
   );
 
   server.tool(
@@ -966,18 +1009,29 @@ export function registerBrowseTools(server: McpServer): void {
         .enum(["now", "after_current"])
         .default("now")
         .describe("'now' replaces immediately; 'after_current' waits for the current track to end, then replaces"),
+      shuffle: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Play in shuffled order via Roon's native Shuffle action (default false = album order)"),
     },
-    async ({ album, zone, when }) => playWithWhen(album, zone, "album", when ?? "now"),
+    async ({ album, zone, when, shuffle }) => playWithWhen(album, zone, "album", when ?? "now", shuffle ?? false),
   );
 
   server.tool(
     "play_playlist",
-    "Search for a playlist and start playing it in a Roon zone",
+    "Search for a playlist and start playing it in a Roon zone. shuffle=true executes Roon's native Shuffle action (random track order, no extra transport events); if the matched playlist exposes no Shuffle action, it falls back to Play Now and the result text says so.",
     {
       playlist: z.string().describe("Playlist name to search for"),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
+      shuffle: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Play in shuffled order via Roon's native Shuffle action (default false = playlist order)"),
     },
-    async ({ playlist, zone }) => searchAndPlay(playlist, zone, "playlist"),
+    async ({ playlist, zone, shuffle }) =>
+      searchAndPlay(playlist, zone, "playlist", shuffle ? "shuffle" : "play"),
   );
 
   server.tool(
