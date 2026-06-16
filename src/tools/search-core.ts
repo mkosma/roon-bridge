@@ -265,7 +265,14 @@ export function bestMatch(items: BrowseItem[], query: string): BrowseItem | unde
 }
 
 /** The action vocabulary Roon exposes on a track/album/artist action list. */
-export type QueueAction = "play_now" | "add_next" | "queue";
+export type QueueAction = "play_now" | "add_next" | "queue" | "shuffle";
+
+/**
+ * Titles Roon uses for the native "Shuffle" action across sources/locales.
+ * Roon's local library and most streaming sources label it plainly "Shuffle";
+ * some surfaces use "Shuffle Play" / "Play Shuffled" / "Shuffle All".
+ */
+const SHUFFLE_ACTION_TITLE = /^(shuffle|shuffle play|play shuffled|shuffle all)$/i;
 
 /**
  * Resolve the right action item for the requested intent from an action list.
@@ -280,6 +287,14 @@ export function resolveActionItem(
   const actionable = items.filter((item) => item.item_key && item.hint !== "header");
   const byTitle = (t: string) =>
     actionable.find((item) => item.title.trim().toLowerCase() === t);
+
+  if (intent === "shuffle") {
+    // Only ever the genuine native Shuffle action; never fall back to Play Now
+    // here. The caller decides the fallback so it can report honestly which
+    // path executed.
+    const pick = actionable.find((item) => SHUFFLE_ACTION_TITLE.test(item.title.trim()));
+    return pick ? { item: pick, matched: pick.title } : undefined;
+  }
 
   if (intent === "play_now") {
     const pick =

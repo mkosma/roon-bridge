@@ -118,6 +118,40 @@ describe("resolveActionItem", () => {
   it("returns undefined when no actionable items", () => {
     expect(resolveActionItem([{ title: "h", hint: "header" }], "play_now")).toBeUndefined();
   });
+
+  it("shuffle selects the native 'Shuffle' action when present", () => {
+    const withShuffle: BrowseItem[] = [
+      { title: "Play Now", item_key: "k1", hint: "action" },
+      { title: "Shuffle", item_key: "k2", hint: "action" },
+      { title: "Queue", item_key: "k3", hint: "action" },
+    ];
+    const r = resolveActionItem(withShuffle, "shuffle");
+    expect(r?.matched).toBe("Shuffle");
+    expect(r?.item.item_key).toBe("k2");
+  });
+
+  it("shuffle matches locale/source title variants (Shuffle Play, Play Shuffled, Shuffle All)", () => {
+    for (const title of ["Shuffle Play", "Play Shuffled", "Shuffle All"]) {
+      const list: BrowseItem[] = [
+        { title: "Play Now", item_key: "k1", hint: "action" },
+        { title, item_key: "k2", hint: "action" },
+      ];
+      expect(resolveActionItem(list, "shuffle")?.matched).toBe(title);
+    }
+  });
+
+  it("shuffle returns undefined (no fake fallback) when no Shuffle action exists", () => {
+    // The honest-fallback decision belongs to the caller, not the resolver.
+    expect(resolveActionItem(actionList, "shuffle")).toBeUndefined();
+  });
+
+  it("shuffle does not grab a 'Start Radio' or 'Play Now' action", () => {
+    const noShuffle: BrowseItem[] = [
+      { title: "Play Now", item_key: "k1", hint: "action" },
+      { title: "Start Radio", item_key: "k4", hint: "action" },
+    ];
+    expect(resolveActionItem(noShuffle, "shuffle")).toBeUndefined();
+  });
 });
 
 describe("stripRoonLinks", () => {
