@@ -17,12 +17,25 @@ import type { BrowseItem, BrowseResult, LoadResult } from "node-roon-api-browse"
 
 const world = {
   hasShuffleAction: true,
+  // When true, level one (the search-result popup) has NO Shuffle; Shuffle lives
+  // one level deeper inside a navigable "Play" submenu - the real Roon playlist
+  // shape this navigate-into-item fix targets.
+  shuffleNestedInPlaySubmenu: false,
   executed: [] as string[],
 };
 
 // The playlist's action list. Includes a native Shuffle action unless the
 // world says this item exposes none.
 function playlistActions(): BrowseItem[] {
+  if (world.shuffleNestedInPlaySubmenu) {
+    // Level one: a navigable "Play" submenu + flat actions, NO Shuffle here.
+    return [
+      { title: "Play", item_key: "sub:play", hint: "action_list" },
+      { title: "Queue", item_key: "act:queue", hint: "action" },
+      { title: "Add Next", item_key: "act:addnext", hint: "action" },
+      { title: "Start Radio", item_key: "act:radio", hint: "action" },
+    ];
+  }
   const actions: BrowseItem[] = [
     { title: "Play Now", item_key: "act:play", hint: "action" },
     { title: "Queue", item_key: "act:queue", hint: "action" },
@@ -45,6 +58,13 @@ function loadItems(): BrowseItem[] {
       return [{ title: "Discovered", item_key: "match:playlist", hint: "list", subtitle: "" }];
     case "match:playlist":
       return playlistActions();
+    case "sub:play":
+      // The opened "Play" submenu: Play Now / Shuffle / Play From Here.
+      return [
+        { title: "Play Now", item_key: "act:play", hint: "action" },
+        { title: "Shuffle", item_key: "act:shuffle", hint: "action" },
+        { title: "Play From Here", item_key: "act:fromhere", hint: "action" },
+      ];
     default:
       return [];
   }
@@ -66,7 +86,7 @@ const mockBrowse = {
     }
     // Navigation into a list node. The action list is hinted action_list.
     lastBrowse = key;
-    const isActionList = key === "match:playlist";
+    const isActionList = key === "match:playlist" || key === "sub:play";
     cb(false, {
       action: "list",
       list: { title: key, count: loadItems().length, level: 1, hint: isActionList ? "action_list" : undefined },
@@ -108,6 +128,7 @@ async function call(server: unknown, name: string, args: Record<string, unknown>
 
 function reset(partial: Partial<typeof world> = {}) {
   world.hasShuffleAction = true;
+  world.shuffleNestedInPlaySubmenu = false;
   world.executed = [];
   lastBrowse = "root";
   Object.assign(world, partial);
@@ -132,6 +153,38 @@ describe("play_playlist shuffle", () => {
     expect(world.executed).not.toContain("act:play");
     expect(text).toMatch(/^Shuffling:/);
     expect(text).not.toMatch(/shuffle unavailable/i);
+  });
+
+  it("shuffle:true navigates INTO the item to find Shuffle nested in a Play submenu", async () => {
+    reset({ shuffleNestedInPlaySubmenu: true });
+    const server = buildServer();
+    const { isError, text } = await call(server, "play_playlist", {
+      playlist: "Discovered",
+      shuffle: true,
+    });
+
+    expect(isError).toBe(false);
+    // Level one had no Shuffle; the fix opened the "Play" submenu and fired the
+    // nested Shuffle action - never Play Now, never the honest-fallback note.
+    expect(world.executed).toContain("act:shuffle");
+    expect(world.executed).not.toContain("act:play");
+    expect(text).toMatch(/^Shuffling:/);
+    expect(text).not.toMatch(/shuffle unavailable/i);
+  });
+
+  it("shuffle:false does NOT navigate into the item even when Shuffle is nested deeper", async () => {
+    reset({ shuffleNestedInPlaySubmenu: true });
+    const server = buildServer();
+    const { isError, text } = await call(server, "play_playlist", {
+      playlist: "Discovered",
+      shuffle: false,
+    });
+
+    expect(isError).toBe(false);
+    // Default path resolves Play at level one (the "Play" submenu node) and
+    // never drills for Shuffle - no extra round-trips on the non-shuffle path.
+    expect(world.executed).not.toContain("act:shuffle");
+    expect(text).toMatch(/^Now playing:/);
   });
 
   it("shuffle:true falls back to Play Now and SAYS SO when no Shuffle action exists", async () => {
