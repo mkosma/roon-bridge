@@ -263,9 +263,10 @@ export class VolumeRamper {
    * to an even cadence over totalMs. `onStep(level, index, steps)` is an
    * optional per-step probe for logging the real volume-vs-time timeline.
    *
-   * NOTE: shares its eased-cadence technique with the (separately in-flight)
-   * smooth_skip `rampShaped` helper; the two should be unified once that work
-   * merges. This method is curve-driven and duration-anchored for long fades.
+   * This is the single shaped-cadence path: ramp_volume drives it for long
+   * curve-shaped fades, and smooth_skip drives it (curve="perceptual") for its
+   * fade-out duck and fade-in ride. Duration-anchored to a wall clock so long
+   * durations don't accumulate setTimeout drift or stall.
    */
   async rampCurve(
     target: number,

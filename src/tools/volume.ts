@@ -239,9 +239,12 @@ export function registerVolumeTools(server: McpServer): void {
         mark(`start: original=${original} floor=${floor} out=${outMs}ms in=${inMs}ms dir=${dir}`);
 
         try {
-          // Quick shaped duck (easeIn) to the floor on the OUTGOING track. This
-          // does not add silence - the old track just plays quieter for outMs.
-          await sharedRamper.rampShaped(floor, getZone, transport, outMs, "in", stepProbe);
+          // Quick perceptual duck to the floor on the OUTGOING track. This does
+          // not add silence - the old track just plays quieter for outMs. The
+          // "perceptual" curve (main's rampCurve) dwells on the low units, where
+          // each 1-unit step is a bigger dB jump, so the tail settles into the
+          // floor smoothly instead of stepping (ticket diagnosis #2).
+          await sharedRamper.rampCurve(floor, getZone, transport, outMs, "perceptual", stepProbe);
           mark("ducked, issuing skip");
           // Perform the manual skip. No wait after this: fading up immediately
           // overlaps Roon's load gap rather than sitting silent through it.
@@ -254,9 +257,10 @@ export function registerVolumeTools(server: McpServer): void {
           mark("skip issued, fading up");
         } finally {
           // Always fade back up to the original level from wherever we ended up,
-          // so a failed skip never leaves the zone stuck low. Shaped easeOut so
-          // the new track swells up smoothly out of the floor.
-          await sharedRamper.rampShaped(original, getZone, transport, inMs, "out", stepProbe);
+          // so a failed skip never leaves the zone stuck low. "perceptual" again
+          // so the new track swells up smoothly out of the floor, spending the
+          // most time in the low range where steps are most audible.
+          await sharedRamper.rampCurve(original, getZone, transport, inMs, "perceptual", stepProbe);
           mark(`fade-in done, restored to ${original}`);
         }
 
