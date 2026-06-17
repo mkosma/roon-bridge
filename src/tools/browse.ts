@@ -253,6 +253,95 @@ function libraryEntryTitles(rootItems: BrowseItem[], query: string, category: st
 }
 
 /**
+ * Search for an item, pick the best match, and navigate to its action list -
+ * the same steps 1-5b that searchAndPlay performs, factored so the artist-queue
+ * path can reach an item's action menu without executing a playback action.
+ *
+ * This is the general play/queue resolver. The library path uses the deeper
+ * resolveLibraryActions below, because the Add/Remove-from-Library toggle does
+ * not live on the quick action popup this returns.
+ */
+async function resolveActionItems(
+  browse: RoonApiBrowse,
+  query: string,
+  zoneId: string | undefined,
+  category: string | undefined,
+  sessionKey: string,
+): Promise<ResolvedActions> {
+  const hierarchy = "search";
+
+  const searchData = await browseAndLoad(browse, {
+    hierarchy,
+    input: query,
+    pop_all: true,
+    zone_or_output_id: zoneId,
+    multi_session_key: sessionKey,
+  });
+  if (searchData.error) return { error: `Search error: ${searchData.error}` };
+  if (!searchData.items?.length) return { error: `No results found for "${query}".` };
+
+  let targetCategory: BrowseItem | undefined;
+  if (category) {
+    const catLower = category.toLowerCase();
+    targetCategory =
+      searchData.items.find(
+        (i) => i.item_key && (i.title.toLowerCase() === catLower + "s" || i.title.toLowerCase() === catLower),
+      ) ||
+      searchData.items.find(
+        (i) => i.item_key && i.title.toLowerCase().includes(catLower) && i.hint !== "header",
+      );
+  }
+  targetCategory ??= searchData.items.find((i) => i.item_key && i.hint !== "header");
+  if (!targetCategory?.item_key) return { error: `No "${category ?? "playable"}" results for "${query}".` };
+
+  const categoryData = await browseAndLoad(browse, {
+    hierarchy,
+    item_key: targetCategory.item_key,
+    zone_or_output_id: zoneId,
+    multi_session_key: sessionKey,
+  });
+  if (categoryData.error) return { error: `Error browsing ${targetCategory.title}: ${categoryData.error}` };
+  if (!categoryData.items?.length) return { error: `No ${targetCategory.title.toLowerCase()} found for "${query}".` };
+
+  const matched = bestMatch(categoryData.items, query);
+  if (!matched?.item_key) return { error: `No playable match for "${query}".` };
+
+  const actionData = await browseAndLoad(browse, {
+    hierarchy,
+    item_key: matched.item_key,
+    zone_or_output_id: zoneId,
+    multi_session_key: sessionKey,
+  });
+  if (actionData.message) return { matched, message: actionData.message };
+  if (actionData.error) return { error: `Error: ${actionData.error}` };
+  if (!actionData.items?.length) return { matched, actionItems: [] };
+
+  // Navigate deeper to the actual action list when Roon nests it one level.
+  let actionItems = actionData.items;
+  let currentListHint = actionData.list?.hint;
+  for (let depth = 0; depth < 3; depth++) {
+    if (currentListHint === "action_list") break;
+    if (actionItems.some((i) => i.hint === "action")) break;
+    const navigable = actionItems.filter(
+      (i) => i.item_key && (i.hint === "action_list" || i.hint === "list"),
+    );
+    if (navigable.length !== 1) break;
+    const deeper = await browseAndLoad(browse, {
+      hierarchy,
+      item_key: navigable[0].item_key!,
+      zone_or_output_id: zoneId,
+      multi_session_key: sessionKey,
+    });
+    if (deeper.message) return { matched, message: deeper.message };
+    if (deeper.error || !deeper.items?.length) break;
+    actionItems = deeper.items;
+    currentListHint = deeper.list?.hint;
+  }
+
+  return { matched, actionItems };
+}
+
+/**
  * Resolve the action menu that carries the Add/Remove-from-Library toggle for an
  * album or artist match, leaving the browse session positioned at that menu so
  * the caller can execute the toggle in the SAME session.
