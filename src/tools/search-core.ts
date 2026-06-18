@@ -213,6 +213,20 @@ const COMPILATION_MARKER =
 /** Query intent that legitimately wants a live/alt recording - suppresses the live penalty. */
 const WANTS_LIVE = /[([]\s*live\b|\blive\s+(at|in|from|on|version|edit|recording|session|album)\b|\b(bbc|peel)\s+session|\bunplugged\b|\bin concert\b|\blive\b\s*$|^\s*live\b/i;
 
+/**
+ * Detect an INSTRUMENTAL recording from a title/version. Fires only on explicit
+ * markers (parenthetical/bracketed, trailing "- Instrumental", or a "...
+ * Instrumental Version/Mix/Edit" token), never on a bare word inside a song
+ * title. Generic counterpart of the provider-side inferInstrumental, usable from
+ * the Roon-browse layer where only text is available.
+ */
+const INSTRUMENTAL_MARKER =
+  /[([]\s*instrumental\b|[-–]\s*instrumental\b|\binstrumental\s+(version|mix|edit)\b/i;
+
+export function looksInstrumental(title: string, subtitle = ""): boolean {
+  return INSTRUMENTAL_MARKER.test(title) || INSTRUMENTAL_MARKER.test(stripRoonLinks(subtitle));
+}
+
 export interface VariantFlags {
   is_live: boolean;
   is_compilation: boolean;
