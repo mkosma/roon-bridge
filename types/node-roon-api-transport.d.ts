@@ -125,6 +125,13 @@ declare module "node-roon-api-transport" {
       queue_item_id: number,
       cb?: (error: false | string) => void,
     ): void;
+    transfer_zone(
+      from: Zone | Output | string,
+      to: Zone | Output | string,
+      cb?: ResultCallback,
+    ): void;
+    group_outputs(outputs: Array<Output | string>, cb?: ResultCallback): void;
+    ungroup_outputs(outputs: Array<Output | string>, cb?: ResultCallback): void;
     zone_by_zone_id(zone_id: string): Zone | null;
     zone_by_output_id(output_id: string): Zone | null;
   }

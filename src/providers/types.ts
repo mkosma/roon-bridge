@@ -18,6 +18,29 @@ export interface ProviderTrack {
   durationSec?: number;
   /** Cross-provider join key — enables e.g. cloning a Qobuz playlist to Tidal. */
   isrc?: string;
+  /** Provider-native album id (needed to anchor a deterministic Roon resolve). */
+  albumId?: string;
+  /** 1-based position within its album, when the provider exposes it. */
+  trackNumber?: number;
+  /** Release year (4-digit), derived from the provider's release date. */
+  year?: number;
+  /** Explicit-content flag (Qobuz `parental_warning`). */
+  explicit?: boolean;
+  /** Version/edition token, e.g. "Live", "Remastered", "Instrumental" (null = none). */
+  version?: string;
+  /**
+   * True when the recording is flagged as instrumental. Providers expose no
+   * dedicated boolean; this is inferred from title/version tokens, so it is a
+   * best-effort hint, never authoritative.
+   */
+  instrumental?: boolean;
+  /** Hi-res (>CD quality) availability, when the provider exposes it. */
+  hires?: boolean;
+  /**
+   * Whether the track is in the user's provider library/favorites. Only
+   * populated by callers that explicitly ask for it (an extra API round-trip).
+   */
+  inLibrary?: boolean;
 }
 
 export interface ProviderPlaylist {
@@ -33,6 +56,15 @@ export interface MusicProvider {
   readonly name: ProviderName;
 
   searchTracks(query: string, limit?: number): Promise<ProviderTrack[]>;
+
+  /** Fetch one track's full metadata by its provider-native id. */
+  getTrack(id: string): Promise<ProviderTrack>;
+
+  /**
+   * Given provider track ids, return the subset that are in the user's
+   * library/favorites. Implementations should tolerate unknown ids (omit them).
+   */
+  tracksInLibrary(ids: string[]): Promise<Set<string>>;
 
   listPlaylists(limit?: number): Promise<ProviderPlaylist[]>;
   getPlaylist(

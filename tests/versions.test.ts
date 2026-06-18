@@ -169,6 +169,20 @@ describe("find_versions", () => {
       expect(ref?.t).toBe(c.title);
     }
   });
+
+  it("surfaces the browse item_key, an instrumental flag, and documents unreachable fields", async () => {
+    const server = buildServer();
+    const { json } = await call(server, "find_versions", { query: "Twist & Crawl" });
+    for (const c of json.candidates) {
+      expect(typeof c.item_key === "string" || c.item_key === null).toBe(true);
+      expect(typeof c.instrumental).toBe("boolean");
+    }
+    // The studio cut carries its real browse item_key.
+    const studio = json.candidates.find((c: { subtitle: string }) => c.subtitle?.includes("I Just Can't Stop It"));
+    expect(studio.item_key).toBe("trk:studio");
+    // Roon-browse API limits are documented in the payload, not silently omitted.
+    expect(json.fields_note).toMatch(/duration .* explicit .* year .* provider track ID/i);
+  });
 });
 
 describe("queue_version", () => {

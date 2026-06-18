@@ -40,6 +40,7 @@ import {
   resolveActionItem,
   promisifyBrowse,
   stripRoonLinks,
+  looksInstrumental,
   type ScoredCandidate,
   type QueueAction,
 } from "./search-core.js";
@@ -99,7 +100,13 @@ function toCandidateJson(c: ScoredCandidate, query: string, category: string | u
     subtitle: c.subtitle || null,
     is_live: c.is_live,
     is_compilation: c.is_compilation,
+    instrumental: looksInstrumental(c.title, c.subtitle),
     confidence: Number(c.confidence.toFixed(2)),
+    // Roon's browse item_key for this row. It is session- AND stack-scoped (it
+    // expires once this browse session moves on), so it is exposed for
+    // transparency only - it is NOT a stable cross-call handle. Use `ref` (or a
+    // provider track ID from search_tracks) to queue an exact recording later.
+    item_key: c.item.item_key ?? null,
     ref: encodeRef({ q: query, c: category, t: c.title, s: c.subtitle, src: source }),
   };
 }
@@ -157,7 +164,7 @@ export function registerVersionTools(server: McpServer): void {
   // ---------------------------------------------------------------------------
   server.tool(
     "find_versions",
-    "Search for a track (or album) and return the candidate VERSIONS ranked, each with is_live / is_compilation / confidence and an opaque `ref`. Use this to see whether a live take, remaster, or compilation is masquerading as the studio cut, then pass a chosen candidate's `ref` to queue_version to queue THAT exact recording. Studio versions are ranked first by default. Roon's browse API exposes no year/format/library field, so album info is only what appears in the subtitle.",
+    "Search for a track (or album) and return the candidate VERSIONS ranked, each with is_live / is_compilation / instrumental / confidence, the Roon item_key, and an opaque `ref`. Use this to see whether a live take, remaster, or compilation is masquerading as the studio cut, then pass a chosen candidate's `ref` to queue_version to queue THAT exact recording. Studio versions are ranked first by default. NOTE: Roon's browse API exposes only title/subtitle/item_key per row - NOT duration, explicit, year, or a provider track ID. For that metadata plus a directly-queueable ID, use search_tracks (Qobuz) + queue_by_id.",
     {
       query: z.string().describe("Song or album to find versions of (include the artist for precision)."),
       category: z
@@ -210,7 +217,9 @@ export function registerVersionTools(server: McpServer): void {
           ...(note ? { note } : {}),
           count: shaped.length,
           candidates: shaped,
-          hint: "Queue an exact version with queue_version(ref).",
+          fields_note:
+            "duration / explicit / year / provider track ID are NOT available from Roon's browse API; use search_tracks for those plus a queue_by_id-able ID. is_live / is_compilation / instrumental are inferred from title+subtitle text.",
+          hint: "Queue an exact version with queue_version(ref), or get a provider ID from search_tracks and use queue_by_id.",
         });
       } catch (e) {
         return jsonResult({ ok: false, error: e instanceof Error ? e.message : String(e) }, true);

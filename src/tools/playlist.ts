@@ -35,22 +35,54 @@ export function registerPlaylistTools(server: McpServer): void {
 
   server.tool(
     "search_tracks",
-    "Search a music provider for tracks. Returns track IDs (use them with add_tracks_to_playlist).",
+    "Search a music provider for tracks. Returns each track's ID plus duration, year, explicit flag, instrumental hint, version/edition, hi-res, and an in_library flag (whether it is in Monty's provider library). Feed an ID straight to queue_by_id / play_by_id to queue the EXACT track, or to add_tracks_to_playlist. source='library' restricts to tracks already in the library (his safest source).",
     {
       query: z.string().describe("Search query"),
       limit: z.number().int().positive().max(50).optional().describe("Max results (default 10)"),
+      source: z
+        .enum(["all", "library"])
+        .default("all")
+        .describe("'all' searches the whole catalog (default); 'library' returns only tracks already in Monty's library."),
       provider: providerArg,
     },
-    async ({ query, limit, provider }) => {
+    async ({ query, limit, source, provider }) => {
       try {
-        const tracks = await resolve(provider).searchTracks(query, limit ?? 10);
+        const p = resolve(provider);
+        const tracks = await p.searchTracks(query, limit ?? 10);
         if (tracks.length === 0) return ok(`No tracks found for "${query}".`);
+
+        // in_library: one membership read for the whole result set.
+        let inLib = new Set<string>();
+        try {
+          inLib = await p.tracksInLibrary(tracks.map((t) => t.id));
+        } catch {
+          // Membership unavailable (e.g. auth); fall through with in_library unknown.
+        }
+        let rows = tracks.map((t) => ({ ...t, inLibrary: inLib.has(t.id) }));
+        if ((source ?? "all") === "library") rows = rows.filter((t) => t.inLibrary);
+
+        if (rows.length === 0) {
+          return ok(`No library tracks for "${query}". (Searched ${tracks.length} catalog result(s); none are in the library.)`);
+        }
+
+        const fmtDur = (s?: number) =>
+          s == null ? "" : ` | ${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+        const flags = (t: (typeof rows)[number]) => {
+          const f: string[] = [];
+          if (t.year) f.push(String(t.year));
+          if (t.explicit) f.push("explicit");
+          if (t.instrumental) f.push("instrumental");
+          if (t.version) f.push(t.version);
+          if (t.hires) f.push("hi-res");
+          f.push(t.inLibrary ? "in library" : "not in library");
+          return ` (${f.join(", ")})`;
+        };
         return ok(
-          `Tracks for "${query}":\n` +
-            tracks
+          `Tracks for "${query}"${(source ?? "all") === "library" ? " (library only)" : ""}:\n` +
+            rows
               .map(
                 (t) =>
-                  `  ID: ${t.id} | ${t.title} — ${t.artist}${t.album ? ` [${t.album}]` : ""}`,
+                  `  ID: ${t.id} | ${t.title} — ${t.artist}${t.album ? ` [${t.album}]` : ""}${fmtDur(t.durationSec)}${flags(t)}`,
               )
               .join("\n"),
         );
