@@ -24,6 +24,7 @@ import { registerQueueTools } from "./tools/queue.js";
 import { registerVersionTools } from "./tools/versions.js";
 import { registerRoonPlaylistTools } from "./tools/roon-playlists.js";
 import { registerPlaylistTools } from "./tools/playlist.js";
+import { registerPlayByIdTools } from "./tools/play-by-id.js";
 import { createControlRouter, createConfigRouter } from "./control/control-router.js";
 import { createMonitorRouter } from "./control/monitor-router.js";
 import express from "express";
@@ -74,6 +75,7 @@ function createMcpServer(): McpServer {
   registerVersionTools(server);
   registerRoonPlaylistTools(server);
   registerPlaylistTools(server);
+  registerPlayByIdTools(server);
 
   return server;
 }

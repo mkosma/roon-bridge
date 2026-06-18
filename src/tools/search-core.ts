@@ -334,6 +334,95 @@ export function bestMatch(items: BrowseItem[], query: string): BrowseItem | unde
 }
 
 /**
+ * Normalize a track/album title for exact, punctuation-insensitive comparison:
+ * lowercase, strip a leading "N." track-number prefix, drop bracketed
+ * qualifiers, collapse punctuation and whitespace. Used by the queue-by-id
+ * resolver to pin an EXACT recording rather than a fuzzy top match.
+ */
+export function normalizeTitle(title: string): string {
+  return stripRoonLinks(title)
+    .toLowerCase()
+    .replace(/^\s*\d+\s*[.\-]\s*/, "") // leading "2. " / "2 - " track-number prefix
+    .replace(/[([{].*?[)\]}]/g, " ") // bracketed qualifiers (feat. / remaster / live)
+    .replace(/[^\p{L}\p{N}]+/gu, " ") // any non-alphanumeric -> space
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+/** True when `a` and `b` name the same artist (normalized exact or substring). */
+export function artistMatches(a: string, b: string): boolean {
+  const na = normalizeTitle(a);
+  const nb = normalizeTitle(b);
+  if (!na || !nb) return false;
+  return na === nb || na.includes(nb) || nb.includes(na);
+}
+
+/** A track-identity descriptor coming from a provider (Qobuz), for matching. */
+export interface TrackIdentity {
+  title: string;
+  artist: string;
+  album?: string;
+  trackNumber?: number;
+}
+
+/**
+ * Deterministically pick the browse row for an EXACT track from a list of
+ * candidate rows (either Tracks-category search results or an album's track
+ * listing), using a provider's authoritative title/artist/album/number.
+ *
+ * Selection is exact, never fuzzy:
+ *   1. Keep rows whose normalized title equals the target title.
+ *   2. If an artist is carried in the row subtitle, require it to match.
+ *   3. If still tied, prefer a row whose album (subtitle, when present) matches.
+ *   4. If still tied, prefer the row whose leading "N." number == trackNumber.
+ *
+ * Returns the chosen row plus whether the pick was unambiguous, so the caller
+ * can report a tie honestly instead of guessing. `albumKnown` says whether the
+ * rows even carry album text to disambiguate on (album track listings usually
+ * do not — the album is the page, not the row).
+ */
+export function pickTrackRow(
+  rows: BrowseItem[],
+  target: TrackIdentity,
+  opts: { rowsCarryArtist?: boolean } = {},
+): { item: BrowseItem; unambiguous: boolean; tiedCount: number } | undefined {
+  const wantTitle = normalizeTitle(target.title);
+  const playable = rows.filter((r) => r.item_key && r.hint !== "header");
+
+  let titleHits = playable.filter((r) => normalizeTitle(r.title) === wantTitle);
+  if (!titleHits.length) {
+    // Fall back to a contains match (Roon sometimes appends a qualifier).
+    titleHits = playable.filter((r) => normalizeTitle(r.title).includes(wantTitle) && wantTitle.length > 0);
+  }
+  if (!titleHits.length) return undefined;
+
+  let pool = titleHits;
+  if (opts.rowsCarryArtist) {
+    const artistHits = pool.filter((r) => artistMatches(stripRoonLinks(r.subtitle || ""), target.artist));
+    if (artistHits.length) pool = artistHits;
+  }
+
+  if (pool.length > 1 && target.album) {
+    const wantAlbum = normalizeTitle(target.album);
+    const albumHits = pool.filter((r) => {
+      const sub = normalizeTitle(r.subtitle || "");
+      return sub.length > 0 && (sub.includes(wantAlbum) || wantAlbum.includes(sub));
+    });
+    if (albumHits.length) pool = albumHits;
+  }
+
+  if (pool.length > 1 && target.trackNumber != null) {
+    const byNumber = pool.find((r) => {
+      const m = r.title.match(/^\s*(\d+)\s*[.\-]/);
+      return m && Number(m[1]) === target.trackNumber;
+    });
+    if (byNumber) return { item: byNumber, unambiguous: true, tiedCount: pool.length };
+  }
+
+  return { item: pool[0], unambiguous: pool.length === 1, tiedCount: pool.length };
+}
+
+/**
  * Run a search and return the scored candidate list for a single category,
  * without drilling into any action list. This is the read-only half of the
  * find-and-act flow: it powers the version picker (which needs to SHOW the
