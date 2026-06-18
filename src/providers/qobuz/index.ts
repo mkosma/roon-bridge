@@ -18,12 +18,36 @@ import { getQobuzCredentials } from "./token.js";
 interface QobuzTrack {
   id?: number | string;
   title?: string;
+  version?: string | null;
   duration?: number;
   isrc?: string;
+  parental_warning?: boolean;
+  track_number?: number;
+  hires?: boolean;
+  release_date_original?: string;
   performer?: { name?: string };
-  album?: { title?: string };
+  album?: { title?: string; id?: string | number; release_date_original?: string };
   /** Position-scoped id within a playlist; required by playlist/deleteTracks. */
   playlist_track_id?: number | string;
+}
+
+/**
+ * Infer whether a recording is instrumental from its title/version tokens.
+ * Qobuz exposes NO dedicated instrumental flag, so this is a best-effort hint:
+ * it fires only on explicit "instrumental" markers (a parenthetical/bracketed
+ * tag, a trailing "- Instrumental", or a version string), never on a bare word
+ * inside a song title like "Instrumental Madness".
+ */
+export function inferInstrumental(title = "", version = ""): boolean {
+  const marker = /[([]\s*instrumental\b|[-–]\s*instrumental\b|\binstrumental\s+(version|mix|edit)\b/i;
+  return marker.test(title) || /\binstrumental\b/i.test(version);
+}
+
+/** Pull a 4-digit year from a Qobuz release date ("2008-04-22" -> 2008). */
+export function yearFromReleaseDate(date?: string): number | undefined {
+  if (!date) return undefined;
+  const m = date.match(/^(\d{4})/);
+  return m ? Number(m[1]) : undefined;
 }
 interface QobuzPlaylist {
   id?: number | string;
@@ -34,14 +58,24 @@ interface QobuzPlaylist {
 }
 
 function mapTrack(t: QobuzTrack): ProviderTrack {
+  const version = t.version || undefined;
+  // Year: prefer the track's own release date, fall back to the album's.
+  const year = yearFromReleaseDate(t.release_date_original ?? t.album?.release_date_original);
   return {
     provider: "qobuz",
     id: String(t.id ?? ""),
     title: t.title ?? "",
     artist: t.performer?.name ?? "Unknown",
     album: t.album?.title || undefined,
+    albumId: t.album?.id != null ? String(t.album.id) : undefined,
     durationSec: typeof t.duration === "number" ? t.duration : undefined,
     isrc: t.isrc || undefined,
+    trackNumber: typeof t.track_number === "number" ? t.track_number : undefined,
+    year,
+    explicit: typeof t.parental_warning === "boolean" ? t.parental_warning : undefined,
+    version,
+    instrumental: inferInstrumental(t.title ?? "", version ?? ""),
+    hires: typeof t.hires === "boolean" ? t.hires : undefined,
   };
 }
 function mapPlaylist(p: QobuzPlaylist): ProviderPlaylist {
@@ -80,6 +114,49 @@ export class QobuzProvider implements MusicProvider {
     const items =
       ((data.tracks as { items?: QobuzTrack[] })?.items) ?? [];
     return items.map(mapTrack);
+  }
+
+  async getTrack(id: string): Promise<ProviderTrack> {
+    const api = await this.api();
+    const data = await api.request("GET", "track/get", { track_id: id });
+    if (!data.id && !data.title) {
+      throw new ProviderError("not_found", `Qobuz track ${id} not found`, "qobuz");
+    }
+    return mapTrack(data as QobuzTrack);
+  }
+
+  /**
+   * Library membership via favorite/status (signed), one call per id. Bounded
+   * concurrency keeps a 50-result search responsive; unknown/failed ids are
+   * simply omitted from the returned set (treated as not-in-library).
+   */
+  async tracksInLibrary(ids: string[]): Promise<Set<string>> {
+    const unique = [...new Set(ids.map(String))].filter(Boolean);
+    const inLib = new Set<string>();
+    if (unique.length === 0) return inLib;
+    const api = await this.api();
+
+    const CONCURRENCY = 8;
+    for (let i = 0; i < unique.length; i += CONCURRENCY) {
+      const batch = unique.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(
+        batch.map(async (id) => {
+          try {
+            const data = await api.request(
+              "GET",
+              "favorite/status",
+              { item_id: id, type: "track" },
+              { signed: true },
+            );
+            return data.status === true ? id : null;
+          } catch {
+            return null;
+          }
+        }),
+      );
+      for (const id of results) if (id) inLib.add(id);
+    }
+    return inLib;
   }
 
   async listPlaylists(limit = 20): Promise<ProviderPlaylist[]> {

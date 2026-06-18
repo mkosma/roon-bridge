@@ -26,6 +26,12 @@ export class TidalProvider implements MusicProvider {
   async searchTracks(): Promise<ProviderTrack[]> {
     notImplemented("searchTracks");
   }
+  async getTrack(): Promise<ProviderTrack> {
+    notImplemented("getTrack");
+  }
+  async tracksInLibrary(): Promise<Set<string>> {
+    notImplemented("tracksInLibrary");
+  }
   async listPlaylists(): Promise<ProviderPlaylist[]> {
     notImplemented("listPlaylists");
   }
