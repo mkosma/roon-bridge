@@ -3,7 +3,7 @@ import RoonApiTransport from "node-roon-api-transport";
 import RoonApiBrowse from "node-roon-api-browse";
 import RoonApiStatus from "node-roon-api-status";
 import type { RoonCore } from "node-roon-api";
-import type { Zone, QueueItem } from "node-roon-api-transport";
+import type { Zone, QueueItem, Output } from "node-roon-api-transport";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -299,6 +299,47 @@ export class RoonConnection extends EventEmitter {
     const transport = this.getTransport();
     return new Promise<void>((resolve, reject) => {
       transport.play_from_here(zone, queueItemId, (error: false | string) => {
+        if (error) reject(new Error(String(error)));
+        else resolve();
+      });
+    });
+  }
+
+  /**
+   * Transfer playback (current track + queue) from one zone to another. Thin
+   * promise wrapper over the native transport transfer_zone, which the bridge
+   * had not previously surfaced.
+   */
+  transferZone(from: Zone, to: Zone): Promise<void> {
+    const transport = this.getTransport();
+    return new Promise<void>((resolve, reject) => {
+      transport.transfer_zone(from, to, (error: false | string) => {
+        if (error) reject(new Error(String(error)));
+        else resolve();
+      });
+    });
+  }
+
+  /**
+   * Group the given outputs into one synchronized zone (the first output's
+   * zone's queue is preserved). Native transport group_outputs, not previously
+   * surfaced by the bridge.
+   */
+  groupOutputs(outputs: Output[]): Promise<void> {
+    const transport = this.getTransport();
+    return new Promise<void>((resolve, reject) => {
+      transport.group_outputs(outputs, (error: false | string) => {
+        if (error) reject(new Error(String(error)));
+        else resolve();
+      });
+    });
+  }
+
+  /** Ungroup previously-grouped outputs. Native transport ungroup_outputs. */
+  ungroupOutputs(outputs: Output[]): Promise<void> {
+    const transport = this.getTransport();
+    return new Promise<void>((resolve, reject) => {
+      transport.ungroup_outputs(outputs, (error: false | string) => {
         if (error) reject(new Error(String(error)));
         else resolve();
       });
