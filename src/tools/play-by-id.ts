@@ -34,6 +34,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { roonConnection } from "../roon-connection.js";
 import { initProviders } from "../providers/bootstrap.js";
+import { queueProvenance } from "../control/queue-provenance.js";
 import type { ProviderName, ProviderTrack } from "../providers/types.js";
 import type { Zone, QueueItem } from "node-roon-api-transport";
 import type RoonApiBrowse from "node-roon-api-browse";
@@ -286,43 +287,56 @@ async function resolveRoonRow(
   return { itemKey: pick.item.item_key!, via: "album-anchored", unambiguous: pick.unambiguous, tiedCount: pick.tiedCount };
 }
 
-/** Execute the resolved row's action and verify the effect. */
-async function executeAndVerify(
-  meta: ProviderTrack,
-  trackId: string,
+/**
+ * Structured result of an execute-and-verify. Always carries `ok`; on success it
+ * carries the matched track, the Roon action used, and verification proof. This
+ * is the reusable core that both the queue_by_id/play_by_id MCP tools and the
+ * edit_queue rebuild consume - the MCP tools just JSON-wrap it.
+ */
+export type ExecResult = { ok: boolean } & Record<string, unknown>;
+
+/**
+ * Resolve a TrackIdentity to its exact Roon row, execute the `when` action, and
+ * verify the effect. When a provider track id is supplied (opts.trackId) and the
+ * add lands, the new queue_item_id is recorded in the queue-provenance map so a
+ * later rebuild can replay the EXACT recording.
+ *
+ * Returns a structured ExecResult (never throws for the resolve/verify paths;
+ * the caller decides how to surface it).
+ */
+export async function executeIdentity(
+  identity: TrackIdentity,
   zone: Zone,
   when: "now" | "next" | "queue",
-): Promise<ToolResult> {
+  opts: { trackId?: string; provider?: ProviderName } = {},
+): Promise<ExecResult> {
+  const trackId = opts.trackId ?? null;
   const browse = roonConnection.getBrowse();
   const sessionKey = newSessionKey();
   const log = (step: string, data: unknown) =>
     console.error(`[roon-bridge] playById[${sessionKey}] ${step}:`, JSON.stringify(data));
 
-  const identity: TrackIdentity = { title: meta.title, artist: meta.artist, album: meta.album, trackNumber: meta.trackNumber, version: meta.version, durationSec: meta.durationSec };
   const resolved = await resolveRoonRow(browse, identity, zone.zone_id, sessionKey, log);
   if ("error" in resolved) {
-    return jsonResult({ ok: false, error: resolved.error, detail: resolved.detail, track_id: trackId, requested: identity }, true);
+    return { ok: false, error: resolved.error, detail: resolved.detail, track_id: trackId, requested: identity };
   }
 
   const drilled = await drillToActions(browse, resolved.itemKey, zone.zone_id, sessionKey, {
-    expectedTitle: meta.title,
-    preferAlbumContext: !!meta.album,
+    expectedTitle: identity.title,
+    preferAlbumContext: !!identity.album,
   });
-  if (drilled.message) return jsonResult({ ok: false, error: "message", detail: drilled.message, matched: meta.title }, true);
-  if (drilled.error) return jsonResult({ ok: false, error: drilled.error, matched: meta.title }, true);
+  if (drilled.message) return { ok: false, error: "message", detail: drilled.message, matched: identity.title };
+  if (drilled.error) return { ok: false, error: drilled.error, matched: identity.title };
 
   const intent = WHEN_TO_INTENT[when];
   const action = resolveActionItem(drilled.actionItems, intent);
   if (!action?.item.item_key) {
-    return jsonResult(
-      {
-        ok: false,
-        error: "no_action",
-        detail: `No '${intent}' action for "${meta.title}".`,
-        available_actions: drilled.actionItems.filter((i) => i.hint !== "header").map((i) => i.title),
-      },
-      true,
-    );
+    return {
+      ok: false,
+      error: "no_action",
+      detail: `No '${intent}' action for "${identity.title}".`,
+      available_actions: drilled.actionItems.filter((i) => i.hint !== "header").map((i) => i.title),
+    };
   }
 
   // Snapshot the queue before (skip for 'now', which replaces playback).
@@ -345,9 +359,10 @@ async function executeAndVerify(
     zone_or_output_id: zone.zone_id,
     multi_session_key: sessionKey,
   });
-  if (exec.error) return jsonResult({ ok: false, error: String(exec.error), matched: meta.title }, true);
+  if (exec.error) return { ok: false, error: String(exec.error), matched: identity.title };
 
-  // Best-effort auto_radio off, matching the other play/queue paths.
+  // Best-effort auto_radio off, matching the other play/queue paths. This also
+  // keeps a queue rebuild from racing radio-appended tracks while it appends.
   try {
     const transport = roonConnection.getTransport();
     await new Promise<void>((resolve) => transport.change_settings(zone, { auto_radio: false }, () => resolve()));
@@ -357,10 +372,10 @@ async function executeAndVerify(
 
   const matched = {
     track_id: trackId,
-    title: meta.title,
-    artist: meta.artist,
-    album: meta.album ?? null,
-    track_number: meta.trackNumber ?? null,
+    title: identity.title,
+    artist: identity.artist,
+    album: identity.album ?? null,
+    track_number: identity.trackNumber ?? null,
     resolved_via: resolved.via,
     unambiguous: resolved.unambiguous,
   };
@@ -368,9 +383,22 @@ async function executeAndVerify(
   // Whether the provider id denotes a live recording. Used to read back the
   // landed row and refuse a silent live/studio swap (BUG A safety net): even if
   // the resolver picked right, the RETURN must reflect what actually landed.
-  const intendedLive = classifyVariant(meta.title).is_live || /\blive\b/i.test(meta.version ?? "");
+  const intendedLive = classifyVariant(identity.title).is_live || /\blive\b/i.test(identity.version ?? "");
   const recordingMismatch = (landedTitle: string | null): boolean =>
     !!landedTitle && classifyVariant(landedTitle).is_live !== intendedLive;
+
+  /** Record provider provenance for a newly-enqueued queue_item_id. */
+  const remember = (queueItemId: number) => {
+    if (!trackId) return;
+    queueProvenance.record(queueItemId, {
+      providerId: trackId,
+      provider: opts.provider,
+      title: identity.title,
+      artist: identity.artist,
+      album: identity.album ?? null,
+      trackNumber: identity.trackNumber ?? null,
+    });
+  };
 
   if (!verifyAdd) {
     // Verify now-playing flipped to our title (bounded poll).
@@ -381,16 +409,20 @@ async function executeAndVerify(
       const z = roonConnection.findZone(zone.zone_id);
       const np = z?.now_playing?.three_line?.line1;
       if (np) landedTitle = np;
-      if (np && normalizeTitle(np) === normalizeTitle(meta.title)) { nowOk = true; break; }
+      if (np && normalizeTitle(np) === normalizeTitle(identity.title)) { nowOk = true; break; }
       await new Promise((r) => setTimeout(r, 150));
     }
     if (recordingMismatch(landedTitle)) {
-      return jsonResult(
-        { ok: false, error: "wrong_recording_queued", detail: `Expected ${intendedLive ? "a live" : "the studio"} recording of "${meta.title}" but "${landedTitle}" played.`, matched, queued_title: landedTitle, zone: zone.display_name },
-        true,
-      );
+      return { ok: false, error: "wrong_recording_queued", detail: `Expected ${intendedLive ? "a live" : "the studio"} recording of "${identity.title}" but "${landedTitle}" played.`, matched, queued_title: landedTitle, zone: zone.display_name };
     }
-    return jsonResult({ ok: true, action: action.matched, when, matched, verified: nowOk, queued_title: landedTitle, zone: zone.display_name });
+    // Best-effort: remember the now-playing head so a rebuild can replay it.
+    if (nowOk) {
+      try {
+        const after = await roonConnection.getQueueSnapshot(zone);
+        if (after[0]) remember(after[0].queue_item_id);
+      } catch { /* non-critical */ }
+    }
+    return { ok: true, action: action.matched, when, matched, verified: nowOk, queued_title: landedTitle, zone: zone.display_name };
   }
 
   // Verify by re-reading the queue until our track appears (bounded poll).
@@ -408,48 +440,82 @@ async function executeAndVerify(
   let landed = false;
   let afterCount = beforeCount;
   let landedTitle: string | null = null;
-  const wantTitle = normalizeTitle(meta.title);
+  const wantTitle = normalizeTitle(identity.title);
+  let newIds: number[] = [];
   const deadline = Date.now() + 2500;
   try {
     while (Date.now() < deadline) {
       const after = await roonConnection.getQueueSnapshot(zone);
       afterCount = after.length;
-      const newRow = after.find((i) => !beforeIds.has(i.queue_item_id));
-      if (newRow) landedTitle = queueRowTitle(newRow);
+      const newRows = after.filter((i) => !beforeIds.has(i.queue_item_id));
+      newIds = newRows.map((i) => i.queue_item_id);
+      if (newRows[0]) landedTitle = queueRowTitle(newRows[0]);
       const np = roonConnection.findZone(zone.zone_id)?.now_playing?.three_line?.line1;
       const nowPlayingFlipped = !!np && normalizeTitle(np) === wantTitle;
       if (nowPlayingFlipped && !landedTitle) landedTitle = np!;
-      if (after.length > beforeCount || newRow || nowPlayingFlipped) { landed = true; break; }
+      if (after.length > beforeCount || newIds.length > 0 || nowPlayingFlipped) { landed = true; break; }
       await new Promise((r) => setTimeout(r, 150));
     }
   } catch {
-    return jsonResult({ ok: true, action: action.matched, when, matched, verified: false, note: "queue growth could not be verified", zone: zone.display_name });
+    return { ok: true, action: action.matched, when, matched, verified: false, note: "queue growth could not be verified", zone: zone.display_name };
   }
 
   if (recordingMismatch(landedTitle)) {
-    return jsonResult(
-      { ok: false, error: "wrong_recording_queued", detail: `Expected ${intendedLive ? "a live" : "the studio"} recording of "${meta.title}" but "${landedTitle}" landed in the queue.`, matched, queued_title: landedTitle, queue_count_before: beforeCount, queue_count_after: afterCount, zone: zone.display_name },
-      true,
-    );
+    return { ok: false, error: "wrong_recording_queued", detail: `Expected ${intendedLive ? "a live" : "the studio"} recording of "${identity.title}" but "${landedTitle}" landed in the queue.`, matched, queued_title: landedTitle, queue_count_before: beforeCount, queue_count_after: afterCount, zone: zone.display_name };
   }
 
   if (!landed) {
-    return jsonResult(
-      {
-        ok: false,
-        error: "add_not_verified",
-        detail: `The action reported success but "${meta.title}" did not appear in the queue.`,
-        matched,
-        action: action.matched,
-        queue_count_before: beforeCount,
-        queue_count_after: afterCount,
-        zone: zone.display_name,
-      },
-      true,
-    );
+    return {
+      ok: false,
+      error: "add_not_verified",
+      detail: `The action reported success but "${identity.title}" did not appear in the queue.`,
+      matched,
+      action: action.matched,
+      queue_count_before: beforeCount,
+      queue_count_after: afterCount,
+      zone: zone.display_name,
+    };
   }
 
-  return jsonResult({ ok: true, action: action.matched, when, matched, verified: true, queued_title: landedTitle, queue_count_before: beforeCount, queue_count_after: afterCount, zone: zone.display_name });
+  // Record provenance only when the add introduced exactly one new item, so a
+  // stray radio/auto-append never gets mislabeled as this provider track.
+  if (newIds.length === 1) remember(newIds[0]);
+
+  return {
+    ok: true,
+    action: action.matched,
+    when,
+    matched,
+    verified: true,
+    queued_title: landedTitle,
+    queue_count_before: beforeCount,
+    queue_count_after: afterCount,
+    new_item_id: newIds.length === 1 ? newIds[0] : null,
+    zone: zone.display_name,
+  };
+}
+
+/**
+ * Resolve a provider track id to authoritative metadata, then execute+verify.
+ * The deterministic entry point shared by the MCP tools and edit_queue.
+ */
+export async function executeById(
+  trackId: string,
+  provider: ProviderName | undefined,
+  zone: Zone,
+  when: "now" | "next" | "queue",
+): Promise<ExecResult> {
+  let meta: ProviderTrack;
+  try {
+    meta = await initProviders().get(provider).getTrack(trackId);
+  } catch (e) {
+    return { ok: false, error: "provider_lookup_failed", detail: e instanceof Error ? e.message : String(e), track_id: trackId };
+  }
+  if (!meta.title || !meta.artist) {
+    return { ok: false, error: "incomplete_track", detail: `Provider returned no title/artist for id ${trackId}.`, track_id: trackId };
+  }
+  const identity: TrackIdentity = { title: meta.title, artist: meta.artist, album: meta.album, trackNumber: meta.trackNumber, version: meta.version, durationSec: meta.durationSec };
+  return executeIdentity(identity, zone, when, { trackId, provider: meta.provider ?? provider });
 }
 
 async function queueOrPlayById(
@@ -460,16 +526,8 @@ async function queueOrPlayById(
 ): Promise<ToolResult> {
   try {
     const zone = roonConnection.findZoneOrThrow(zoneName);
-    let meta: ProviderTrack;
-    try {
-      meta = await initProviders().get(provider).getTrack(trackId);
-    } catch (e) {
-      return jsonResult({ ok: false, error: "provider_lookup_failed", detail: e instanceof Error ? e.message : String(e), track_id: trackId }, true);
-    }
-    if (!meta.title || !meta.artist) {
-      return jsonResult({ ok: false, error: "incomplete_track", detail: `Provider returned no title/artist for id ${trackId}.`, track_id: trackId }, true);
-    }
-    return await executeAndVerify(meta, trackId, zone, when);
+    const result = await executeById(trackId, provider, zone, when);
+    return jsonResult(result, !result.ok);
   } catch (e) {
     return jsonResult({ ok: false, error: e instanceof Error ? e.message : String(e) }, true);
   }
