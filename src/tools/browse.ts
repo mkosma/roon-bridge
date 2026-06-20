@@ -13,13 +13,10 @@ import {
   resolveActionItem,
   type BrowseItem,
 } from "./search-core.js";
-import { DeferredPlayer } from "../control/deferred-player.js";
+import { deferredPlayer } from "../control/deferred-player-instance.js";
 import type RoonApiBrowse from "node-roon-api-browse";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
-
-// One shared scheduler for event-driven "play after the current track" (Obj 5).
-const deferredPlayer = new DeferredPlayer(roonConnection);
 
 /** What kind of action a play-path caller wants to execute. */
 type ActionType = "play" | "queue" | "shuffle";
