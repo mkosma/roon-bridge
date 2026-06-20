@@ -35,8 +35,9 @@ import { z } from "zod";
 import { roonConnection } from "../roon-connection.js";
 import { initProviders } from "../providers/bootstrap.js";
 import type { ProviderName, ProviderTrack } from "../providers/types.js";
-import type { Zone } from "node-roon-api-transport";
+import type { Zone, QueueItem } from "node-roon-api-transport";
 import type RoonApiBrowse from "node-roon-api-browse";
+import { deferredPlayer } from "../control/deferred-player-instance.js";
 import {
   newSessionKey,
   browseAndLoad,
@@ -323,15 +324,30 @@ async function executeAndVerify(
     return jsonResult({ ok: true, action: action.matched, when, matched, verified: nowOk, zone: zone.display_name });
   }
 
-  // Verify by re-reading the queue until it grows (bounded poll).
+  // Verify by re-reading the queue until our track appears (bounded poll).
+  //
+  // Robustness to a CONCURRENT NATURAL ADVANCE (the root cause of the lone
+  // queue_by_id ok=False seen 2026-06-20): if the current track ends between the
+  // add and the re-read, Roon consumes the played head item, so the queue length
+  // need not grow (one added, one consumed = net zero). A bare length-grew test
+  // then false-negatives a real success. So we treat the add as landed on EITHER
+  // signal that does not depend on net length:
+  //   - a queue_item_id appears that was not present before (the added row), OR
+  //   - now-playing flipped to our title (an 'Add Next' track whose current
+  //     track just ended and which therefore started playing - it leaves the
+  //     queue's "upcoming" set as it becomes the head).
   let landed = false;
   let afterCount = beforeCount;
+  const wantTitle = normalizeTitle(meta.title);
   const deadline = Date.now() + 2500;
   try {
     while (Date.now() < deadline) {
       const after = await roonConnection.getQueueSnapshot(zone);
       afterCount = after.length;
-      if (after.length > beforeCount || after.some((i) => !beforeIds.has(i.queue_item_id))) { landed = true; break; }
+      const newId = after.some((i) => !beforeIds.has(i.queue_item_id));
+      const np = roonConnection.findZone(zone.zone_id)?.now_playing?.three_line?.line1;
+      const nowPlayingFlipped = !!np && normalizeTitle(np) === wantTitle;
+      if (after.length > beforeCount || newId || nowPlayingFlipped) { landed = true; break; }
       await new Promise((r) => setTimeout(r, 150));
     }
   } catch {
@@ -380,6 +396,419 @@ async function queueOrPlayById(
   }
 }
 
+// ===========================================================================
+// Batch enqueue: queue_tracks / play_tracks - an ORDERED set in one call.
+//
+// Platform reality (same constraints queue.ts documents): Roon exposes only
+// three queue mutators to an extension - "Add Next" (insert right after the
+// current track), "Queue" (append to the tail), and transport play_from_here
+// (jump). There is NO insert-at-position and NO move. So an ordered set is built
+// from the ONE race-free, forward-ordered primitive Roon has - APPEND-TO-TAIL:
+// each "Queue" action appends after the previous one, and a track boundary never
+// reorders the tail. That guarantees the SET's internal order absolutely.
+//
+// Positioning per `when` is then layered on top of that ordered build:
+//   - 'queue'         : leave the block at the tail.                 [cur, ...prior, block]
+//   - 'now'           : Play Now the first track (replaces the queue), then append
+//                       the rest to the tail in order.                [block] (plays block[0])
+//   - 'after_current' : arm the DeferredPlayer; at the REAL track seam run the
+//                       same now-sequence (re-resolved fresh, since item_keys go
+//                       stale by the seam). Prior queue discarded, mirroring
+//                       play_album/play_track after_current.
+//   - 'next'          : place the block immediately after the current track.
+//
+// 'next' is the one case the append-to-tail primitive cannot position alone:
+// [cur, block, ...prior] requires inserting BETWEEN current and the existing
+// upcoming items, and Roon's only after-current primitive is "Add Next", which
+// inserts immediately-after-current (LIFO) - so a forward set needs reverse
+// Add-Next calls. That is exactly the racy reverse-next pattern that scrambled
+// Maya's set on 2026-06-20, so it is used ONLY when it is safe:
+//   - upcoming queue empty  -> append-to-tail forward IS [cur, block]. Race-free.
+//   - prior present + the current track has ample time left (>= SAFE_REVERSE_MS)
+//     -> reverse Add-Next from PRE-RESOLVED rows (a single guarded burst, not the
+//        naive per-call-search pattern), then VERIFY the order landed.
+//   - prior present + current near its boundary -> do NOT risk a scramble; fall
+//     back to ordered tail-append (contiguous, in order, no reversal / split /
+//     pull-to-front) and report the anchor honestly.
+// See HANDBACK for the precise guarantee and the spec tension this resolves.
+// ===========================================================================
+
+/** Headroom the current track must have left to attempt a reverse Add-Next for
+ *  'next' with a non-empty upcoming queue. Pre-resolved execs are fast; this is
+ *  a generous margin so a boundary cannot land mid-burst. */
+const SAFE_REVERSE_MS = 8000;
+
+interface ResolvedTrack {
+  index: number;
+  trackId: string;
+  meta: ProviderTrack;
+  actionItems: BrowseItem[];
+  sessionKey: string;
+  resolvedVia: ResolvedRow["via"];
+  unambiguous: boolean;
+}
+interface FailedTrack {
+  index: number;
+  trackId: string;
+  reason: string;
+  detail?: string;
+}
+type TrackOutcome = ResolvedTrack | FailedTrack;
+
+function isResolved(o: TrackOutcome): o is ResolvedTrack {
+  return (o as ResolvedTrack).meta !== undefined;
+}
+
+/** Resolve ONE provider track id to its drilled action list (read-only; no
+ *  queue mutation). Reuses the exact-ID resolver queue_by_id uses. */
+async function resolveOneForBatch(
+  browse: RoonApiBrowse,
+  trackId: string,
+  index: number,
+  provider: ProviderName | undefined,
+  zone: Zone,
+): Promise<TrackOutcome> {
+  const sessionKey = newSessionKey();
+  const log = (step: string, data: unknown) =>
+    console.error(`[roon-bridge] queueTracks[${sessionKey}] ${step}:`, JSON.stringify(data));
+  let meta: ProviderTrack;
+  try {
+    meta = await initProviders().get(provider).getTrack(trackId);
+  } catch (e) {
+    return { index, trackId, reason: "provider_lookup_failed", detail: e instanceof Error ? e.message : String(e) };
+  }
+  if (!meta.title || !meta.artist) {
+    return { index, trackId, reason: "incomplete_track", detail: `Provider returned no title/artist for id ${trackId}.` };
+  }
+  const identity: TrackIdentity = { title: meta.title, artist: meta.artist, album: meta.album, trackNumber: meta.trackNumber };
+  const resolved = await resolveRoonRow(browse, identity, zone.zone_id, sessionKey, log);
+  if ("error" in resolved) {
+    return { index, trackId, reason: resolved.error, detail: resolved.detail };
+  }
+  const drilled = await drillToActions(browse, resolved.itemKey, zone.zone_id, sessionKey);
+  if (drilled.message) return { index, trackId, reason: "message", detail: drilled.message };
+  if (drilled.error) return { index, trackId, reason: drilled.error };
+  return {
+    index,
+    trackId,
+    meta,
+    actionItems: drilled.actionItems,
+    sessionKey,
+    resolvedVia: resolved.via,
+    unambiguous: resolved.unambiguous,
+  };
+}
+
+/** Execute one resolved track's action for an intent, in its own session. */
+async function execTrackAction(
+  browse: RoonApiBrowse,
+  track: ResolvedTrack,
+  zone: Zone,
+  intent: QueueAction,
+): Promise<{ ok: boolean; action?: string; reason?: string }> {
+  const action = resolveActionItem(track.actionItems, intent);
+  if (!action?.item.item_key) {
+    return { ok: false, reason: `no_${intent}_action` };
+  }
+  const exec = await promisifyBrowse(browse, {
+    hierarchy: "search",
+    item_key: action.item.item_key,
+    zone_or_output_id: zone.zone_id,
+    multi_session_key: track.sessionKey,
+  });
+  if (exec.error) return { ok: false, reason: String(exec.error) };
+  return { ok: true, action: action.matched };
+}
+
+/** Best-effort auto_radio off, matching the other play/queue paths. */
+async function autoRadioOff(zone: Zone): Promise<void> {
+  try {
+    const transport = roonConnection.getTransport();
+    await new Promise<void>((resolve) => transport.change_settings(zone, { auto_radio: false }, () => resolve()));
+  } catch {
+    /* non-critical */
+  }
+}
+
+function queueRowTitle(item: QueueItem): string {
+  return item.three_line?.line1 ?? item.two_line?.line1 ?? item.one_line?.line1 ?? "";
+}
+
+/** Milliseconds left on the current track (0 if nothing is playing). */
+function trackTimeLeftMs(zone: Zone): number {
+  const np = zone.now_playing;
+  if (zone.state !== "playing" || !np || np.length == null) return 0;
+  return Math.max(0, (np.length - (np.seek_position ?? 0)) * 1000);
+}
+
+/** Items queued AFTER the current track (the "prior upcoming" set). */
+function upcomingCount(items: QueueItem[], zone: Zone): number {
+  const playing = zone.state === "playing" || zone.state === "paused" || zone.state === "loading";
+  return playing && items.length > 0 ? items.length - 1 : items.length;
+}
+
+/**
+ * Replace the queue with an ordered set, fresh-resolved at call time. Used by
+ * the after_current deferral (item_keys captured at arming go stale by the seam,
+ * so we re-resolve) and is the now-sequence's core: Play Now the first
+ * resolvable track, then append the rest to the tail in order.
+ */
+async function runReplaceSequence(
+  browse: RoonApiBrowse,
+  trackIds: string[],
+  provider: ProviderName | undefined,
+  zone: Zone,
+): Promise<void> {
+  let replaced = false;
+  for (let i = 0; i < trackIds.length; i++) {
+    const t = await resolveOneForBatch(browse, trackIds[i], i, provider, zone);
+    if (!isResolved(t)) continue;
+    await execTrackAction(browse, t, zone, replaced ? "queue" : "play_now");
+    replaced = true;
+  }
+  await autoRadioOff(zone);
+}
+
+interface BlockVerification {
+  count_queued: number;
+  contiguous: boolean;
+  in_order: boolean;
+  anchor_ok: boolean;
+  first_position: number | null; // 1-based position of the block's first row
+}
+
+/**
+ * Re-read the queue and verify the resolved set landed as a contiguous, in-order
+ * block at the expected anchor. Robust to a concurrent natural advance: the block
+ * is identified by queue_item_ids absent from the before-snapshot, so a consumed
+ * head never hides it.
+ */
+async function verifyBlock(
+  zone: Zone,
+  resolved: ResolvedTrack[],
+  beforeIds: Set<number>,
+  expectedAnchor: "head" | "after-current" | "tail",
+): Promise<BlockVerification> {
+  const wantTitles = resolved.map((t) => normalizeTitle(t.meta.title));
+  let after: QueueItem[] = [];
+  let newRows: QueueItem[] = [];
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    try {
+      after = await roonConnection.getQueueSnapshot(zone);
+    } catch {
+      break;
+    }
+    newRows = after.filter((i) => !beforeIds.has(i.queue_item_id));
+    if (newRows.length >= resolved.length) break;
+    await new Promise((r) => setTimeout(r, 150));
+  }
+
+  // newRows preserve queue order. Count how many wanted titles appear in order.
+  const gotTitles = newRows.map((r) => normalizeTitle(queueRowTitle(r)));
+  let wi = 0;
+  for (const g of gotTitles) {
+    if (wi < wantTitles.length && g === wantTitles[wi]) wi++;
+  }
+  const count_queued = wi;
+  const in_order = count_queued === resolved.length;
+
+  const positions = newRows
+    .map((r) => after.findIndex((a) => a.queue_item_id === r.queue_item_id))
+    .filter((p) => p >= 0)
+    .sort((a, b) => a - b);
+  const contiguous = positions.length > 0 && positions[positions.length - 1] - positions[0] === positions.length - 1;
+  const firstIdx = positions.length ? positions[0] : -1;
+
+  let expectedFirst: number;
+  if (expectedAnchor === "head") expectedFirst = 0;
+  else if (expectedAnchor === "after-current") expectedFirst = 1;
+  else expectedFirst = after.length - newRows.length; // tail
+  const anchor_ok = firstIdx === expectedFirst;
+
+  return {
+    count_queued,
+    contiguous,
+    in_order,
+    anchor_ok,
+    first_position: firstIdx >= 0 ? firstIdx + 1 : null,
+  };
+}
+
+async function queueOrPlayTracks(
+  trackIds: string[],
+  provider: ProviderName | undefined,
+  zoneName: string,
+  when: "queue" | "next" | "now" | "after_current",
+): Promise<ToolResult> {
+  try {
+    const zone = roonConnection.findZoneOrThrow(zoneName);
+    const browse = roonConnection.getBrowse();
+
+    // 1. Pre-resolve every track IN ORDER (read-only; no queue mutation yet).
+    const outcomes: TrackOutcome[] = [];
+    for (let i = 0; i < trackIds.length; i++) {
+      outcomes.push(await resolveOneForBatch(browse, trackIds[i], i, provider, zone));
+    }
+    const resolved = outcomes.filter(isResolved);
+
+    const trackStatus = (landedIdx?: Set<number>) =>
+      outcomes.map((o) =>
+        isResolved(o)
+          ? {
+              index: o.index,
+              track_id: o.trackId,
+              ok: landedIdx ? landedIdx.has(o.index) : true,
+              title: o.meta.title,
+              artist: o.meta.artist,
+              album: o.meta.album ?? null,
+              resolved_via: o.resolvedVia,
+              unambiguous: o.unambiguous,
+              ...(landedIdx && !landedIdx.has(o.index) ? { reason: "resolved_but_not_verified_in_queue" } : {}),
+            }
+          : { index: o.index, track_id: o.trackId, ok: false, reason: o.reason, detail: o.detail },
+      );
+
+    if (!resolved.length) {
+      return jsonResult(
+        {
+          ok: false,
+          when,
+          zone: zone.display_name,
+          count_requested: trackIds.length,
+          count_queued: 0,
+          error: "no_tracks_resolved",
+          tracks: trackStatus(),
+        },
+        true,
+      );
+    }
+
+    // 2. after_current: arm the deferral and return; the replace runs at the seam.
+    if (when === "after_current") {
+      const np = zone.now_playing;
+      if (zone.state === "playing" && np && np.length != null) {
+        deferredPlayer
+          .scheduleAfterCurrent(zone, () => runReplaceSequence(browse, trackIds, provider, zone))
+          .catch((e: unknown) => console.error("[queueTracks] schedule error:", e));
+        return jsonResult({
+          ok: true,
+          when,
+          scheduled: true,
+          zone: zone.display_name,
+          count_requested: trackIds.length,
+          count_queued: resolved.length,
+          note: `${resolved.length} track(s) will replace the queue in order when "${np.three_line.line1}" ends (re-resolved at the seam; prior queue discarded).`,
+          tracks: trackStatus(),
+        });
+      }
+      // Nothing playing - no seam; fall through to an immediate replace.
+      when = "now";
+    }
+
+    // An immediate action supersedes any armed deferral.
+    deferredPlayer.cancel();
+
+    // Snapshot the queue before mutating (skip the before-ids dependence for
+    // 'now', which replaces the queue entirely).
+    let beforeIds = new Set<number>();
+    let priorCount = 0;
+    if (when !== "now") {
+      try {
+        const pre = await roonConnection.getQueueSnapshot(zone);
+        beforeIds = new Set(pre.map((i) => i.queue_item_id));
+        priorCount = upcomingCount(pre, zone);
+      } catch {
+        beforeIds = new Set();
+      }
+    }
+
+    const landed = new Set<number>();
+    let usedReverse = false;
+    let strategyNote: string | undefined;
+
+    if (when === "now") {
+      const first = await execTrackAction(browse, resolved[0], zone, "play_now");
+      if (first.ok) landed.add(resolved[0].index);
+      for (let k = 1; k < resolved.length; k++) {
+        const r = await execTrackAction(browse, resolved[k], zone, "queue");
+        if (r.ok) landed.add(resolved[k].index);
+      }
+    } else if (when === "queue") {
+      for (const t of resolved) {
+        const r = await execTrackAction(browse, t, zone, "queue");
+        if (r.ok) landed.add(t.index);
+      }
+    } else {
+      // when === "next"
+      const timeLeft = trackTimeLeftMs(zone);
+      if (priorCount === 0) {
+        strategyNote = "empty upcoming queue: appended in order right after the current track";
+        for (const t of resolved) {
+          const r = await execTrackAction(browse, t, zone, "queue");
+          if (r.ok) landed.add(t.index);
+        }
+      } else if (timeLeft >= SAFE_REVERSE_MS) {
+        usedReverse = true;
+        strategyNote = "inserted after current via reverse Add-Next from pre-resolved rows";
+        for (let k = resolved.length - 1; k >= 0; k--) {
+          const r = await execTrackAction(browse, resolved[k], zone, "add_next");
+          if (r.ok) landed.add(resolved[k].index);
+        }
+      } else {
+        strategyNote =
+          "current track near its boundary with items already queued: appended in order at the tail to avoid a reverse-insert race (Roon exposes no race-free list-insert between current and the upcoming queue)";
+        for (const t of resolved) {
+          const r = await execTrackAction(browse, t, zone, "queue");
+          if (r.ok) landed.add(t.index);
+        }
+      }
+    }
+
+    await autoRadioOff(zone);
+
+    // 3. Verify the block landed contiguous and in order at the expected anchor.
+    const anchor: "head" | "after-current" | "tail" =
+      when === "now" ? "head" : when === "next" && usedReverse ? "after-current" : "tail";
+    const v = await verifyBlock(zone, resolved, beforeIds, anchor);
+
+    // Map verification back to per-track ok: a resolved track is "landed" if the
+    // action executed AND the block verification accounts for it. When the whole
+    // block verified in order, every resolved+executed track is landed.
+    const verifiedIdx = new Set<number>();
+    if (v.in_order) {
+      for (const t of resolved) if (landed.has(t.index)) verifiedIdx.add(t.index);
+    } else {
+      // Partial: trust the execute-acks (still honest - reports what we know).
+      for (const idx of landed) verifiedIdx.add(idx);
+    }
+
+    const ok =
+      v.count_queued === trackIds.length && // every REQUESTED track landed (no failures)
+      v.contiguous &&
+      v.in_order;
+
+    return jsonResult(
+      {
+        ok,
+        when,
+        zone: zone.display_name,
+        count_requested: trackIds.length,
+        count_queued: v.count_queued,
+        order_verified: v.in_order,
+        contiguous: v.contiguous,
+        anchor_ok: v.anchor_ok,
+        block_first_position: v.first_position,
+        strategy: strategyNote,
+        tracks: trackStatus(verifiedIdx),
+      },
+      !ok,
+    );
+  } catch (e) {
+    return jsonResult({ ok: false, error: e instanceof Error ? e.message : String(e) }, true);
+  }
+}
+
 export function registerPlayByIdTools(server: McpServer): void {
   if (process.env.PLAYLIST_TOOLS === "0") return; // shares the provider layer
 
@@ -409,5 +838,40 @@ export function registerPlayByIdTools(server: McpServer): void {
       when: z.enum(["now", "next", "queue"]).default("now").describe("'now' plays immediately (default); 'next' after current; 'queue' adds to end."),
     },
     async ({ track_id, provider, zone, when }) => queueOrPlayById(track_id, provider, zone, when ?? "now"),
+  );
+
+  const trackIdsArg = z
+    .array(z.string())
+    .min(1)
+    .describe("ORDERED list of provider track IDs (from search_tracks / find_versions). The resulting queue preserves this exact order.");
+
+  server.tool(
+    "queue_tracks",
+    "Queue an ORDERED list of EXACT tracks by provider track ID, in ONE atomic call - the sequenced-set primitive single queue_by_id calls cannot do safely. Each ID is resolved to its exact Roon recording (same deterministic resolver as queue_by_id), then the set is enqueued so it lands CONTIGUOUS and IN THE GIVEN ORDER (built via race-free append-to-tail, never a racy reverse-next). Honest per-track status: a track that fails to resolve is flagged with its index and reason, never silently dropped; the rest still queue in correct relative order (best-effort). when: 'next' (default) places the set right after the current track; 'queue' appends to the end; 'now' replaces and plays from the first; 'after_current' waits for the current track to end (event-driven, robust to pause/seek/skip) then plays the set, discarding the prior queue. Limit: with 'next' and items ALREADY queued after the current track, Roon has no race-free insert-between primitive - if the current track has time left the set is inserted after it (reverse Add-Next, verified), otherwise it is appended in order at the tail; see strategy/anchor fields in the return.",
+    {
+      track_ids: trackIdsArg,
+      provider: providerArg,
+      zone: zoneArg,
+      when: z
+        .enum(["queue", "next", "now", "after_current"])
+        .default("next")
+        .describe("'next' (default) after current; 'queue' to the end; 'now' replace+play; 'after_current' deferred replace at the track seam."),
+    },
+    async ({ track_ids, provider, zone, when }) => queueOrPlayTracks(track_ids, provider, zone, when ?? "next"),
+  );
+
+  server.tool(
+    "play_tracks",
+    "Play an ORDERED list of EXACT tracks by provider track ID immediately, in ONE call. Same deterministic ID->exact-recording resolution and ordered, honest-status behavior as queue_tracks; defaults to when='now' (replace the queue and play from the first track, the rest following in order). Use when='next'/'queue'/'after_current' to enqueue instead.",
+    {
+      track_ids: trackIdsArg,
+      provider: providerArg,
+      zone: zoneArg,
+      when: z
+        .enum(["now", "next", "queue", "after_current"])
+        .default("now")
+        .describe("'now' (default) replace+play from first; 'next' after current; 'queue' to the end; 'after_current' deferred replace at the track seam."),
+    },
+    async ({ track_ids, provider, zone, when }) => queueOrPlayTracks(track_ids, provider, zone, when ?? "now"),
   );
 }
