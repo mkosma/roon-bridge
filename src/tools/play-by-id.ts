@@ -49,6 +49,8 @@ import {
   normalizeTitle,
   artistMatches,
   pickTrackRow,
+  classifyVariant,
+  waitForStableQueue,
   type BrowseItem,
   type QueueAction,
   type TrackIdentity,
@@ -247,7 +249,7 @@ async function executeAndVerify(
   const log = (step: string, data: unknown) =>
     console.error(`[roon-bridge] playById[${sessionKey}] ${step}:`, JSON.stringify(data));
 
-  const identity: TrackIdentity = { title: meta.title, artist: meta.artist, album: meta.album, trackNumber: meta.trackNumber };
+  const identity: TrackIdentity = { title: meta.title, artist: meta.artist, album: meta.album, trackNumber: meta.trackNumber, version: meta.version, durationSec: meta.durationSec };
   const resolved = await resolveRoonRow(browse, identity, zone.zone_id, sessionKey, log);
   if ("error" in resolved) {
     return jsonResult({ ok: false, error: resolved.error, detail: resolved.detail, track_id: trackId, requested: identity }, true);
@@ -311,17 +313,32 @@ async function executeAndVerify(
     unambiguous: resolved.unambiguous,
   };
 
+  // Whether the provider id denotes a live recording. Used to read back the
+  // landed row and refuse a silent live/studio swap (BUG A safety net): even if
+  // the resolver picked right, the RETURN must reflect what actually landed.
+  const intendedLive = classifyVariant(meta.title).is_live || /\blive\b/i.test(meta.version ?? "");
+  const recordingMismatch = (landedTitle: string | null): boolean =>
+    !!landedTitle && classifyVariant(landedTitle).is_live !== intendedLive;
+
   if (!verifyAdd) {
     // Verify now-playing flipped to our title (bounded poll).
     let nowOk = false;
+    let landedTitle: string | null = null;
     const deadline = Date.now() + 2500;
     while (Date.now() < deadline) {
       const z = roonConnection.findZone(zone.zone_id);
       const np = z?.now_playing?.three_line?.line1;
+      if (np) landedTitle = np;
       if (np && normalizeTitle(np) === normalizeTitle(meta.title)) { nowOk = true; break; }
       await new Promise((r) => setTimeout(r, 150));
     }
-    return jsonResult({ ok: true, action: action.matched, when, matched, verified: nowOk, zone: zone.display_name });
+    if (recordingMismatch(landedTitle)) {
+      return jsonResult(
+        { ok: false, error: "wrong_recording_queued", detail: `Expected ${intendedLive ? "a live" : "the studio"} recording of "${meta.title}" but "${landedTitle}" played.`, matched, queued_title: landedTitle, zone: zone.display_name },
+        true,
+      );
+    }
+    return jsonResult({ ok: true, action: action.matched, when, matched, verified: nowOk, queued_title: landedTitle, zone: zone.display_name });
   }
 
   // Verify by re-reading the queue until our track appears (bounded poll).
@@ -338,20 +355,30 @@ async function executeAndVerify(
   //     queue's "upcoming" set as it becomes the head).
   let landed = false;
   let afterCount = beforeCount;
+  let landedTitle: string | null = null;
   const wantTitle = normalizeTitle(meta.title);
   const deadline = Date.now() + 2500;
   try {
     while (Date.now() < deadline) {
       const after = await roonConnection.getQueueSnapshot(zone);
       afterCount = after.length;
-      const newId = after.some((i) => !beforeIds.has(i.queue_item_id));
+      const newRow = after.find((i) => !beforeIds.has(i.queue_item_id));
+      if (newRow) landedTitle = queueRowTitle(newRow);
       const np = roonConnection.findZone(zone.zone_id)?.now_playing?.three_line?.line1;
       const nowPlayingFlipped = !!np && normalizeTitle(np) === wantTitle;
-      if (after.length > beforeCount || newId || nowPlayingFlipped) { landed = true; break; }
+      if (nowPlayingFlipped && !landedTitle) landedTitle = np!;
+      if (after.length > beforeCount || newRow || nowPlayingFlipped) { landed = true; break; }
       await new Promise((r) => setTimeout(r, 150));
     }
   } catch {
     return jsonResult({ ok: true, action: action.matched, when, matched, verified: false, note: "queue growth could not be verified", zone: zone.display_name });
+  }
+
+  if (recordingMismatch(landedTitle)) {
+    return jsonResult(
+      { ok: false, error: "wrong_recording_queued", detail: `Expected ${intendedLive ? "a live" : "the studio"} recording of "${meta.title}" but "${landedTitle}" landed in the queue.`, matched, queued_title: landedTitle, queue_count_before: beforeCount, queue_count_after: afterCount, zone: zone.display_name },
+      true,
+    );
   }
 
   if (!landed) {
@@ -370,7 +397,7 @@ async function executeAndVerify(
     );
   }
 
-  return jsonResult({ ok: true, action: action.matched, when, matched, verified: true, queue_count_before: beforeCount, queue_count_after: afterCount, zone: zone.display_name });
+  return jsonResult({ ok: true, action: action.matched, when, matched, verified: true, queued_title: landedTitle, queue_count_before: beforeCount, queue_count_after: afterCount, zone: zone.display_name });
 }
 
 async function queueOrPlayById(
@@ -480,7 +507,7 @@ async function resolveOneForBatch(
   if (!meta.title || !meta.artist) {
     return { index, trackId, reason: "incomplete_track", detail: `Provider returned no title/artist for id ${trackId}.` };
   }
-  const identity: TrackIdentity = { title: meta.title, artist: meta.artist, album: meta.album, trackNumber: meta.trackNumber };
+  const identity: TrackIdentity = { title: meta.title, artist: meta.artist, album: meta.album, trackNumber: meta.trackNumber, version: meta.version, durationSec: meta.durationSec };
   const resolved = await resolveRoonRow(browse, identity, zone.zone_id, sessionKey, log);
   if ("error" in resolved) {
     return { index, trackId, reason: resolved.error, detail: resolved.detail };
@@ -590,40 +617,60 @@ async function verifyBlock(
   expectedAnchor: "head" | "after-current" | "tail",
 ): Promise<BlockVerification> {
   const wantTitles = resolved.map((t) => normalizeTitle(t.meta.title));
-  let after: QueueItem[] = [];
-  let newRows: QueueItem[] = [];
-  const deadline = Date.now() + 3000;
-  while (Date.now() < deadline) {
-    try {
-      after = await roonConnection.getQueueSnapshot(zone);
-    } catch {
-      break;
+
+  // Judge ONLY a SETTLED queue. A large-queue replace can take Roon several
+  // seconds to drain and rebuild; a snapshot taken mid-settle may show a
+  // transient full block that then collapses to a partial one. The old verify
+  // broke out of its poll the instant it saw >= N rows, which on a large 'now'
+  // replace (beforeIds empty -> every row counts as "new") was the FIRST
+  // snapshot - so it reported order_verified=true off an unsettled queue and
+  // missed real track loss (BUG B). Wait for stability, then count what is
+  // actually there.
+  let after: QueueItem[];
+  try {
+    after = await waitForStableQueue(() => roonConnection.getQueueSnapshot(zone), {
+      quietMs: 300,
+      deadlineMs: 12000,
+    });
+  } catch {
+    return { count_queued: 0, contiguous: false, in_order: false, anchor_ok: false, first_position: null };
+  }
+
+  let count_queued: number;
+  let positions: number[];
+
+  if (expectedAnchor === "head") {
+    // 'now' replaced the queue: beforeIds is empty, so new-id identification is
+    // meaningless. The set must be a contiguous, in-order run from the HEAD;
+    // count only the prefix that genuinely matches in the settled queue.
+    let i = 0;
+    while (i < wantTitles.length && i < after.length && normalizeTitle(queueRowTitle(after[i])) === wantTitles[i]) i++;
+    count_queued = i;
+    positions = Array.from({ length: i }, (_, k) => k);
+  } else {
+    // 'next' / 'queue': the block is the rows whose ids are absent from the
+    // before-snapshot, preserving queue order.
+    const newRows = after.filter((q) => !beforeIds.has(q.queue_item_id));
+    const gotTitles = newRows.map((r) => normalizeTitle(queueRowTitle(r)));
+    let wi = 0;
+    for (const g of gotTitles) {
+      if (wi < wantTitles.length && g === wantTitles[wi]) wi++;
     }
-    newRows = after.filter((i) => !beforeIds.has(i.queue_item_id));
-    if (newRows.length >= resolved.length) break;
-    await new Promise((r) => setTimeout(r, 150));
+    count_queued = wi;
+    positions = newRows
+      .map((r) => after.findIndex((a) => a.queue_item_id === r.queue_item_id))
+      .filter((p) => p >= 0)
+      .sort((a, b) => a - b);
   }
 
-  // newRows preserve queue order. Count how many wanted titles appear in order.
-  const gotTitles = newRows.map((r) => normalizeTitle(queueRowTitle(r)));
-  let wi = 0;
-  for (const g of gotTitles) {
-    if (wi < wantTitles.length && g === wantTitles[wi]) wi++;
-  }
-  const count_queued = wi;
   const in_order = count_queued === resolved.length;
-
-  const positions = newRows
-    .map((r) => after.findIndex((a) => a.queue_item_id === r.queue_item_id))
-    .filter((p) => p >= 0)
-    .sort((a, b) => a - b);
   const contiguous = positions.length > 0 && positions[positions.length - 1] - positions[0] === positions.length - 1;
   const firstIdx = positions.length ? positions[0] : -1;
 
   let expectedFirst: number;
   if (expectedAnchor === "head") expectedFirst = 0;
   else if (expectedAnchor === "after-current") expectedFirst = 1;
-  else expectedFirst = after.length - newRows.length; // tail
+  else expectedFirst = after.length - positions.length; // tail
   const anchor_ok = firstIdx === expectedFirst;
 
   return {

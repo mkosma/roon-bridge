@@ -22,6 +22,7 @@ import type {
   LoadResult,
   BrowseItem,
 } from "node-roon-api-browse";
+import type { QueueItem } from "node-roon-api-transport";
 
 let sessionCounter = 0;
 
@@ -377,6 +378,23 @@ export interface TrackIdentity {
   artist: string;
   album?: string;
   trackNumber?: number;
+  /** Provider version/edition token ("Live", "Remastered", ...), when known. */
+  version?: string;
+  /** Provider track length in seconds, when known (read-back / pin assist). */
+  durationSec?: number;
+}
+
+/**
+ * Whether the recording a provider id denotes is a LIVE take (so a live Roon row
+ * is the CORRECT match, not a substitution). A studio cut answers false: a live
+ * sibling must then be REJECTED, never silently queued in its place. This closes
+ * the wrong-recording defect - normalizeTitle deliberately strips "(Live ...)",
+ * so without this discriminator a live row collapses to the same title as the
+ * studio cut and passes as an exact match.
+ */
+export function identityWantsLive(target: TrackIdentity): boolean {
+  if (classifyVariant(target.title).is_live) return true;
+  return LIVE_MARKER.test(target.version ?? "") || /\blive\b/i.test(target.version ?? "");
 }
 
 /**
@@ -409,6 +427,20 @@ export function pickTrackRow(
     titleHits = playable.filter((r) => normalizeTitle(r.title).includes(wantTitle) && wantTitle.length > 0);
   }
   if (!titleHits.length) return undefined;
+
+  // Variant pinning (the wrong-recording defect): normalizeTitle strips
+  // "(Live ...)", so a live sibling collapses to the same title as the studio
+  // cut - which is how queue_by_id queued a live take while reporting the studio
+  // title. Keep only rows whose live/studio character matches what the provider
+  // id actually denotes. If NONE match (e.g. only a live row is present but the
+  // id is the studio cut), return undefined so the caller fails honestly or
+  // falls back to the album anchor, instead of substituting the wrong recording.
+  const wantLive = identityWantsLive(target);
+  const variantHits = titleHits.filter(
+    (r) => classifyVariant(r.title, stripRoonLinks(r.subtitle || "")).is_live === wantLive,
+  );
+  if (!variantHits.length) return undefined;
+  titleHits = variantHits;
 
   let pool = titleHits;
   if (opts.rowsCarryArtist) {
@@ -560,6 +592,43 @@ export function resolveActionItem(
     ) ||
     byTitle("play now");
   return pick ? { item: pick, matched: pick.title } : undefined;
+}
+
+/**
+ * Poll a queue snapshot until it SETTLES - identical length and item ids across a
+ * quiet window - or a deadline. A large-queue replace can take Roon several
+ * seconds to drain and rebuild, during which a snapshot may show a transient
+ * full block that then collapses; judging before settle is the dropped-tracks
+ * false positive (BUG B). Returns the last snapshot seen. Drives the post-action
+ * verification in both the batch enqueue and the album add.
+ */
+export async function waitForStableQueue(
+  snapshot: () => Promise<QueueItem[]>,
+  opts: { quietMs?: number; deadlineMs?: number; pollMs?: number } = {},
+): Promise<QueueItem[]> {
+  const quietMs = opts.quietMs ?? 300;
+  const deadlineMs = opts.deadlineMs ?? 12000;
+  const pollMs = opts.pollMs ?? 120;
+  const sig = (q: QueueItem[]) => `${q.length}:${q.map((i) => i.queue_item_id).join(",")}`;
+
+  const deadline = Date.now() + deadlineMs;
+  let last = await snapshot();
+  let lastSig = sig(last);
+  let stableSince = Date.now();
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, pollMs));
+    const cur = await snapshot();
+    const curSig = sig(cur);
+    if (curSig === lastSig) {
+      if (Date.now() - stableSince >= quietMs) return cur;
+      last = cur;
+    } else {
+      last = cur;
+      lastSig = curSig;
+      stableSince = Date.now();
+    }
+  }
+  return last;
 }
 
 export type { BrowseItem };
