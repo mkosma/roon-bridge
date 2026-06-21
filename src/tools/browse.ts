@@ -11,6 +11,7 @@ import {
   scoreCandidates,
   bestMatch,
   resolveActionItem,
+  waitForStableQueue,
   type BrowseItem,
 } from "./search-core.js";
 import { deferredPlayer } from "../control/deferred-player-instance.js";
@@ -710,6 +711,123 @@ async function queueArtist(query: string, zoneName: string): Promise<ToolResult>
   }
 }
 
+/**
+ * Queue a WHOLE album, and verify the whole album actually landed.
+ *
+ * The generic add path (searchAndPlay) verifies only that the queue GREW by at
+ * least one item, then claims success. For an album-level Queue action that is
+ * not enough: if Roon commits the album incrementally and the verify reads too
+ * early - or under-commits outright - the tool reports success while only ONE
+ * track landed (the BUG C under-add). This path instead reads the album's real
+ * track count, queues it, waits for the queue to SETTLE, and reports the actual
+ * tracks_added: the full album, or an honest under-add with its count. This is
+ * the safer album-journey default (album order, canonical recordings) - but only
+ * worth defaulting to if it reliably adds the whole album or says it did not.
+ */
+async function queueAlbum(query: string, zoneName: string): Promise<ToolResult> {
+  try {
+    const browse = roonConnection.getBrowse();
+    const zone = roonConnection.findZoneOrThrow(zoneName);
+    const sessionKey = newSessionKey();
+    const hierarchy = "search";
+    const log = (step: string, data: unknown) =>
+      console.error(`[roon-bridge] queueAlbum[${sessionKey}] ${step}:`, JSON.stringify(data));
+    const errText = (text: string): ToolResult => ({ content: [{ type: "text", text }], isError: true });
+
+    // Resolve the album entity (scored, variants penalized so a live/comp album
+    // does not outrank the studio release).
+    const searchData = await browseAndLoad(browse, {
+      hierarchy, input: query, pop_all: true, zone_or_output_id: zone.zone_id, multi_session_key: sessionKey,
+    });
+    if (searchData.error) return errText(`Search error: ${searchData.error}`);
+    if (!searchData.items?.length) return errText(`No results found for "${query}".`);
+    const albumsCat =
+      searchData.items.find((i) => i.item_key && i.title.toLowerCase() === "albums") ||
+      searchData.items.find((i) => i.item_key && i.title.toLowerCase().includes("album"));
+    if (!albumsCat?.item_key) return errText(`No album results for "${query}".`);
+
+    const catData = await browseAndLoad(browse, {
+      hierarchy, item_key: albumsCat.item_key, zone_or_output_id: zone.zone_id, multi_session_key: sessionKey,
+    });
+    if (catData.error || !catData.items?.length) return errText(`No albums found for "${query}".`);
+    const album = scoreCandidates(catData.items, query, true)[0]?.item ?? bestMatch(catData.items, query);
+    if (!album?.item_key) return errText(`No album match for "${query}".`);
+
+    // The album's real length, so we can tell a full add from an under-add. Read
+    // it from the album's own page; if Roon returned only an action popup (no
+    // track rows), descend one level into the album's content listing.
+    const opened = await browseAndLoad(browse, {
+      hierarchy, item_key: album.item_key, zone_or_output_id: zone.zone_id, multi_session_key: sessionKey,
+    });
+    let expectedTracks = (opened.items ?? []).filter((i) => i.item_key && isTrackRow(i)).length;
+    if (!expectedTracks) {
+      const navChild = (opened.items ?? []).find(
+        (i) => i.item_key && (i.hint === "list" || i.hint === "action_list") && !isTrackRow(i),
+      );
+      if (navChild?.item_key) {
+        const deeper = await browseAndLoad(browse, {
+          hierarchy, item_key: navChild.item_key, zone_or_output_id: zone.zone_id, multi_session_key: sessionKey,
+        });
+        const deepRows = (deeper.items ?? []).filter((i) => i.item_key && isTrackRow(i)).length;
+        expectedTracks = deepRows || deeper.total || 0;
+      }
+    }
+    if (!expectedTracks && opened.total) expectedTracks = opened.total;
+    log("album-resolved", { album: album.title, expectedTracks });
+
+    // Snapshot, queue the whole album, then verify against the SETTLED queue.
+    let preIds = new Set<number>();
+    let preCount = 0;
+    try {
+      const pre = await roonConnection.getQueueSnapshot(zone);
+      preIds = new Set(pre.map((i) => i.queue_item_id));
+      preCount = pre.length;
+    } catch {
+      preIds = new Set();
+    }
+
+    const queued = await executeQueueAction(browse, album.item_key, zone.zone_id, sessionKey, log);
+    if (!queued) {
+      return errText(`Could not queue album "${album.title}" - no queue action available in '${zone.display_name}'.`);
+    }
+
+    // Best-effort auto_radio off, matching the other play/queue paths.
+    try {
+      const transport = roonConnection.getTransport();
+      await new Promise<void>((resolve) => transport.change_settings(zone, { auto_radio: false }, () => resolve()));
+    } catch {
+      /* non-critical */
+    }
+
+    let tracksAdded = 0;
+    try {
+      const after = await waitForStableQueue(() => roonConnection.getQueueSnapshot(zone), { quietMs: 300, deadlineMs: 12000 });
+      const newItems = after.filter((i) => !preIds.has(i.queue_item_id));
+      tracksAdded = Math.max(newItems.length, after.length - preCount);
+    } catch (verifyErr) {
+      log("verify-error", String(verifyErr));
+      return {
+        content: [{ type: "text", text: `Queued album "${album.title}" in '${zone.display_name}' (queue growth unverified: ${String(verifyErr)}).` }],
+      };
+    }
+
+    const full = expectedTracks > 0 ? tracksAdded >= expectedTracks : tracksAdded > 0;
+    const payload = {
+      ok: full,
+      album: album.title,
+      tracks_added: tracksAdded,
+      tracks_expected: expectedTracks || null,
+      zone: zone.display_name,
+      ...(full
+        ? {}
+        : { reason: "album_under_added", detail: `Only ${tracksAdded} of ${expectedTracks || "?"} track(s) from "${album.title}" landed in the queue.` }),
+    };
+    return { content: [{ type: "text", text: JSON.stringify(payload) }], isError: !full };
+  } catch (error) {
+    return { content: [{ type: "text", text: String(error instanceof Error ? error.message : error) }], isError: true };
+  }
+}
+
 async function searchAndPlay(
   query: string,
   zoneName: string,
@@ -1340,7 +1458,7 @@ export function registerBrowseTools(server: McpServer): void {
 
   server.tool(
     "add_to_queue",
-    "Search for a track, album, artist, or playlist and add it to the queue in a Roon zone. category='artist' enqueues a varied stretch of that artist (their albums), not a single track.",
+    "Search for a track, album, artist, or playlist and add it to the queue in a Roon zone. category='artist' enqueues a varied stretch of that artist (their albums), not a single track. category='album' queues the WHOLE album and verifies the full album landed (against the album's real track count), reporting tracks_added and an honest under-add count rather than claiming success when only part of the album made it.",
     {
       query: z.string().describe("Search query (track name, album title, artist name, etc.)"),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
@@ -1352,8 +1470,14 @@ export function registerBrowseTools(server: McpServer): void {
     async ({ query, zone, category }) =>
       // An artist add means "more of this artist" - enqueue their albums, not a
       // single matched row. A direct artist-node Queue action reports success
-      // but enqueues nothing, so this takes a dedicated, verified path.
-      category === "artist" ? queueArtist(query, zone) : searchAndPlay(query, zone, category, "queue"),
+      // but enqueues nothing, so this takes a dedicated, verified path. An album
+      // add likewise needs its own path: verify the WHOLE album landed (not just
+      // queue growth), or report an honest under-add count (BUG C).
+      category === "artist"
+        ? queueArtist(query, zone)
+        : category === "album"
+          ? queueAlbum(query, zone)
+          : searchAndPlay(query, zone, category, "queue"),
   );
 
   server.tool(
