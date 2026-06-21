@@ -1282,7 +1282,7 @@ export function registerBrowseTools(server: McpServer): void {
         .int()
         .min(0)
         .default(0)
-        .describe("Pagination offset — only meaningful with `category`."),
+        .describe("Pagination offset - only meaningful with `category`."),
     },
     async ({ query, zone, category, limit, offset }): Promise<ToolResult> => {
       try {
@@ -1364,7 +1364,7 @@ export function registerBrowseTools(server: McpServer): void {
           if (catData.nextOffset != null) {
             const catName = title.toLowerCase().replace(/s$/, "");
             allResults.push(
-              `  [${total - end} more — call search with category="${catName}", offset=${catData.nextOffset}]`,
+              `  [${total - end} more - call search with category="${catName}", offset=${catData.nextOffset}]`,
             );
           }
 

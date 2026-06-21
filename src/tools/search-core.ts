@@ -411,7 +411,7 @@ export function identityWantsLive(target: TrackIdentity): boolean {
  * Returns the chosen row plus whether the pick was unambiguous, so the caller
  * can report a tie honestly instead of guessing. `albumKnown` says whether the
  * rows even carry album text to disambiguate on (album track listings usually
- * do not — the album is the page, not the row).
+ * do not - the album is the page, not the row).
  */
 export function pickTrackRow(
   rows: BrowseItem[],

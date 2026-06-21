@@ -1,3 +1,111 @@
+# Handback: curation reliability - 3 live-only queueing failures (2026-06-20, round 2)
+
+**Branch:** `builder/queue-tracks-batch` · **Worktree:** `~/dev/roon-bridge-worktrees/queue-tracks-batch`
+**Ticket:** `~/.agents/Maya/state/ticket-roon-bridge-curation-reliability-3bugs-2026-06-20.md`
+(refs the queue-tracks-batch ticket BUG 1 = BUG B here, and the exact-id-resolver ticket = BUG A here)
+**Status:** built, tsc-clean, full suite green. NOT deployed, NOT merged. Maya PM-reviews, runs the live
+re-check below in an away-window, then merges.
+
+Built by Builder-curation-reliability. Commits on the branch (this round):
+- `2650eef` fix(queue-by-id/queue_tracks): pin exact recording + settle-aware verify (BUG A, BUG B)
+- `fe72958` fix(add_to_queue): verify the whole album landed; honest under-add count (BUG C)
+
+All three failures passed the 256-test mock suite and surfaced only against the real Roon bridge. The
+mocks were too forgiving. Each fix lands a FAILING-FIRST adversarial fixture into the STANDARD `npm
+test` suite (verified failing on pre-fix source, green after), so a regression is caught automatically.
+
+## Test counts
+
+- Before (baseline this round): **256 pass / 2 skip** (26 files).
+- After: **264 pass / 2 skip** (29 files). Net **+8** new tests, no regressions, `tsc --noEmit` clean.
+- New files: `tests/queue-by-id-recording.test.ts` (4, BUG A), `tests/queue-tracks-large-replace.test.ts`
+  (2, BUG B), `tests/add-to-queue-album.test.ts` (2, BUG C).
+- Fail-first proof: stashing the source fix and re-running shows the new tests RED (BUG A 4/4, BUG B
+  drop-case, BUG C 2/2); restoring the fix makes them green.
+
+## Root causes + fixes
+
+### BUG A - "exact by ID" silently queued a live/alt recording (production: queue_by_id + queue_tracks)
+**Root cause.** `resolveRoonRow` -> `pickTrackRow` (`src/tools/search-core.ts`) selected a Roon row by
+NORMALIZED title + artist. `normalizeTitle` deliberately strips bracketed qualifiers, so "New Girl
+(Live at The Crocodile)" collapses to "new girl" - identical to the studio cut. When Roon's
+track-search surfaced only/first the live sibling, it passed as an exact, *unambiguous* match and was
+queued, while the return reported the provider's intended studio title (a silent title/recording
+mismatch - what hid the bug).
+**Fix.** `pickTrackRow` now pins on live/studio character: `identityWantsLive(target)` derives whether
+the provider id denotes a live take (from its title/version); rows whose `classifyVariant().is_live`
+differs are dropped. If none match (e.g. only a live row exists for a studio id), it returns undefined
+so the caller falls back to the album anchor or FAILS honestly (`track_not_in_album`) instead of
+substituting. `TrackIdentity` carries `version`/`durationSec`. `executeAndVerify`
+(`src/tools/play-by-id.ts`) reads back the ACTUAL landed row title (`queued_title` in the return) and
+returns `wrong_recording_queued` if a live/studio mismatch lands. The return now reflects reality, not
+the intended title.
+
+### BUG B - large-queue replace dropped tracks while reporting order_verified=true (queue_tracks/play_tracks `now`)
+**Root cause.** `verifyBlock` (`src/tools/play-by-id.ts`) broke out of its verify poll the instant it
+saw `newRows.length >= resolved.length`. For a `now` replace the before-snapshot is skipped, so
+`beforeIds` is empty and EVERY row counts as "new"; on a large existing queue (~38 items) that
+condition is true on the FIRST snapshot, read while Roon was still draining+rebuilding (~9.7s settle).
+A transient snapshot that briefly held all 5 tracks read as success before the queue collapsed to 2 -
+`order_verified` was a false positive. Small queues settle instantly, so they never reproduced it.
+**Fix.** New shared `waitForStableQueue` (`src/tools/search-core.ts`) polls until the queue SETTLES
+(identical length + item ids across a 300ms quiet window, 12s deadline) before judging. `verifyBlock`
+then counts the block off the SETTLED queue: for `now`/head anchor it counts a contiguous, in-order run
+from the head (beforeIds is meaningless there); for `next`/`queue` it keeps the before/after new-id
+diff. `count_queued`/`order_verified` now reflect what actually landed; a real drop reports `ok=false`
+with the true count.
+
+### BUG C - album-add under-filled to a single track (add_to_queue category='album')
+**Root cause.** `add_to_queue category='album'` went through the generic `searchAndPlay`, whose queue
+verify (`src/tools/browse.ts` step 7c) only checks the queue grew by >= 1 item, then claims success. An
+album-level Queue action that under-commits (1 of ~11 landed, live 2026-06-20) therefore read as
+success, and the return reported no count.
+**Fix.** A dedicated `queueAlbum` path (mirroring the existing `queueArtist` pattern): resolve the album
+(scored, variants penalized), read the album's real track count from its page (track rows, with a
+one-level descent into the content listing and a `list.count` fallback for the popup shape), snapshot,
+queue the whole album, then `waitForStableQueue` and report the ACTUAL `tracks_added`. Returns the full
+album (`ok=true`, `tracks_added`/`tracks_expected`) or an honest under-add (`ok=false`,
+`album_under_added`, the count, the resolved album title). `add_to_queue` routes `category='album'` here;
+the tool description states the guarantee. Note: when Roon returns only an album action-popup with no
+reachable track listing, `tracks_expected` is unknown and the path is best-effort (success on any
+growth) - the live re-check below exercises the real shape.
+
+## Live re-check script for Maya (away-window, WiiM + 1, real bridge on :3100)
+
+Deploy the branch build (overlay + kickstart, full backup), run these against real Roon while Monty is
+away / muted, then REVERT to main if not merging. All assertions are read-back against `get_queue`.
+
+1. **BUG A - studio not live.** `search_tracks "The Long Winters New Girl"` to confirm the two ids.
+   `queue_by_id 48916424` -> the return's `queued_title` is "New Girl" (NO "(Live ...)"), and
+   `get_queue` shows the studio 2:31 cut, not the 3:02 Crocodile live. Repeat for any same-title
+   studio/live pair (e.g. the Puppets/Atmosphere case). A pinned-but-unavailable studio cut must FAIL
+   (`track_not_in_album` / honest error), never substitute a live take.
+2. **BUG A - the Bride And Bridle id.** `queue_by_id 48916419` should land the studio album track or
+   fail honestly - not silently queue a sibling.
+3. **BUG B - large-queue replace.** Build a large queue (~30-40 items), then `play_tracks` with 5 known
+   studio ids replacing it. The return's `count_queued` must equal what `get_queue` actually holds after
+   it settles (poll `get_queue` a few seconds later); `order_verified=true` ONLY if all 5 are contiguous
+   from the head. Confirm no silent drop. Re-run the clean small-queue 3- and 5-track replaces (should
+   still be perfect).
+4. **BUG C - album add.** `add_to_queue query="The Long Winters When I Pretend To Fall" category="album"`
+   -> return reports `tracks_added` == the album's real length and `ok=true`; `get_queue` shows the whole
+   album. Re-run the three albums that worked before (The Worst You Can Do Is Harm, Ultimatum, Putting
+   The Days To Bed) - each should report its full count, not a partial.
+
+## Not done / notes
+
+- Live/audible verification is left to Maya + Monty (mock/unit-verified only here). The Roon-execution
+  half (real browse ranking, real settle timing, real album-page shape) is exactly what differs from
+  mocks - hence the live re-check above.
+- BUG C `tracks_expected` is best-effort when Roon yields an album action-popup with no reachable track
+  listing; in that case the path reports the count it added and succeeds on any growth. If the live
+  re-check shows that shape, a follow-up could resolve the album's length via the provider (Qobuz album
+  id) instead of the Roon page.
+- No new tools, no schema/behavior changes to the working `queue_tracks` modes; BUG B only hardened the
+  post-action verify. The existing queue-tracks suite stays green.
+
+---
+
 # Handback: queue_tracks / play_tracks - ordered, race-free batch enqueue
 
 **Branch:** `builder/queue-tracks-batch` · **Worktree:** `~/dev/roon-bridge-worktrees/queue-tracks-batch`
