@@ -72,16 +72,61 @@ const WHEN_TO_INTENT: Record<string, QueueAction> = {
 const ALBUM_ACTION_TITLE =
   /^(play|play now|play album|play artist|shuffle|add next|play next|queue|add to queue|start radio|start album radio)$/i;
 
+/** Trailing context tag Roon appends when one recording appears in two surfaces
+ *  ("Heart Cooks Brain (Album)" vs the standalone "Heart Cooks Brain"). */
+const CONTEXT_TAG = /\s*\((?:album|single|ep)\)\s*$/i;
+
+/** A recording title reduced for same-recording comparison: Roon links stripped,
+ *  a leading track-number prefix and the trailing context tag removed, lowered,
+ *  whitespace collapsed. Deliberately does NOT strip other parentheticals (e.g.
+ *  "(Live ...)") - a variant qualifier must survive so it can fail the match. */
+function recordingKey(title: string): string {
+  return stripRoonLinks(title)
+    .replace(/^\s*\d+\s*[.\-]\s*/, "")
+    .replace(CONTEXT_TAG, "")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+/**
+ * Roon sometimes drills a single recording to a TWO-ITEM disambiguation - the
+ * album-context item ("X (Album)") and the standalone item ("X") - instead of a
+ * direct action list. Both are the SAME recording, so picking either and reading
+ * its actions is correct; erroring "no_action" (BUG D) is not. Select the item
+ * for the resolved context deterministically. Returns undefined unless EVERY
+ * candidate reduces to the same recording as `expectedTitle`, so a genuine
+ * live/studio split (different recordings) is never silently guessed.
+ */
+function selectSameRecordingItem(
+  items: BrowseItem[],
+  expectedTitle: string,
+  preferAlbumContext: boolean,
+): BrowseItem | undefined {
+  const want = recordingKey(expectedTitle);
+  if (!want || items.length < 2) return undefined;
+  if (!items.every((i) => recordingKey(i.title) === want)) return undefined;
+  const albumCtx = items.find((i) => CONTEXT_TAG.test(i.title.trim()));
+  const standalone = items.find((i) => !CONTEXT_TAG.test(i.title.trim()));
+  return preferAlbumContext ? albumCtx ?? standalone ?? items[0] : standalone ?? albumCtx ?? items[0];
+}
+
 /**
  * Drill a matched item's browse node to its action list, mirroring the deeper-
  * navigation logic the other play/queue paths use. Returns the action items
  * with the session left positioned so the caller can execute in the same session.
+ *
+ * `opts.expectedTitle` enables same-recording disambiguation (BUG D): when a
+ * recording drills to multiple navigable children that are all the SAME
+ * recording (album-context + standalone), descend into the one matching the
+ * resolved context instead of giving up and reporting no_action.
  */
 async function drillToActions(
   browse: RoonApiBrowse,
   itemKey: string,
   zoneId: string | undefined,
   sessionKey: string,
+  opts?: { expectedTitle?: string; preferAlbumContext?: boolean },
 ): Promise<{ error?: string; message?: string; actionItems: BrowseItem[] }> {
   const actionData = await browseAndLoad(browse, {
     hierarchy: "search",
@@ -98,10 +143,14 @@ async function drillToActions(
     if (listHint === "action_list") break;
     if (actionItems.some((i) => i.hint === "action")) break;
     const navigable = actionItems.filter((i) => i.item_key && (i.hint === "action_list" || i.hint === "list"));
-    if (navigable.length !== 1) break;
+    let chosen: BrowseItem | undefined = navigable.length === 1 ? navigable[0] : undefined;
+    if (!chosen && navigable.length > 1 && opts?.expectedTitle) {
+      chosen = selectSameRecordingItem(navigable, opts.expectedTitle, opts.preferAlbumContext ?? true);
+    }
+    if (!chosen?.item_key) break;
     const deeper = await browseAndLoad(browse, {
       hierarchy: "search",
-      item_key: navigable[0].item_key!,
+      item_key: chosen.item_key,
       zone_or_output_id: zoneId,
       multi_session_key: sessionKey,
     });
@@ -255,7 +304,10 @@ async function executeAndVerify(
     return jsonResult({ ok: false, error: resolved.error, detail: resolved.detail, track_id: trackId, requested: identity }, true);
   }
 
-  const drilled = await drillToActions(browse, resolved.itemKey, zone.zone_id, sessionKey);
+  const drilled = await drillToActions(browse, resolved.itemKey, zone.zone_id, sessionKey, {
+    expectedTitle: meta.title,
+    preferAlbumContext: !!meta.album,
+  });
   if (drilled.message) return jsonResult({ ok: false, error: "message", detail: drilled.message, matched: meta.title }, true);
   if (drilled.error) return jsonResult({ ok: false, error: drilled.error, matched: meta.title }, true);
 
@@ -512,7 +564,10 @@ async function resolveOneForBatch(
   if ("error" in resolved) {
     return { index, trackId, reason: resolved.error, detail: resolved.detail };
   }
-  const drilled = await drillToActions(browse, resolved.itemKey, zone.zone_id, sessionKey);
+  const drilled = await drillToActions(browse, resolved.itemKey, zone.zone_id, sessionKey, {
+    expectedTitle: meta.title,
+    preferAlbumContext: !!meta.album,
+  });
   if (drilled.message) return { index, trackId, reason: "message", detail: drilled.message };
   if (drilled.error) return { index, trackId, reason: drilled.error };
   return {
