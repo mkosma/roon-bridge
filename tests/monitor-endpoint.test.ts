@@ -14,7 +14,18 @@ const playingZone = {
   zone_id: "zone-1",
   display_name: "WiiM + 1",
   state: "playing" as const,
-  outputs: [],
+  outputs: [
+    {
+      output_id: "out-wiim",
+      display_name: "WiiM Ultra",
+      volume: { type: "number", value: 48, min: 0, max: 100, is_muted: false },
+    },
+    {
+      output_id: "out-muse",
+      display_name: "Muse",
+      volume: { type: "number", value: 50, min: 0, max: 100, is_muted: false },
+    },
+  ],
   is_previous_allowed: true,
   is_next_allowed: true,
   is_pause_allowed: true,
@@ -90,6 +101,26 @@ describe("GET /monitor/state", () => {
       expect(json.state).toBe("playing");
       expect(json.queue_remaining_count).toBe(29);
       expect(json.now_playing).toMatchObject({ title: "Karoo (Original)", artist: "Larse" });
+    });
+  });
+
+  it("includes a representative volume plus per-output detail", async () => {
+    await withApp(async (base) => {
+      const res = await fetch(`${base}/monitor/state?zone=WiiM`);
+      const json = (await res.json()) as Record<string, unknown>;
+      const vol = json.volume as { value: number; is_muted: boolean; outputs: unknown[] };
+      expect(vol).not.toBeNull();
+      expect(vol.value).toBe(48); // first numeric-volume output
+      expect(vol.is_muted).toBe(false);
+      expect(vol.outputs).toHaveLength(2);
+    });
+  });
+
+  it("reports volume null when the zone has no numeric-volume outputs", async () => {
+    await withApp(async (base) => {
+      const res = await fetch(`${base}/monitor/state?zone=MacBook`);
+      const json = (await res.json()) as Record<string, unknown>;
+      expect(json.volume).toBeNull();
     });
   });
 

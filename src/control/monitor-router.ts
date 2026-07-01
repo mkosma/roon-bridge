@@ -8,7 +8,14 @@
  *
  *   { ok, zone, state: "playing"|"paused"|"stopped"|"loading",
  *     now_playing: { title, artist, album } | null,
- *     queue_remaining_count, queue_time_remaining_seconds }
+ *     queue_remaining_count, queue_time_remaining_seconds,
+ *     volume: { value, is_muted, outputs: [...] } | null }
+ *
+ * `volume` is a single representative level for the zone (the first
+ * numeric-volume output's value), plus per-output detail for grouped zones like
+ * "WiiM + 1". It lets a polling daemon notice a manual volume change between
+ * ticks without a separate get_volume round trip. null when the zone exposes no
+ * numeric volume (e.g. fixed-volume / incremental-only outputs).
  *
  * It reads ONLY the in-memory zone map that roon-bridge already keeps fresh via
  * its single subscribe_zones stream. No browse, no subscribe_queue round trip,
@@ -26,6 +33,27 @@
 import { Router } from "express";
 import { roonConnection } from "../roon-connection.js";
 import type { Zone } from "node-roon-api-transport";
+
+// A compact, monitor-friendly volume read for a zone. Reads only the in-memory
+// outputs (no transport round trip), mirroring the rest of /monitor/state.
+// `value` is the first numeric-volume output's level - a stable scalar a daemon
+// can diff between ticks; `outputs` carries per-output detail for grouped zones.
+function volumeSnapshot(zone: Zone) {
+  const outputs = (zone.outputs ?? [])
+    .filter((o) => o.volume && o.volume.type !== "incremental")
+    .map((o) => ({
+      output_id: o.output_id,
+      name: o.display_name,
+      value: o.volume?.value ?? null,
+      is_muted: o.volume?.is_muted ?? null,
+    }));
+  if (outputs.length === 0) return null;
+  return {
+    value: outputs[0].value,
+    is_muted: outputs[0].is_muted,
+    outputs,
+  };
+}
 
 function snapshot(zone: Zone) {
   const np = zone.now_playing;
@@ -46,6 +74,7 @@ function snapshot(zone: Zone) {
       : null,
     queue_remaining_count: zone.queue_items_remaining ?? 0,
     queue_time_remaining_seconds: zone.queue_time_remaining ?? null,
+    volume: volumeSnapshot(zone),
   };
 }
 
