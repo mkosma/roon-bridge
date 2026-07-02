@@ -1,70 +1,142 @@
-# Handback: BUG D - queue_by_id / queue_tracks fail on a two-action "(Album)" disambiguation
+# Handback: edit_queue (delete/reorder upcoming queue via safe rebuild)
 
-**Branch:** `builder/album-action-fix` · **Worktree:** `~/dev/roon-bridge-worktrees/album-action-fix`
-**Ticket:** `~/.agents/Maya/state/ticket-roon-bridge-album-action-disambiguation-2026-06-24.md`
-**Status:** built, tsc-clean, full suite green (267 pass, +3 over the 264 baseline; 2 pre-existing skips).
-NOT deployed, NOT merged, NOT restarted. Maya deploys and live-verifies.
+**Branch:** `builder/edit-queue` · **Worktree:** `~/dev/roon-bridge-worktrees/edit-queue`
+**Ticket:** `~/.agents/Maya/state/ticket-roon-bridge-edit-queue-2026-06-18.md`
+**Status:** built, unit-verified. NOT deployed, NOT merged. PM-review the diff,
+re-run the suite, then live-verify the Roon-execution paths with Monty at
+**WiiM + 1** before merging.
 
-Built by Builder-album-action-fix.
+## Test suite
 
-## The defect
+`npx vitest run` -> **266 passed | 2 skipped** (26 files). Baseline before this
+work was 247 | 2 skipped; +19 new (`tests/edit-queue.test.ts`), no regressions.
+The 2 skipped are the pre-existing `qobuz-provider.live.test.ts`. Clean `tsc`
+(`npm run build`).
 
-`queue_by_id {track_id: "121053082"}` (Heart Cooks Brain, Modest Mouse / The Lonesome Crowded West)
-resolved the right row, then returned `error: "no_action"` with
-`available_actions: ["Heart Cooks Brain (Album)", "Heart Cooks Brain"]`. Hit 12 of 15 LCW tracks;
-single-action tracks (e.g. "Doin' the Cockroach") queued fine. `queue_tracks` failed the same way
-(`count_queued: 0`). Album-level `add_to_queue category=album` / `play_album` were unaffected.
+Note: `node_modules/` here was copied from `~/dev/roon-bridge` (git deps need
+network) and is gitignored. If you re-clone the worktree, `npm install` first.
 
-## Root cause
+## What I built (3 commits)
 
-When the resolver drills the pinned track row, Roon does not always return the action verbs
-(Play Now / Add Next / Queue) directly. For these tracks it returns a TWO-ITEM disambiguation - the
-album-context item "X (Album)" and the standalone item "X" - each a navigable child leading to its own
-action list. `drillToActions` only descended when exactly ONE navigable child existed
-(`if (navigable.length !== 1) break;`), so it stopped on the two-item case and handed the two
-disambiguation items to `resolveActionItem`, which found no queue verb among them -> `no_action`.
+1. **`feat(play-by-id)`** - in-memory queue-provenance store
+   (`src/control/queue-provenance.ts`) + extracted reusable core in
+   `src/tools/play-by-id.ts` (`executeIdentity` / `executeById` returning a
+   structured `ExecResult`; the MCP tools just JSON-wrap it). No behavior change
+   to `queue_by_id` / `play_by_id`.
+2. **`feat(edit_queue)`** - the new tool (`src/tools/edit-queue.ts`) + server
+   registration. Params: `delete` (queue_item_ids), `reorder` (desired order of
+   the remaining upcoming ids), `zone`, `when` (`after_current` default | `now`).
+3. **`test(edit_queue)`** - pure-helper + integration tests.
 
-## The fix (`src/tools/play-by-id.ts`)
+## The provider-id-map approach (the key design decision)
 
-`drillToActions` now takes `opts: { expectedTitle?, preferAlbumContext? }`. When the drill yields
-multiple navigable children, `selectSameRecordingItem` checks whether EVERY child reduces to the same
-recording as `expectedTitle` (via `recordingKey`: strips Roon links, a leading track-number prefix, and
-ONLY the trailing `(Album|Single|EP)` context tag - deliberately preserving any `(Live ...)` qualifier so
-a genuine live/studio split fails the match). If so, it deterministically selects the album-context item
-(`preferAlbumContext`, true when the track has an album) and descends into it to read the real action
-list. If the children are NOT the same recording, it returns undefined and the old behavior stands - no
-guessing among different recordings (per the determinism directive). Both callsites
-(`executeAndVerify` for queue_by_id, `resolveOneForBatch` for queue_tracks) pass
-`{ expectedTitle: meta.title, preferAlbumContext: !!meta.album }`.
+`get_queue` gives each item's stable `queue_item_id` + title/artist/album but
+**no provider (Qobuz) track id**, so a rebuild can't just replay ids. So:
 
-## Tests (`tests/queue-by-id-album-action.test.ts`, new file)
+- **Capture at enqueue time.** When `queue_by_id` / `play_by_id` enqueue a track
+  they know the provider id; after the add verifies, the new `queue_item_id` is
+  recorded in `queueProvenance` as `queue_item_id -> {providerId, provider,
+  title, artist, album, trackNumber}`. (Recorded only when the add introduced
+  exactly one new item, so a stray radio append is never mislabeled.)
+- **Replay EXACT on rebuild.** `edit_queue` looks up each edited item's
+  provenance and re-queues via the deterministic `queue_by_id` path
+  (`executeById`) - same recording, no re-matching, no covers.
+- **Fallback, flagged.** Items with no provenance (queued by the Roon GUI, by
+  name search, or before this process started) fall back to title+artist
+  re-resolution (`executeIdentity` with the queue row's metadata) and are
+  flagged `reresolved: true` per item, with a `reresolved_count` in the plan.
 
-Mocks the real two-action Roon shape: drilling the resolved track row returns the
-`["Heart Cooks Brain (Album)", "Heart Cooks Brain"]` navigable disambiguation; only the album-context
-child reveals the action verbs. A second track ("Doin' the Cockroach") drills straight to verbs
-(single-action control).
+In-memory and process-lifetime only (bounded to 1000 entries, LRU). A miss is
+always safe (it just takes the fallback path). This means: provenance-exact
+replay works for tracks queued via `queue_by_id`/`play_by_id` in the **same**
+running bridge process; otherwise the (flagged) title+artist fallback is used.
 
-- `queue_by_id queues a track whose Roon row drills to the '(Album)' two-item disambiguation` -
-  asserts ok, and that the ALBUM-context item (`act:queue:hcb`) was executed, not the standalone single.
-- `queue_by_id queues a single-action control track` - single-action path still works.
-- `queue_tracks queues a two-action track and a single-action track together` - `count_queued: 2`,
-  every track ok.
+## The algorithm (Monty's design)
 
-**Failing-first verified:** against pre-fix `src/tools/play-by-id.ts` (stashed), the two two-action tests
-FAIL with the `no_action` shape (`count_queued: 0`); the single-action control passes (the bug never
-affected it). With the fix all three pass. The pre-existing 264-test suite never reproduced the
-multi-action shape - its mocks drilled straight to action verbs - which is why the bug shipped green.
+1. Snapshot the queue; the currently-playing track is left alone.
+2. `planEditedList` (pure) computes the intended **upcoming** list: delete named
+   ids, then apply `reorder` (must be a permutation of the ids remaining after
+   deletion - it cannot include the now-playing track or a deleted id).
+3. `when="after_current"` (default): arm the event-driven `DeferredPlayer` (the
+   same after-current impl `play_track`/`play_album` use - fires on the real
+   track-end event, distinguishes a natural end from a manual skip, never a
+   wall-clock timer). `when="now"`: rebuild immediately.
+4. At the seam: interference check (below) -> start the first edited track via
+   `executeById`/`executeIdentity` with `when="now"` (replace) -> the execute
+   path **validates it is actually now-playing** (`verified`) before continuing
+   -> append the rest in order with `when="queue"`.
+5. Re-read the queue and verify the final order matches intent (`final_match`).
 
-## How verified
+## Hard requirement: abort on interference (never fight the user)
 
-- `./node_modules/.bin/tsc --noEmit` -> exit 0 (clean).
-- `./node_modules/.bin/vitest run tests/queue-by-id-album-action.test.ts` -> 3 passed.
-- Stash the source fix, re-run -> 2 failed / 1 passed (failing-first confirmed); pop.
-- `./node_modules/.bin/vitest run` (full) -> 30 files passed, 1 skipped; 267 passed, 2 skipped.
+Detection, layered:
 
-## Not done / for Maya
+- **DeferredPlayer generation guard** - a newer `edit_queue`/play supersedes a
+  pending one; a manual skip re-arms (never fires mid-track).
+- **Snapshot-compare** (`detectInterference`) at fire time: the upcoming ids
+  captured when armed must still be present, in the same relative order, in the
+  live queue. If the user/another process removed, consumed-past, or reordered
+  them, **abort**. Tolerant of the consumed head and trailing radio adds.
+- **Zone-state check** - if playback is `stopped`/`paused` at fire time, abort.
+- **First-track guard** - if the first edited track can't be made now-playing
+  (`verified !== true`), abort before appending onto a wrong base.
 
-- Live-verify on the WiiM + 1 zone: `queue_by_id 121053082` (and a couple more LCW tracks) must queue,
-  and a `queue_tracks` batch of LCW tracks must land contiguous and in order. The mock proves the logic;
-  only the real bridge proves the Roon action shape was read correctly.
-- Deploy + restart :3100 is Maya's (handoff note: start extensions after the Core library scan settles).
+Every abort logs `[roon-bridge] edit_queue abort: <reason>` and touches nothing
+further. `when="now"` is treated as an explicit user action, so it skips the
+wait-window interference/state guards (the window is a single read).
+
+## Acceptance status
+
+| Item | Status |
+| --- | --- |
+| Delete a mid-queue track; current plays to its end, queue continues with it gone, order intact, no mid-track cut | Built; unit-proven (now + after_current paths). **Needs live WiiM + 1 confirm.** |
+| Reorder remaining tracks; final queue matches requested order | Built; unit-proven (`final_match`). **Needs live confirm.** |
+| Delete the currently-playing track's successor | Built; unit-proven. **Needs live confirm.** |
+| Deleting the currently-*playing* track | Documented: it keeps playing to its end, then the edited queue takes over (`deleted_playing_note`). **Needs live confirm.** |
+| Interference abort (skip/pause/requeue mid-wait -> rebuild aborts, user wins) | Built; unit-proven (snapshot-compare + state + generation). **Needs live confirm** (the headline safety property). |
+| Re-queued tracks are the EXACT recordings (provider-id map), not re-matched | Built; unit-proven (provenance path executes `act:*:idD` exactly; fallback flagged). **Needs live confirm** that provenance is populated in the live process. |
+| No regression; re-run suite, report count | DONE - 266 \| 2, +19, no regressions. |
+
+**What I could NOT verify (and why):** anything that EXECUTES a Roon browse
+action or moves playback makes sound on the living-room system and risks a
+pairing interaction with the live single bridge. Per the ticket I did not deploy
+or live-test. The browse/transport mechanics reuse the already-live-proven
+`queue_by_id` path and the already-live-proven `DeferredPlayer`; the new logic
+(planning, interference, orchestration) is unit-tested against mocks.
+
+## Live checks Maya must run with Monty at "WiiM + 1"
+
+Run in a quiet moment (these move playback). Build a known queue first via
+`queue_by_id` (so provenance is captured), e.g. queue 4 distinct tracks, then
+`get_queue` to read their `queue_item_id`s.
+
+1. **Delete a mid-queue track, after_current (headline).** `edit_queue
+   delete:[<id of track 3>]` (default `when`). Expect `scheduled:true`. Let the
+   current track finish naturally -> the deleted track is gone, the rest keep
+   their order, and the current track was never cut. Confirm in Roon.
+2. **Reorder, after_current.** `edit_queue reorder:[<ids in a new order>]`.
+   After the seam, confirm the upcoming order matches exactly. Check the result's
+   `outcome.final_match` is `true`.
+3. **Delete + reorder together**, after_current. Confirm both applied.
+4. **EXACT recording.** Verify a re-queued track is the same recording you
+   queued (provenance), and that `plan.reresolved_count` is `0` when everything
+   was queued via `queue_by_id`. Then `get_queue` a GUI-queued track and confirm
+   editing it shows `reresolved:true` for that item but still lands the right song.
+5. **Interference abort (the safety headline).** Start an `after_current` edit,
+   then before the current track ends: (a) manually skip -> rebuild must abort,
+   your skip wins; (b) repeat and pause -> abort; (c) repeat and queue something
+   new -> abort. In each case nothing from the edit should be forced; check the
+   logs for `edit_queue abort: <reason>`.
+6. **when="now".** `edit_queue delete:[...] when:"now"` -> rebuilds immediately
+   (cuts the current track). Confirm the edited queue and `outcome.final_match`.
+7. **Edge cases.** Delete all upcoming -> expect `cannot_empty_queue` (refused,
+   nothing touched). No-op (reorder to current order) -> `noop:true`, playback
+   untouched.
+
+This is the "tweak the queue" step of the ramp-to-silence -> edit -> ramp-up
+maneuver, so step 5 (never stomping) is the one to lean on hardest in live test.
+
+If a rebuild mis-selects a recording, the tuning point is the same browse
+traversal `queue_by_id` uses (`resolveRoonRow` in `src/tools/play-by-id.ts`); if
+it re-resolves something it shouldn't, check that the item's provenance was
+captured (only same-process `queue_by_id`/`play_by_id` enqueues populate it).

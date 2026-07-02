@@ -25,6 +25,7 @@ import { registerVersionTools } from "./tools/versions.js";
 import { registerRoonPlaylistTools } from "./tools/roon-playlists.js";
 import { registerPlaylistTools } from "./tools/playlist.js";
 import { registerPlayByIdTools } from "./tools/play-by-id.js";
+import { registerEditQueueTools } from "./tools/edit-queue.js";
 import { registerTopologyTools } from "./tools/topology.js";
 import { createControlRouter, createConfigRouter } from "./control/control-router.js";
 import { createMonitorRouter } from "./control/monitor-router.js";
@@ -77,6 +78,7 @@ function createMcpServer(): McpServer {
   registerRoonPlaylistTools(server);
   registerPlaylistTools(server);
   registerPlayByIdTools(server);
+  registerEditQueueTools(server);
   registerTopologyTools(server);
 
   return server;
