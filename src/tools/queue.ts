@@ -39,6 +39,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { roonConnection } from "../roon-connection.js";
 import type { Zone, QueueItem } from "node-roon-api-transport";
+import { deferredPlayer } from "../control/deferred-player-instance.js";
 import {
   newSessionKey,
   browseAndLoad,
@@ -358,12 +359,17 @@ export function registerQueueTools(server: McpServer): void {
   // ---------------------------------------------------------------------------
   server.tool(
     "play_from_here",
-    "Jump playback to a specific queued item by its queue_item_id (from get_queue). Native Roon operation. Verified by re-reading now-playing.",
+    "Jump playback to a specific queued item by its queue_item_id (from get_queue). Native Roon operation. SAFE DEFAULT: does NOT cut the current track - the jump is deferred until the current track ends (server-side, event-driven, no mid-track cut). Pass immediate:true to jump RIGHT NOW. Verified by re-reading now-playing.",
     {
       queue_item_id: z.coerce.number().int().describe("queue_item_id from get_queue."),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)."),
+      immediate: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Jump RIGHT NOW, cutting the current track. Default false = jump when the current track ends (no mid-track cut)."),
     },
-    async ({ queue_item_id, zone }): Promise<ToolResult> => {
+    async ({ queue_item_id, zone, immediate }): Promise<ToolResult> => {
       try {
         const z = roonConnection.findZoneOrThrow(zone);
         const rows = await readQueueRows(z);
@@ -379,19 +385,46 @@ export function registerQueueTools(server: McpServer): void {
             true,
           );
         }
-        await roonConnection.playFromHere(z, queue_item_id);
 
-        // Verify: re-read; the target should now be the head / now-playing.
-        await new Promise((r) => setTimeout(r, 200));
-        const after = await readQueueRows(z);
-        const head = after[0];
-        return jsonResult({
-          ok: true,
-          jumped_to: { queue_item_id, title: target.title, artist: target.artist },
-          now_playing: head ? { queue_item_id: head.queue_item_id, title: head.title } : null,
-          verified: head?.queue_item_id === queue_item_id,
-          zone: z.display_name,
-        });
+        // The jump itself (Roon play_from_here) + verification by re-read.
+        const doJump = async (): Promise<ToolResult> => {
+          await roonConnection.playFromHere(z, queue_item_id);
+          // Verify: re-read; the target should now be the head / now-playing.
+          await new Promise((r) => setTimeout(r, 200));
+          const after = await readQueueRows(z);
+          const head = after[0];
+          return jsonResult({
+            ok: true,
+            jumped_to: { queue_item_id, title: target.title, artist: target.artist },
+            now_playing: head ? { queue_item_id: head.queue_item_id, title: head.title } : null,
+            verified: head?.queue_item_id === queue_item_id,
+            zone: z.display_name,
+          });
+        };
+
+        // SAFE DEFAULT: defer the jump to the current track's natural end so the
+        // playing track is never cut. Only when something is actually playing
+        // with a known length is there a seam to wait for.
+        if (!immediate) {
+          const np = z.now_playing;
+          if (z.state === "playing" && np && np.length != null) {
+            deferredPlayer
+              .scheduleAfterCurrent(z, () => doJump())
+              .catch((e: unknown) => console.error("[play_from_here] schedule error:", e));
+            return jsonResult({
+              ok: true,
+              scheduled: true,
+              jump_to: { queue_item_id, title: target.title, artist: target.artist },
+              detail: `Armed: playback will jump to "${target.title}" when "${np.three_line?.line1 ?? "the current track"}" ends (no mid-track cut). Pass immediate:true to jump now.`,
+              zone: z.display_name,
+            });
+          }
+          // Nothing playing - no seam to wait for; jump now.
+        }
+
+        // immediate:true (or nothing playing): jump now, superseding any deferral.
+        deferredPlayer.cancel();
+        return await doJump();
       } catch (e) {
         return jsonResult({ ok: false, error: e instanceof Error ? e.message : String(e) }, true);
       }

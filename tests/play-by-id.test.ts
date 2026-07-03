@@ -184,9 +184,37 @@ describe("queue_by_id (album-anchored deterministic resolution)", () => {
     expect(world.executed.some((k) => k.includes("lemons"))).toBe(false);
   });
 
-  it("play_by_id defaults to Play Now", async () => {
+  it("play_by_id SAFE DEFAULT (no immediate) does NOT play now - it adds after current (Add Next)", async () => {
     const server = buildServer();
     const { json } = await call(server, "play_by_id", { track_id: "95206613" });
+    expect(json.ok).toBe(true);
+    expect(json.when).toBe("next");
+    // The Add Next action ran; the current track was NOT cut with Play Now.
+    expect(world.executed).toContain("act:next:lemons-puppets");
+    expect(world.executed).not.toContain("act:play:lemons-puppets");
+  });
+
+  it("play_by_id immediate:true plays now (Play Now)", async () => {
+    const server = buildServer();
+    const { json } = await call(server, "play_by_id", { track_id: "95206613", immediate: true });
+    expect(json.ok).toBe(true);
+    expect(json.when).toBe("now");
+    expect(world.executed).toContain("act:play:lemons-puppets");
+  });
+
+  it("queue_by_id SAFE DEFAULT never plays now; a stray when:'now' is downgraded, not honored", async () => {
+    const server = buildServer();
+    // Even if a caller passes the old interrupting value, without immediate it
+    // must NOT cut the current track - it downgrades to the safe queue add.
+    const { json } = await call(server, "queue_by_id", { track_id: "95206613", when: "now" });
+    expect(json.ok).toBe(true);
+    expect(world.executed).toContain("act:queue:lemons-puppets");
+    expect(world.executed).not.toContain("act:play:lemons-puppets");
+  });
+
+  it("queue_by_id immediate:true plays now (Play Now)", async () => {
+    const server = buildServer();
+    const { json } = await call(server, "queue_by_id", { track_id: "95206613", immediate: true });
     expect(json.ok).toBe(true);
     expect(world.executed).toContain("act:play:lemons-puppets");
   });

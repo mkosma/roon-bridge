@@ -105,7 +105,12 @@ vi.mock("../src/roon-connection.js", () => ({
       change_settings: (_z: unknown, _s: unknown, cb: () => void) => cb(),
     })),
     findZoneOrThrow: vi.fn(() => ({ zone_id: "zone-1", display_name: "WiiM + 1" })),
+    findZone: vi.fn(() => ({ zone_id: "zone-1", display_name: "WiiM + 1" })),
     getQueueSnapshot: vi.fn(async () => []),
+    // play_playlist now routes through the deferral machinery (immediate gate),
+    // which cancels any armed deferral via source.on/off.
+    on: vi.fn(),
+    off: vi.fn(),
   },
 }));
 

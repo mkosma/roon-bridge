@@ -216,6 +216,26 @@ describe("queue_version", () => {
     expect(world.executed).toContain("act:queue:live");
   });
 
+  it("immediate:true plays now (Play Now), not a queue add", async () => {
+    const server = buildServer();
+    const ref = await refFor(server, (c) => c.subtitle?.includes("I Just Can't Stop It"));
+    const { isError, json } = await call(server, "queue_version", { ref, immediate: true });
+    expect(isError).toBe(false);
+    expect(json.ok).toBe(true);
+    expect(json.when).toBe("now");
+    expect(world.executed).toContain("act:play:studio");
+    expect(world.executed).not.toContain("act:queue:studio");
+  });
+
+  it("SAFE DEFAULT: a stray when:'now' without immediate is downgraded to a queue add (never cuts)", async () => {
+    const server = buildServer();
+    const ref = await refFor(server, (c) => c.subtitle?.includes("I Just Can't Stop It"));
+    const { json } = await call(server, "queue_version", { ref, when: "now" });
+    expect(json.ok).toBe(true);
+    expect(world.executed).toContain("act:queue:studio");
+    expect(world.executed).not.toContain("act:play:studio");
+  });
+
   it("'next' uses Add Next", async () => {
     const server = buildServer();
     const ref = await refFor(server, (c) => c.subtitle?.includes("I Just Can't Stop It"));

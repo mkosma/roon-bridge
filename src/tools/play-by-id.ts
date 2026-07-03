@@ -975,29 +975,43 @@ export function registerPlayByIdTools(server: McpServer): void {
   const trackIdArg = z.string().describe("Provider track ID from search_tracks / find_versions (e.g. a Qobuz track id).");
   const providerArg = z.enum(["qobuz", "tidal"]).optional().describe("Music provider; defaults to the configured default.");
   const zoneArg = z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted).");
+  // The uniform interrupt gate (see browse.ts). `immediate` is the ONLY switch
+  // that authorizes cutting the current track; without it the tool never plays
+  // 'now'. A stray when:'now' is downgraded to the safe default unless immediate.
+  const immediateArg = z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      "Interrupt/replace the currently-playing track RIGHT NOW (play-now / replace-and-play-from-first). Default false = never cut the current track (uses `when` for non-interrupting placement).",
+    );
 
   server.tool(
     "queue_by_id",
-    "Queue the EXACT track identified by a provider track ID (from search_tracks), bypassing fuzzy name search. Resolves the ID to authoritative title/artist/album, pins the exact Roon recording (artist-scoped, album-disambiguated - solves the same-artist/two-albums case that queue_version refuses), runs the action, and verifies the queue actually grew. when: 'queue' adds to end (default), 'next' plays after current, 'now' plays immediately.",
+    "Queue the EXACT track identified by a provider track ID (from search_tracks), bypassing fuzzy name search. Resolves the ID to authoritative title/artist/album, pins the exact Roon recording (artist-scoped, album-disambiguated - solves the same-artist/two-albums case that queue_version refuses), runs the action, and verifies the queue actually grew. SAFE DEFAULT: never cuts the current track. when: 'queue' adds to end (default), 'next' plays after current. To play immediately (replacing the current track), pass immediate:true.",
     {
       track_id: trackIdArg,
       provider: providerArg,
       zone: zoneArg,
-      when: z.enum(["queue", "next", "now"]).default("queue").describe("'queue' adds to end (default); 'next' after current; 'now' immediately."),
+      immediate: immediateArg,
+      when: z.enum(["queue", "next"]).default("queue").describe("Non-interrupting placement: 'queue' adds to end (default); 'next' after current. Ignored when immediate:true."),
     },
-    async ({ track_id, provider, zone, when }) => queueOrPlayById(track_id, provider, zone, when ?? "queue"),
+    async ({ track_id, provider, zone, immediate, when }) =>
+      queueOrPlayById(track_id, provider, zone, immediate ? "now" : (when === "next" ? "next" : "queue")),
   );
 
   server.tool(
     "play_by_id",
-    "Play the EXACT track identified by a provider track ID (from search_tracks) immediately, bypassing fuzzy name search. Same deterministic ID->exact-recording resolution as queue_by_id; defaults to playing now. Use when='next'/'queue' to enqueue instead.",
+    "Play the EXACT track identified by a provider track ID (from search_tracks), bypassing fuzzy name search. Same deterministic ID->exact-recording resolution as queue_by_id. SAFE DEFAULT: does NOT cut the current track - it plays after current (when='next', default). Pass immediate:true to play it RIGHT NOW, replacing the current track. Use when='queue' to append instead.",
     {
       track_id: trackIdArg,
       provider: providerArg,
       zone: zoneArg,
-      when: z.enum(["now", "next", "queue"]).default("now").describe("'now' plays immediately (default); 'next' after current; 'queue' adds to end."),
+      immediate: immediateArg,
+      when: z.enum(["next", "queue"]).default("next").describe("Non-interrupting placement: 'next' after current (default); 'queue' adds to end. Ignored when immediate:true."),
     },
-    async ({ track_id, provider, zone, when }) => queueOrPlayById(track_id, provider, zone, when ?? "now"),
+    async ({ track_id, provider, zone, immediate, when }) =>
+      queueOrPlayById(track_id, provider, zone, immediate ? "now" : (when === "queue" ? "queue" : "next")),
   );
 
   const trackIdsArg = z
@@ -1007,31 +1021,35 @@ export function registerPlayByIdTools(server: McpServer): void {
 
   server.tool(
     "queue_tracks",
-    "Queue an ORDERED list of EXACT tracks by provider track ID, in ONE atomic call - the sequenced-set primitive single queue_by_id calls cannot do safely. Each ID is resolved to its exact Roon recording (same deterministic resolver as queue_by_id), then the set is enqueued so it lands CONTIGUOUS and IN THE GIVEN ORDER (built via race-free append-to-tail, never a racy reverse-next). Honest per-track status: a track that fails to resolve is flagged with its index and reason, never silently dropped; the rest still queue in correct relative order (best-effort). when: 'next' (default) places the set right after the current track; 'queue' appends to the end; 'now' replaces and plays from the first; 'after_current' waits for the current track to end (event-driven, robust to pause/seek/skip) then plays the set, discarding the prior queue. Limit: with 'next' and items ALREADY queued after the current track, Roon has no race-free insert-between primitive - if the current track has time left the set is inserted after it (reverse Add-Next, verified), otherwise it is appended in order at the tail; see strategy/anchor fields in the return.",
+    "Queue an ORDERED list of EXACT tracks by provider track ID, in ONE atomic call - the sequenced-set primitive single queue_by_id calls cannot do safely. Each ID is resolved to its exact Roon recording (same deterministic resolver as queue_by_id), then the set is enqueued so it lands CONTIGUOUS and IN THE GIVEN ORDER (built via race-free append-to-tail, never a racy reverse-next). Honest per-track status: a track that fails to resolve is flagged with its index and reason, never silently dropped; the rest still queue in correct relative order (best-effort). SAFE DEFAULT: never cuts the current track. when: 'next' (default) places the set right after the current track; 'queue' appends to the end; 'after_current' waits for the current track to end (event-driven, robust to pause/seek/skip) then plays the set, discarding the prior queue. To replace-and-play from the first track RIGHT NOW, pass immediate:true. Limit: with 'next' and items ALREADY queued after the current track, Roon has no race-free insert-between primitive - if the current track has time left the set is inserted after it (reverse Add-Next, verified), otherwise it is appended in order at the tail; see strategy/anchor fields in the return.",
     {
       track_ids: trackIdsArg,
       provider: providerArg,
       zone: zoneArg,
+      immediate: immediateArg,
       when: z
-        .enum(["queue", "next", "now", "after_current"])
+        .enum(["queue", "next", "after_current"])
         .default("next")
-        .describe("'next' (default) after current; 'queue' to the end; 'now' replace+play; 'after_current' deferred replace at the track seam."),
+        .describe("Non-interrupting placement: 'next' (default) after current; 'queue' to the end; 'after_current' deferred replace at the track seam. Ignored when immediate:true."),
     },
-    async ({ track_ids, provider, zone, when }) => queueOrPlayTracks(track_ids, provider, zone, when ?? "next"),
+    async ({ track_ids, provider, zone, immediate, when }) =>
+      queueOrPlayTracks(track_ids, provider, zone, immediate ? "now" : (when === "queue" || when === "after_current" ? when : "next")),
   );
 
   server.tool(
     "play_tracks",
-    "Play an ORDERED list of EXACT tracks by provider track ID immediately, in ONE call. Same deterministic ID->exact-recording resolution and ordered, honest-status behavior as queue_tracks; defaults to when='now' (replace the queue and play from the first track, the rest following in order). Use when='next'/'queue'/'after_current' to enqueue instead.",
+    "Play an ORDERED list of EXACT tracks by provider track ID, in ONE call. Same deterministic ID->exact-recording resolution and ordered, honest-status behavior as queue_tracks. SAFE DEFAULT: does NOT cut the current track - the set plays after current (when='next', default). Pass immediate:true to replace the queue and play from the first track RIGHT NOW, the rest following in order. Use when='queue'/'after_current' to enqueue instead.",
     {
       track_ids: trackIdsArg,
       provider: providerArg,
       zone: zoneArg,
+      immediate: immediateArg,
       when: z
-        .enum(["now", "next", "queue", "after_current"])
-        .default("now")
-        .describe("'now' (default) replace+play from first; 'next' after current; 'queue' to the end; 'after_current' deferred replace at the track seam."),
+        .enum(["next", "queue", "after_current"])
+        .default("next")
+        .describe("Non-interrupting placement: 'next' after current (default); 'queue' to the end; 'after_current' deferred replace at the track seam. Ignored when immediate:true."),
     },
-    async ({ track_ids, provider, zone, when }) => queueOrPlayTracks(track_ids, provider, zone, when ?? "now"),
+    async ({ track_ids, provider, zone, immediate, when }) =>
+      queueOrPlayTracks(track_ids, provider, zone, immediate ? "now" : (when === "queue" || when === "after_current" ? when : "next")),
   );
 }
