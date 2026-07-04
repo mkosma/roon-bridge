@@ -246,14 +246,34 @@ describe("queue_tracks / play_tracks (ordered batch enqueue)", () => {
     expect(titles()).toEqual(["Current", "Track One", "Track Two", "Track Three"]);
   });
 
-  it("play_tracks when='now' replaces the queue and plays from the first, rest in order", async () => {
+  it("play_tracks immediate:true replaces the queue and plays from the first, rest in order", async () => {
     reset(["Current", "Old"]);
     const server = buildServer();
-    const { json } = await call(server, "play_tracks", { track_ids: ["3", "4", "5"] });
+    const { json } = await call(server, "play_tracks", { track_ids: ["3", "4", "5"], immediate: true });
     expect(json.ok).toBe(true);
     expect(json.when).toBe("now");
     expect(titles()).toEqual(["Track Three", "Track Four", "Track Five"]);
     expect(executed[0]).toBe("act:play:3");
+  });
+
+  it("play_tracks SAFE DEFAULT (no immediate) does NOT replace/cut - it adds after current", async () => {
+    reset(["Current"]); // playing, empty upcoming
+    const server = buildServer();
+    const { json } = await call(server, "play_tracks", { track_ids: ["3", "4", "5"] });
+    expect(json.ok).toBe(true);
+    expect(json.when).toBe("next");
+    // No Play Now; the current track keeps playing and the set lands after it.
+    expect(executed).not.toContain("act:play:3");
+    expect(titles()).toEqual(["Current", "Track Three", "Track Four", "Track Five"]);
+  });
+
+  it("queue_tracks stray when:'now' without immediate is downgraded to the safe default (never cuts)", async () => {
+    reset(["Current"]);
+    const server = buildServer();
+    const { json } = await call(server, "queue_tracks", { track_ids: ["3", "4", "5"], when: "now" });
+    expect(json.ok).toBe(true);
+    expect(json.when).toBe("next");
+    expect(executed).not.toContain("act:play:3");
   });
 
   it("partial failure: a bogus id is flagged by index, the rest queue in correct relative order", async () => {

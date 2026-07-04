@@ -306,7 +306,7 @@ async function runRebuild(
 export function registerEditQueueTools(server: McpServer): void {
   server.tool(
     "edit_queue",
-    "Delete and/or reorder UPCOMING queue items by their stable queue_item_id (from get_queue), via a safe rebuild. Roon exposes no native queue delete/reorder, so this rebuilds the upcoming queue: by default it waits for the current track to END (event-driven, no mid-track cut), then starts the first edited track and re-appends the rest IN ORDER, re-queueing the EXACT same recordings via provider ids captured at enqueue time. If the user or anything else changes the queue/playback while it waits, it ABORTS cleanly rather than fighting. Use when='now' to rebuild immediately (cuts the current track). Returns the before/after plan and verification.",
+    "Delete and/or reorder UPCOMING queue items by their stable queue_item_id (from get_queue), via a safe rebuild. Roon exposes no native queue delete/reorder, so this rebuilds the upcoming queue: SAFE DEFAULT: it waits for the current track to END (event-driven, no mid-track cut), then starts the first edited track and re-appends the rest IN ORDER, re-queueing the EXACT same recordings via provider ids captured at enqueue time. If the user or anything else changes the queue/playback while it waits, it ABORTS cleanly rather than fighting. Pass immediate:true to rebuild RIGHT NOW (cuts the current track). Returns the before/after plan and verification.",
     {
       delete: z
         .array(z.coerce.number().int())
@@ -318,13 +318,16 @@ export function registerEditQueueTools(server: McpServer): void {
         .optional()
         .describe("Desired order of the remaining upcoming queue_item_ids (a permutation of the ids left after deletion). Omit to keep current order."),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)."),
-      when: z
-        .enum(["after_current", "now"])
-        .default("after_current")
-        .describe("'after_current' (default) rebuilds when the current track ends; 'now' rebuilds immediately (cuts the current track)."),
+      immediate: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Rebuild the queue RIGHT NOW, cutting the current track. Default false = wait for the current track to end (no mid-track cut)."),
     },
-    async ({ delete: del, reorder, zone, when }): Promise<ToolResult> => {
+    async ({ delete: del, reorder, zone, immediate }): Promise<ToolResult> => {
       try {
+        // `immediate` is the sole switch that authorizes cutting the current track.
+        const when: "after_current" | "now" = immediate ? "now" : "after_current";
         const z = roonConnection.findZoneOrThrow(zone);
         const rows = await readQueueRows(z);
         if (!rows.length) {

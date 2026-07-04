@@ -160,7 +160,7 @@ describe("large-queue replace verify (BUG B)", () => {
   it("does NOT report order_verified=true when a large replace drops tracks", async () => {
     reset({ dropTail: true });
     const server = buildServer();
-    const { isError, json } = await call(server, "play_tracks", { track_ids: ["1", "2", "3", "4", "5"] });
+    const { isError, json } = await call(server, "play_tracks", { track_ids: ["1", "2", "3", "4", "5"], immediate: true });
     // Settled reality: only 2 of 5 landed. The verify must reflect that, not the
     // transient full-block snapshot.
     expect(json.count_queued).toBe(2);
@@ -172,7 +172,7 @@ describe("large-queue replace verify (BUG B)", () => {
   it("reports success when the replace settles to the full block", async () => {
     reset({ dropTail: false });
     const server = buildServer();
-    const { isError, json } = await call(server, "play_tracks", { track_ids: ["1", "2", "3", "4", "5"] });
+    const { isError, json } = await call(server, "play_tracks", { track_ids: ["1", "2", "3", "4", "5"], immediate: true });
     expect(json.count_queued).toBe(5);
     expect(json.order_verified).toBe(true);
     expect(json.ok).toBe(true);

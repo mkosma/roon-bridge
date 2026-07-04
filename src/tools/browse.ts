@@ -1222,7 +1222,7 @@ async function searchAndPlay(
 async function playWithWhen(
   query: string,
   zoneName: string,
-  category: "album" | "track",
+  category: string,
   when: "now" | "after_current",
   shuffle = false,
 ): Promise<ToolResult> {
@@ -1258,6 +1258,21 @@ async function playWithWhen(
   deferredPlayer.cancel();
   return searchAndPlay(query, zoneName, category, playActionType);
 }
+
+/**
+ * The single, uniform interrupt gate shared by every playback tool. `immediate`
+ * is the ONLY switch that authorizes stopping/replacing the currently-playing
+ * track. Default false = never cut the current track: play after it ends (for
+ * replace-style tools) or append (for queue-style tools). This is the poka-yoke:
+ * the safe behavior is the default and interrupting is an explicit opt-in.
+ */
+const immediateArg = z
+  .boolean()
+  .optional()
+  .default(false)
+  .describe(
+    "Interrupt/replace the currently-playing track RIGHT NOW. Default false = never cut the current track (plays after it ends / appends to the queue).",
+  );
 
 export function registerBrowseTools(server: McpServer): void {
   server.tool(
@@ -1393,67 +1408,65 @@ export function registerBrowseTools(server: McpServer): void {
 
   server.tool(
     "play_artist",
-    "Search for an artist and start playing their music in a Roon zone. shuffle=true executes Roon's native Shuffle action; if the matched artist exposes no Shuffle action, it falls back to Play Now and the result text says so.",
+    "Search for an artist and start playing their music in a Roon zone. SAFE DEFAULT: does NOT cut the current track - it plays the artist after the current track ends (server-side, event-driven, no mid-track cut). Pass immediate:true to start the artist RIGHT NOW, replacing the current track. shuffle=true executes Roon's native Shuffle action; if the matched artist exposes no Shuffle action, it falls back to Play Now and the result text says so.",
     {
       artist: z.string().describe("Artist name to search for"),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
+      immediate: immediateArg,
       shuffle: z
         .boolean()
         .optional()
         .default(false)
         .describe("Play in shuffled order via Roon's native Shuffle action (default false)"),
     },
-    async ({ artist, zone, shuffle }) =>
-      searchAndPlay(artist, zone, "artist", shuffle ? "shuffle" : "play"),
+    async ({ artist, zone, immediate, shuffle }) =>
+      playWithWhen(artist, zone, "artist", immediate ? "now" : "after_current", shuffle ?? false),
   );
 
   server.tool(
     "play_album",
-    "Search for an album and play it in a Roon zone. when='now' (default) replaces the queue immediately; when='after_current' defers the replace until the current track ends - server-side and event-driven, so the queue stays clean and the playing track is never cut mid-way.",
+    "Search for an album and play it in a Roon zone. SAFE DEFAULT: does NOT cut the current track - the album replaces the queue only after the current track ends (server-side, event-driven, so the queue stays clean and the playing track is never cut mid-way). Pass immediate:true to replace the queue and play the album RIGHT NOW.",
     {
       album: z.string().describe("Album name to search for"),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
-      when: z
-        .enum(["now", "after_current"])
-        .default("now")
-        .describe("'now' replaces immediately; 'after_current' waits for the current track to end, then replaces"),
+      immediate: immediateArg,
       shuffle: z
         .boolean()
         .optional()
         .default(false)
         .describe("Play in shuffled order via Roon's native Shuffle action (default false = album order)"),
     },
-    async ({ album, zone, when, shuffle }) => playWithWhen(album, zone, "album", when ?? "now", shuffle ?? false),
+    async ({ album, zone, immediate, shuffle }) =>
+      playWithWhen(album, zone, "album", immediate ? "now" : "after_current", shuffle ?? false),
   );
 
   server.tool(
     "play_playlist",
-    "Search for a playlist and start playing it in a Roon zone. shuffle=true executes Roon's native Shuffle action (random track order, no extra transport events); if the matched playlist exposes no Shuffle action, it falls back to Play Now and the result text says so.",
+    "Search for a playlist and start playing it in a Roon zone. SAFE DEFAULT: does NOT cut the current track - the playlist starts after the current track ends (server-side, event-driven, no mid-track cut). Pass immediate:true to replace the queue and start the playlist RIGHT NOW. shuffle=true executes Roon's native Shuffle action (random track order, no extra transport events); if the matched playlist exposes no Shuffle action, it falls back to Play Now and the result text says so.",
     {
       playlist: z.string().describe("Playlist name to search for"),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
+      immediate: immediateArg,
       shuffle: z
         .boolean()
         .optional()
         .default(false)
         .describe("Play in shuffled order via Roon's native Shuffle action (default false = playlist order)"),
     },
-    async ({ playlist, zone, shuffle }) =>
-      searchAndPlay(playlist, zone, "playlist", shuffle ? "shuffle" : "play"),
+    async ({ playlist, zone, immediate, shuffle }) =>
+      playWithWhen(playlist, zone, "playlist", immediate ? "now" : "after_current", shuffle ?? false),
   );
 
   server.tool(
     "play_track",
-    "Search for a specific track/song and play it in a Roon zone. when='now' (default) replaces the queue immediately; when='after_current' defers the replace until the current track ends - server-side and event-driven, so the queue stays clean and the playing track is never cut mid-way.",
+    "Search for a specific track/song and play it in a Roon zone. SAFE DEFAULT: does NOT cut the current track - it plays after the current track ends (server-side, event-driven, so the queue stays clean and the playing track is never cut mid-way). Pass immediate:true to replace the queue and play the track RIGHT NOW.",
     {
       track: z.string().describe("Track/song name to search for"),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
-      when: z
-        .enum(["now", "after_current"])
-        .default("now")
-        .describe("'now' replaces immediately; 'after_current' waits for the current track to end, then replaces"),
+      immediate: immediateArg,
     },
-    async ({ track, zone, when }) => playWithWhen(track, zone, "track", when ?? "now"),
+    async ({ track, zone, immediate }) =>
+      playWithWhen(track, zone, "track", immediate ? "now" : "after_current"),
   );
 
   server.tool(

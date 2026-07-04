@@ -149,6 +149,11 @@ vi.mock("../src/roon-connection.js", () => ({
       const idx = world.queue.findIndex((q) => q.queue_item_id === id);
       if (idx > 0) world.queue = world.queue.slice(idx);
     }),
+    // play_from_here now defers by default via the DeferredPlayer, which
+    // subscribes/unsubscribes on the connection and reads the zone.
+    findZone: vi.fn(() => makeZone()),
+    on: vi.fn(),
+    off: vi.fn(),
   },
 }));
 
@@ -241,12 +246,45 @@ describe("queue_next", () => {
 describe("play_from_here", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("jumps to a valid queued id and verifies", async () => {
+  it("immediate:true jumps to a valid queued id right now and verifies", async () => {
+    resetWorld({ queue: [qi(1, "A"), qi(2, "B"), qi(3, "C")] });
+    const server = buildServer();
+    const { isError, json } = await call(server, "play_from_here", { queue_item_id: 2, immediate: true });
+    expect(isError).toBe(false);
+    expect(json.ok).toBe(true);
+    expect(json.scheduled).toBeUndefined();
+    expect(world.queue[0].queue_item_id).toBe(2);
+    expect(roonConnection.playFromHere).toHaveBeenCalledTimes(1);
+  });
+
+  it("SAFE DEFAULT (no immediate) with a track playing does NOT jump now - it arms a deferred jump", async () => {
+    // A zone with a real now-playing track (so there is a seam to wait for).
+    const playingWithTrack = {
+      zone_id: "zone-1",
+      display_name: "WiiM + 1",
+      state: "playing",
+      outputs: [],
+      now_playing: { three_line: { line1: "Current" }, length: 200, seek_position: 10 },
+    } as unknown as Zone;
+    (roonConnection.findZoneOrThrow as unknown as ReturnType<typeof vi.fn>).mockReturnValueOnce(playingWithTrack);
     resetWorld({ queue: [qi(1, "A"), qi(2, "B"), qi(3, "C")] });
     const server = buildServer();
     const { isError, json } = await call(server, "play_from_here", { queue_item_id: 2 });
     expect(isError).toBe(false);
     expect(json.ok).toBe(true);
+    expect(json.scheduled).toBe(true);
+    // The jump has NOT happened: the current track was not cut.
+    expect(roonConnection.playFromHere).not.toHaveBeenCalled();
+    expect(world.queue[0].queue_item_id).toBe(1);
+  });
+
+  it("SAFE DEFAULT with nothing playing (no seam) jumps now", async () => {
+    resetWorld({ state: "stopped", queue: [qi(1, "A"), qi(2, "B")] });
+    const server = buildServer();
+    const { isError, json } = await call(server, "play_from_here", { queue_item_id: 2 });
+    expect(isError).toBe(false);
+    expect(json.ok).toBe(true);
+    expect(json.scheduled).toBeUndefined();
     expect(world.queue[0].queue_item_id).toBe(2);
   });
 

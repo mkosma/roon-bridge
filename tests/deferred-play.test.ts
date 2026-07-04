@@ -269,7 +269,7 @@ async function waitFor(cond: () => boolean, timeoutMs = 500): Promise<void> {
   }
 }
 
-describe("play_album when='after_current' (tool integration)", () => {
+describe("default-safe playback: the immediate gate (browse play tools)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     world.executed = [];
@@ -277,30 +277,39 @@ describe("play_album when='after_current' (tool integration)", () => {
     mockConn.zone = playingZone("Now Playing", 100, 0);
   });
 
-  it("defers the replace until the track ends, then executes Play Now", async () => {
-    const server = buildServer();
-    const { isError, text } = await call(server, "play_album", { album: "Some Album", when: "after_current" });
+  // Each browse play tool: WITHOUT immediate, a playing track is never cut - the
+  // pick is deferred to the track seam. WITH immediate:true, it plays now.
+  for (const [tool, arg] of [
+    ["play_album", "album"],
+    ["play_track", "track"],
+    ["play_artist", "artist"],
+    ["play_playlist", "playlist"],
+  ] as const) {
+    it(`${tool} SAFE DEFAULT (no immediate) does NOT cut the current track - it defers to the seam`, async () => {
+      const server = buildServer();
+      const { isError, text } = await call(server, tool, { [arg]: "Some Album" });
 
-    expect(isError).toBe(false);
-    expect(text).toContain("Scheduled");
-    // The browse Play Now must NOT have run yet.
-    expect(world.executed).not.toContain("act:play");
+      expect(isError).toBe(false);
+      expect(text).toContain("Scheduled");
+      // The browse Play Now must NOT have run yet - the playing track is intact.
+      expect(world.executed).not.toContain("act:play");
 
-    // Drive the track to its end, then change track -> natural seam.
-    if (mockConn.zone.now_playing) mockConn.zone.now_playing.seek_position = 96;
-    mockConn.emit("zone-seek", "zone-1");
-    mockConn.zone = playingZone("Next Track", 100, 0);
-    mockConn.emit("zones-changed");
+      // Drive the current track to its natural end -> the deferred pick fires.
+      if (mockConn.zone.now_playing) mockConn.zone.now_playing.seek_position = 96;
+      mockConn.emit("zone-seek", "zone-1");
+      mockConn.zone = playingZone("Next Track", 100, 0);
+      mockConn.emit("zones-changed");
 
-    await waitFor(() => world.executed.includes("act:play"));
-  });
+      await waitFor(() => world.executed.includes("act:play"));
+    });
 
-  it("when='now' replaces immediately", async () => {
-    const server = buildServer();
-    const { isError, text } = await call(server, "play_album", { album: "Some Album", when: "now" });
+    it(`${tool} immediate:true replaces and plays right now`, async () => {
+      const server = buildServer();
+      const { isError, text } = await call(server, tool, { [arg]: "Some Album", immediate: true });
 
-    expect(isError).toBe(false);
-    expect(text).toContain("Now playing");
-    expect(world.executed).toContain("act:play");
-  });
+      expect(isError).toBe(false);
+      expect(text).toContain("Now playing");
+      expect(world.executed).toContain("act:play");
+    });
+  }
 });

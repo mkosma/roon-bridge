@@ -234,17 +234,25 @@ export function registerVersionTools(server: McpServer): void {
   // ---------------------------------------------------------------------------
   server.tool(
     "queue_version",
-    "Queue (or play) the EXACT recording identified by a `ref` from find_versions. Re-resolves the ref deterministically by exact title+subtitle match - not a fuzzy top pick - then runs the chosen action and verifies the queue actually grew. Use this to pin the studio cut after find_versions shows live/comp variants.",
+    "Queue (or play) the EXACT recording identified by a `ref` from find_versions. Re-resolves the ref deterministically by exact title+subtitle match - not a fuzzy top pick - then runs the chosen action and verifies the queue actually grew. Use this to pin the studio cut after find_versions shows live/comp variants. SAFE DEFAULT: never cuts the current track. when: 'queue' adds to end (default), 'next' plays after the current track. To play immediately (replacing the current track), pass immediate:true.",
     {
       ref: z.string().describe("A candidate `ref` returned by find_versions."),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)."),
+      immediate: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("Interrupt/replace the currently-playing track RIGHT NOW. Default false = never cut the current track (uses `when` for non-interrupting placement)."),
       when: z
-        .enum(["queue", "next", "now"])
+        .enum(["queue", "next"])
         .default("queue")
-        .describe("'queue' adds to end (default); 'next' plays after the current track; 'now' plays immediately."),
+        .describe("Non-interrupting placement: 'queue' adds to end (default); 'next' plays after the current track. Ignored when immediate:true."),
     },
-    async ({ ref, zone, when }): Promise<ToolResult> => {
+    async ({ ref, zone, immediate, when: whenArg }): Promise<ToolResult> => {
       try {
+        // `immediate` is the ONLY switch that authorizes cutting the current
+        // track; without it a stray 'now' is downgraded to the safe placement.
+        const when: "queue" | "next" | "now" = immediate ? "now" : whenArg === "next" ? "next" : "queue";
         const decoded = decodeRef(ref);
         if (!decoded) return jsonResult({ ok: false, error: "bad_ref", detail: "ref did not decode; get a fresh one from find_versions." }, true);
 

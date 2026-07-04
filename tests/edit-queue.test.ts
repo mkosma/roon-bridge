@@ -272,10 +272,10 @@ function seedQueue() {
 describe("edit_queue tool (integration)", () => {
   beforeEach(() => { vi.clearAllMocks(); lastBrowse = "root"; lastInput = ""; });
 
-  it("when='now': deletes Gamma and reorders to [Delta, Beta], replaying EXACT provider ids", async () => {
+  it("immediate:true: deletes Gamma and reorders to [Delta, Beta], replaying EXACT provider ids", async () => {
     seedQueue();
     const server = buildServer();
-    const { isError, json } = await call(server, "edit_queue", { delete: [12], reorder: [13, 11], when: "now" });
+    const { isError, json } = await call(server, "edit_queue", { delete: [12], reorder: [13, 11], immediate: true });
 
     expect(isError).toBe(false);
     expect(json.ok).toBe(true);
@@ -342,11 +342,21 @@ describe("edit_queue tool (integration)", () => {
     expect(world.queue.map((q) => q.three_line!.line1)).toEqual(["Beta", "Delta"]);
   });
 
+  it("SAFE DEFAULT (no immediate) arms a deferred rebuild - does not cut the current track", async () => {
+    seedQueue();
+    const server = buildServer();
+    const { json } = await call(server, "edit_queue", { delete: [12] });
+    // Default is after_current: armed, nothing executed yet, current track intact.
+    expect(json.scheduled).toBe(true);
+    expect(json.when).toBe("after_current");
+    expect(world.executed).toHaveLength(0);
+  });
+
   it("falls back to title+artist re-resolution and flags items without provenance", async () => {
     seedQueue();
     queueProvenance.forget(13); // Delta queued by the GUI - no provider id.
     const server = buildServer();
-    const { json } = await call(server, "edit_queue", { reorder: [13, 11, 12], when: "now" });
+    const { json } = await call(server, "edit_queue", { reorder: [13, 11, 12], immediate: true });
     expect(json.ok).toBe(true);
     expect(json.plan.reresolved_count).toBe(1);
     const delta = json.plan.edited_upcoming.find((e: { title: string }) => e.title === "Delta");
