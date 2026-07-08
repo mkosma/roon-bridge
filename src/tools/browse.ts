@@ -15,6 +15,7 @@ import {
   type BrowseItem,
 } from "./search-core.js";
 import { deferredPlayer } from "../control/deferred-player-instance.js";
+import { resultingState, immediateBool } from "./resulting-state.js";
 import type RoonApiBrowse from "node-roon-api-browse";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
@@ -833,6 +834,7 @@ async function searchAndPlay(
   zoneName: string,
   category?: string,
   actionType: ActionType = "play",
+  opts: { minConfidence?: number } = {},
 ): Promise<ToolResult> {
   try {
     const browse = roonConnection.getBrowse();
@@ -941,6 +943,33 @@ async function searchAndPlay(
       };
     }
 
+    // Step 4b: Interrupt-confidence gate. When this call is a deliberate stomp
+    // (immediate / replace), a loose name match must NOT be allowed to replace
+    // the queue - that is the "Gas instead of Spoon" failure. Below the
+    // threshold, return the ranked candidates and play nothing.
+    if (opts.minConfidence != null && matchConfidence < opts.minConfidence) {
+      const candidates = ranked.slice(0, 5).map((c) => ({
+        title: c.item.title,
+        artist: c.artist || null,
+        confidence: Number(c.confidence.toFixed(2)),
+      }));
+      log("step4b-low-confidence-refuse", { query, matchConfidence, threshold: opts.minConfidence, candidates });
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            ok: false,
+            error: "low_confidence_replace",
+            detail: `Refused to replace the queue: the best match for "${query}" is "${matchedResult.title}" at ${Math.round(matchConfidence * 100)}% confidence, below the ${Math.round(opts.minConfidence * 100)}% required to stomp the current track. Pick an exact one below (or use queue_by_id / play_tracks with a provider ID).`,
+            query,
+            zone: zone.display_name,
+            candidates,
+          }, null, 2),
+        }],
+        isError: true,
+      };
+    }
+
     // Step 5: Get action list
     const actionData = await browseAndLoad(browse, {
       hierarchy,
@@ -1031,6 +1060,23 @@ async function searchAndPlay(
     let effectiveActionType = actionType;
     let shuffleUnavailable = false;
     let targetAction = findAction(actionItems, actionType);
+
+    // A play/shuffle action must change what is playing; capture the current
+    // now-playing so Step 8b can prove the flip (and not assert "Now playing"
+    // off a browse-action success that never touched the audio - the false
+    // "Now playing: The National" while Gidge kept playing).
+    //
+    // Capture from a FRESH zone read (not the `zone` snapshot taken at search
+    // start, which a natural track advance during the long browse walk could
+    // have staled), but do it HERE - after the search walk and BEFORE the
+    // shuffle-deeper probe below. findShuffleDeeper opens candidate action nodes,
+    // and browsing an action node executes it in Roon; capturing beforeNP after
+    // that would read the already-started track and mislabel a real play as
+    // unverified. This point is post-walk (fresh) yet pre-any-action-fire (true).
+    const isPlayAction = actionType !== "queue";
+    const beforeNP = isPlayAction
+      ? (roonConnection.findZone(zone.zone_id)?.now_playing?.three_line?.line1 ?? zone.now_playing?.three_line?.line1 ?? null)
+      : null;
 
     // Shuffle requested but not at level one (the search-result popup commonly
     // exposes only Play Now / Queue / Add Next). The native Shuffle action lives
@@ -1184,15 +1230,6 @@ async function searchAndPlay(
     }
 
     const subtitle = matchedResult.subtitle ? ` by ${stripRoonLinks(matchedResult.subtitle)}` : "";
-    // Report the path that actually executed, not the one requested. A shuffle
-    // request that found the native action says "Shuffling"; one that fell back
-    // says so explicitly, so we never assert "shuffled" when it wasn't.
-    const actionVerb =
-      actionType === "queue"
-        ? "Queued"
-        : effectiveActionType === "shuffle"
-          ? "Shuffling"
-          : "Now playing";
     const shuffleNote = shuffleUnavailable
       ? ` [shuffle unavailable for this item - no native Shuffle action; played in playlist order instead]`
       : "";
@@ -1201,8 +1238,96 @@ async function searchAndPlay(
       matchConfidence < 0.5 && runnerUp
         ? ` [loose match, ${confPct}% confidence; runner-up: "${runnerUp.title}"${runnerUp.artist ? ` - ${runnerUp.artist}` : ""}]`
         : ` [match confidence ${confPct}%]`;
+
+    // Step 8b: verify a PLAY/SHUFFLE actually changed what is playing. The
+    // browse action can return success while the zone never moves (the false-
+    // success class: "Now playing: The National" while Gidge kept playing).
+    // Poll the fresh zone until now-playing flips off the track that was playing
+    // before, then report from the STATE READ, not the match.
+    if (isPlayAction) {
+      let landedNP: string | null = null;
+      let sawNowPlaying = false;
+      let verified = false;
+      let playing = false;
+      const deadline = Date.now() + 2500;
+      for (;;) {
+        const z = roonConnection.findZone(zone.zone_id);
+        const np = z?.now_playing?.three_line?.line1 ?? null;
+        playing = z?.state === "playing" || z?.state === "loading" || z?.state == null;
+        if (np != null) {
+          sawNowPlaying = true;
+          landedNP = np;
+        }
+        // Flipped to a different track (or started from silence) while playing.
+        if (np != null && np !== beforeNP && playing) {
+          verified = true;
+          break;
+        }
+        if (Date.now() >= deadline) break;
+        await new Promise((r) => setTimeout(r, 150));
+      }
+
+      const resulting_state = await resultingState(zone);
+
+      // False success: now-playing WAS readable and it never left the track that
+      // was playing before. The action was acked but nothing changed - the exact
+      // failure this guard exists to catch. Refuse to claim success.
+      if (!verified && sawNowPlaying && beforeNP != null && landedNP === beforeNP) {
+        return {
+          content: [{
+            type: "text",
+            text:
+              `WARNING - not verified: the browse action for "${matchedResult.title}"${subtitle} in zone '${zone.display_name}' was accepted, but playback did NOT change (still "${beforeNP}"). The play did not land; confirm with now_playing.${confNote}\n` +
+              JSON.stringify({ ok: false, error: "play_not_verified", resulting_state }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
+      // From-silence no-start: nothing was playing before and the zone is still
+      // not in a playing state after the action - an affirmative "did not start"
+      // (a zone that IS playing but whose now-playing is momentarily unreadable
+      // stays on the soft/unobservable path below). So this is an isError, not a
+      // soft ok:true, verified:false.
+      if (!verified && beforeNP == null && !playing) {
+        return {
+          content: [{
+            type: "text",
+            text:
+              `WARNING - not verified: the browse action for "${matchedResult.title}"${subtitle} in zone '${zone.display_name}' was accepted, but nothing started playing (the zone was silent and stayed silent). The play did not land; confirm with now_playing.${confNote}\n` +
+              JSON.stringify({ ok: false, error: "play_not_verified", resulting_state }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
+      // Verified, or unverifiable because now-playing was not observable. Report
+      // the play from the state read; mark verified:false when unconfirmed rather
+      // than falsely claiming failure (mirrors the queue path's honesty).
+      const fresh = roonConnection.findZone(zone.zone_id);
+      const npTrack = fresh?.now_playing?.three_line?.line1 ?? landedNP ?? matchedResult.title;
+      const npArtist = fresh?.now_playing?.three_line?.line2 ? ` by ${stripRoonLinks(fresh.now_playing.three_line.line2)}` : subtitle;
+      const verb = effectiveActionType === "shuffle" ? "Shuffling" : "Now playing";
+      const unconfirmed = verified ? "" : " [playback state not observable; not verified]";
+      return {
+        content: [{
+          type: "text",
+          text:
+            `${verb}: "${npTrack}"${npArtist} in zone '${zone.display_name}'.${shuffleNote}${confNote}${unconfirmed}\n` +
+            JSON.stringify({ ok: true, verified, resulting_state }, null, 2),
+        }],
+      };
+    }
+
+    // Queue add: report the match; the queue growth was already verified above.
+    const resulting_state = await resultingState(zone);
     return {
-      content: [{ type: "text", text: `${actionVerb}: "${matchedResult.title}"${subtitle} in zone '${zone.display_name}'.${shuffleNote}${confNote}` }],
+      content: [{
+        type: "text",
+        text:
+          `Queued: "${matchedResult.title}"${subtitle} in zone '${zone.display_name}'.${confNote}\n` +
+          JSON.stringify({ ok: true, resulting_state }, null, 2),
+      }],
     };
   } catch (error) {
     return {
@@ -1225,6 +1350,7 @@ async function playWithWhen(
   category: string,
   when: "now" | "after_current",
   shuffle = false,
+  minConfidence?: number,
 ): Promise<ToolResult> {
   const playActionType: ActionType = shuffle ? "shuffle" : "play";
   if (when === "after_current") {
@@ -1254,9 +1380,10 @@ async function playWithWhen(
     // Nothing playing - no seam to wait for; play now.
   }
 
-  // An immediate play supersedes any armed deferral.
+  // An immediate play supersedes any armed deferral. The stomp is gated on match
+  // confidence when minConfidence is set (immediate / replace on a fuzzy tool).
   deferredPlayer.cancel();
-  return searchAndPlay(query, zoneName, category, playActionType);
+  return searchAndPlay(query, zoneName, category, playActionType, { minConfidence });
 }
 
 /**
@@ -1266,13 +1393,21 @@ async function playWithWhen(
  * replace-style tools) or append (for queue-style tools). This is the poka-yoke:
  * the safe behavior is the default and interrupting is an explicit opt-in.
  */
-const immediateArg = z
-  .boolean()
+const immediateArg = immediateBool
   .optional()
   .default(false)
   .describe(
-    "Interrupt/replace the currently-playing track RIGHT NOW. Default false = never cut the current track (plays after it ends / appends to the queue).",
+    "Interrupt/replace the currently-playing track RIGHT NOW. Default false = never cut the current track (plays after it ends / appends to the queue). A stomp is refused if the name match is below 90% confidence (the 'Gas instead of Spoon' guard). Prefer when:\"replace\" where available.",
   );
+
+/**
+ * Confidence a fuzzy name match must clear before an INTERRUPT (immediate /
+ * replace) is allowed to stomp the current track. Below this the tool returns
+ * the candidate list and plays nothing - a stomp may never ride on a loose
+ * match (the "Gas instead of Spoon" rule). The safe after-current default is
+ * NOT gated; only the deliberate stomp is.
+ */
+const REPLACE_MIN_CONFIDENCE = 0.9;
 
 export function registerBrowseTools(server: McpServer): void {
   server.tool(
@@ -1420,41 +1555,53 @@ export function registerBrowseTools(server: McpServer): void {
         .describe("Play in shuffled order via Roon's native Shuffle action (default false)"),
     },
     async ({ artist, zone, immediate, shuffle }) =>
-      playWithWhen(artist, zone, "artist", immediate ? "now" : "after_current", shuffle ?? false),
+      playWithWhen(artist, zone, "artist", immediate ? "now" : "after_current", shuffle ?? false, immediate ? REPLACE_MIN_CONFIDENCE : undefined),
   );
 
   server.tool(
     "play_album",
-    "Search for an album and play it in a Roon zone. SAFE DEFAULT: does NOT cut the current track - the album replaces the queue only after the current track ends (server-side, event-driven, so the queue stays clean and the playing track is never cut mid-way). Pass immediate:true to replace the queue and play the album RIGHT NOW.",
+    "Search for an album and play it in a Roon zone. SAFE DEFAULT: does NOT cut the current track - the album replaces the queue only after the current track ends (server-side, event-driven, so the queue stays clean and the playing track is never cut mid-way). when='replace' replaces the queue and plays the album RIGHT NOW (the harness-safe one-call stomp; immediate:true is the legacy equivalent). A stomp is refused if the album name match is below 90% confidence (candidates are returned instead).",
     {
       album: z.string().describe("Album name to search for"),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
       immediate: immediateArg,
+      when: z
+        .enum(["after_current", "replace"])
+        .default("after_current")
+        .describe("Placement: 'after_current' (default) replaces the queue when the current track ends (no mid-track cut); 'replace' does it RIGHT NOW. immediate:true forces replace."),
       shuffle: z
         .boolean()
         .optional()
         .default(false)
         .describe("Play in shuffled order via Roon's native Shuffle action (default false = album order)"),
     },
-    async ({ album, zone, immediate, shuffle }) =>
-      playWithWhen(album, zone, "album", immediate ? "now" : "after_current", shuffle ?? false),
+    async ({ album, zone, immediate, when, shuffle }) => {
+      const interrupt = immediate || when === "replace";
+      return playWithWhen(album, zone, "album", interrupt ? "now" : "after_current", shuffle ?? false, interrupt ? REPLACE_MIN_CONFIDENCE : undefined);
+    },
   );
 
   server.tool(
     "play_playlist",
-    "Search for a playlist and start playing it in a Roon zone. SAFE DEFAULT: does NOT cut the current track - the playlist starts after the current track ends (server-side, event-driven, no mid-track cut). Pass immediate:true to replace the queue and start the playlist RIGHT NOW. shuffle=true executes Roon's native Shuffle action (random track order, no extra transport events); if the matched playlist exposes no Shuffle action, it falls back to Play Now and the result text says so.",
+    "Search for a playlist and start playing it in a Roon zone. SAFE DEFAULT: does NOT cut the current track - the playlist starts after the current track ends (server-side, event-driven, no mid-track cut). when='replace' replaces the queue and starts the playlist RIGHT NOW (the harness-safe one-call stomp; immediate:true is the legacy equivalent). A stomp is refused if the playlist name match is below 90% confidence (candidates are returned instead). shuffle=true executes Roon's native Shuffle action (random track order, no extra transport events); if the matched playlist exposes no Shuffle action, it falls back to Play Now and the result text says so.",
     {
       playlist: z.string().describe("Playlist name to search for"),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
       immediate: immediateArg,
+      when: z
+        .enum(["after_current", "replace"])
+        .default("after_current")
+        .describe("Placement: 'after_current' (default) starts the playlist when the current track ends (no mid-track cut); 'replace' does it RIGHT NOW. immediate:true forces replace."),
       shuffle: z
         .boolean()
         .optional()
         .default(false)
         .describe("Play in shuffled order via Roon's native Shuffle action (default false = playlist order)"),
     },
-    async ({ playlist, zone, immediate, shuffle }) =>
-      playWithWhen(playlist, zone, "playlist", immediate ? "now" : "after_current", shuffle ?? false),
+    async ({ playlist, zone, immediate, when, shuffle }) => {
+      const interrupt = immediate || when === "replace";
+      return playWithWhen(playlist, zone, "playlist", interrupt ? "now" : "after_current", shuffle ?? false, interrupt ? REPLACE_MIN_CONFIDENCE : undefined);
+    },
   );
 
   server.tool(
@@ -1466,7 +1613,7 @@ export function registerBrowseTools(server: McpServer): void {
       immediate: immediateArg,
     },
     async ({ track, zone, immediate }) =>
-      playWithWhen(track, zone, "track", immediate ? "now" : "after_current"),
+      playWithWhen(track, zone, "track", immediate ? "now" : "after_current", false, immediate ? REPLACE_MIN_CONFIDENCE : undefined),
   );
 
   server.tool(

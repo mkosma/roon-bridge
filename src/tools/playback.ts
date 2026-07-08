@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { roonConnection } from "../roon-connection.js";
+import { resultingState } from "./resulting-state.js";
 
 export function registerPlaybackTools(server: McpServer): void {
   server.tool(
@@ -193,7 +194,7 @@ async function transportControl(
     const zone = roonConnection.findZoneOrThrow(zoneName);
 
     return new Promise((resolve) => {
-      transport.control(zone, control, (error) => {
+      transport.control(zone, control, async (error) => {
         if (error) {
           resolve({
             content: [{ type: "text", text: `Error: ${error}` }],
@@ -208,9 +209,13 @@ async function transportControl(
             next: "Skipped to next track",
             previous: "Went to previous track",
           };
+          const resulting_state = await resultingState(zone);
           resolve({
             content: [
-              { type: "text", text: `${actionMap[control]} in zone '${zone.display_name}'.` },
+              {
+                type: "text",
+                text: `${actionMap[control]} in zone '${zone.display_name}'.\n` + JSON.stringify({ ok: true, resulting_state }),
+              },
             ],
           });
         }

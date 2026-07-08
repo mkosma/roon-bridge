@@ -16,6 +16,10 @@ const world = {
   queue: [] as QueueItem[],
   executed: [] as string[],
   nextId: 3000,
+  // The zone's current now-playing title, read by findZone. Defaults to the
+  // track these tests play ("Puppets") so a Play Now verifies; a test can set it
+  // to a non-matching title to model an acked play that never flips.
+  nowPlaying: "Puppets" as string | null,
 };
 
 function qitem(title: string, artist: string): QueueItem {
@@ -118,7 +122,7 @@ vi.mock("../src/roon-connection.js", () => ({
     getBrowse: vi.fn(() => mockBrowse),
     getTransport: vi.fn(() => ({ change_settings: (_z: unknown, _s: unknown, cb: () => void) => cb() })),
     findZoneOrThrow: vi.fn(() => ({ zone_id: "zone-1", display_name: "WiiM + 1" })),
-    findZone: vi.fn(() => ({ zone_id: "zone-1", display_name: "WiiM + 1", now_playing: { three_line: { line1: "Puppets" } } })),
+    findZone: vi.fn(() => ({ zone_id: "zone-1", display_name: "WiiM + 1", state: "playing", now_playing: { three_line: { line1: world.nowPlaying } } })),
     getQueueSnapshot: vi.fn(async () => world.queue.slice()),
   },
 }));
@@ -149,13 +153,16 @@ async function call(server: unknown, name: string, args: Record<string, unknown>
   const tool = (server as any)._registeredTools[name];
   const res = await tool.handler(args, {});
   const text = res.content.map((c: { text: string }) => c.text).join("\n");
-  return { isError: res.isError === true, json: JSON.parse(text) };
+  // An unconfirmed play prepends a warning line ahead of the JSON tail; parse
+  // from the first brace so both shapes decode.
+  return { isError: res.isError === true, text, json: JSON.parse(text.slice(text.indexOf("{"))) };
 }
 
 function reset() {
   world.queue = [];
   world.executed = [];
   world.nextId = 3000;
+  world.nowPlaying = "Puppets";
   lastBrowse = "root";
   lastInput = "";
 }
@@ -199,6 +206,21 @@ describe("queue_by_id (album-anchored deterministic resolution)", () => {
     const { json } = await call(server, "play_by_id", { track_id: "95206613", immediate: true });
     expect(json.ok).toBe(true);
     expect(json.when).toBe("now");
+    expect(world.executed).toContain("act:play:lemons-puppets");
+  });
+
+  it("play_by_id immediate:true whose Play Now never flips now-playing is NOT success (warning-first, isError)", async () => {
+    const server = buildServer();
+    // The Play Now is acked and executes, but now-playing never becomes our
+    // recording - the false-success class. Verification reads the flip failed.
+    world.nowPlaying = "Something Else Entirely";
+    const { isError, text, json } = await call(server, "play_by_id", { track_id: "95206613", immediate: true });
+    expect(isError).toBe(true);
+    expect(json.ok).toBe(false);
+    expect(json.error).toBe("play_not_verified");
+    // The warning is the FIRST line of the text, not buried in the JSON.
+    expect(text).toMatch(/^WARNING - not verified/);
+    expect(text).toMatch(/did NOT change/);
     expect(world.executed).toContain("act:play:lemons-puppets");
   });
 

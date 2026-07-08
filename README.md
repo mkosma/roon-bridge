@@ -268,6 +268,31 @@ All the same tools as [roon-mcp](https://github.com/AzureStackNerd/roon-mcp):
   the studio cut by default - live takes, compilations, and tributes are
   demoted unless the query asks for one.
 
+### Replacing the queue and playing now (the deliberate stomp)
+
+Every play/queue tool is **safe by default**: it never cuts the current track.
+To deliberately interrupt and replace the queue RIGHT NOW, use **`when: "replace"`**
+- one intentional, single-valued stomp, string-typed so it survives a client
+that stringifies scalars (a plain `immediate: true` boolean can arrive as the
+string `"true"` and fail validation before the handler runs; `when: "replace"`
+never has that problem). `immediate: true` still works and now also accepts the
+strings `"true"`/`"false"`, but `when: "replace"` is the preferred form.
+
+- Deterministic ID tools - `play_tracks`, `queue_tracks`, `play_by_id`,
+  `queue_by_id`, `queue_version`: `when: "replace"` replaces the queue with the
+  exact requested content and plays from the first item, verified to land as
+  exactly that set (no leftover tail).
+- Fuzzy name tools - `play_album`, `play_playlist`: `when: "replace"` only
+  stomps when the name match is **>= 90% confidence**; below that it returns the
+  candidate list and plays nothing (a stomp may never ride on a loose match).
+
+Every mutating tool now appends a **`resulting_state`** block to its success
+payload - the post-action `now_playing`, `queue_head`/`queue_count`, `volume`,
+and `read_at` - so a caller does not need a follow-up `get_queue`/`now_playing`,
+and a claim of success always carries the state that backs it. A play action
+that Roon acks while playback never changes is reported as **not verified**
+(isError), never as a false "Now playing".
+
 ### Version selection (studio vs live, precise pick)
 
 The universal Roon search mixes studio, live, and compilation recordings of the
@@ -280,7 +305,8 @@ and pin an exact recording.
   the library (album/artist only - see note below).
 - `queue_version` - queue/play the EXACT recording named by a `ref` from
   `find_versions`, re-resolved by exact title+subtitle (never a fresh fuzzy
-  pick) and verified by queue growth. `when: queue|next|now`.
+  pick) and verified by queue growth. `when: queue|next|replace` (replace =
+  interrupt and replace the queue now).
 
 > Roon's browse API exposes only title/subtitle/item_key per row - no structured
 > year, format, or library-membership flag - and Roon's Focus filtering is
