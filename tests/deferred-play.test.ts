@@ -15,7 +15,12 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { EventEmitter } from "node:events";
 import type { Zone } from "node-roon-api-transport";
 import type { BrowseItem, BrowseResult, LoadResult } from "node-roon-api-browse";
-import { DeferredPlayer } from "../src/control/deferred-player.js";
+import { DeferredPlayer, type SeamOutcome } from "../src/control/deferred-player.js";
+import { deferralLedger } from "../src/control/deferral-ledger.js";
+
+// A no-op seam action that reports a clean, verified landing.
+const okOutcome: SeamOutcome = { ok: true, verified: true };
+const META = { zoneId: "zone-1", zoneName: "WiiM + 1", trigger: "end of X", description: "test action" };
 
 // ---------------------------------------------------------------------------
 // Part A: DeferredPlayer in isolation
@@ -52,27 +57,33 @@ function setSeek(src: FakeSource, seek: number) {
 }
 
 describe("DeferredPlayer", () => {
+  beforeEach(() => deferralLedger.reset());
+
   it("fires immediately when nothing is playing", async () => {
     const src = new FakeSource();
     src.zone = playingZone("X", 100, 0, "stopped");
     const player = new DeferredPlayer(src);
-    const action = vi.fn(async () => {});
+    const action = vi.fn(async () => okOutcome);
 
-    const res = await player.scheduleAfterCurrent(src.zone, action);
-    expect(res).toBe("fired");
+    const res = await player.scheduleAfterCurrent(src.zone, action, META);
+    expect(res.status).toBe("fired");
+    expect(res.deferral_id).toMatch(/^d-/);
     expect(action).toHaveBeenCalledTimes(1);
     expect(player.isArmed()).toBe(false);
+    // A fire-now verified action is recorded fired_verified.
+    expect(deferralLedger.get(res.deferral_id)?.status).toBe("fired_verified");
   });
 
   it("fires at a natural track end (outgoing track played to completion)", async () => {
     const src = new FakeSource();
     setTrack(src, "Track A", 100, 0);
     const player = new DeferredPlayer(src);
-    const action = vi.fn(async () => {});
+    const action = vi.fn(async () => okOutcome);
 
-    const res = await player.scheduleAfterCurrent(src.zone!, action);
-    expect(res).toBe("scheduled");
+    const res = await player.scheduleAfterCurrent(src.zone!, action, META);
+    expect(res.status).toBe("scheduled");
     expect(action).not.toHaveBeenCalled();
+    expect(deferralLedger.get(res.deferral_id)?.status).toBe("armed");
 
     // Progress to near the end, then the track changes -> natural end -> fire.
     setSeek(src, 90);
@@ -81,44 +92,41 @@ describe("DeferredPlayer", () => {
     src.emit("zones-changed");
 
     await Promise.resolve();
+    await Promise.resolve();
     expect(action).toHaveBeenCalledTimes(1);
     expect(player.isArmed()).toBe(false);
+    expect(deferralLedger.get(res.deferral_id)?.status).toBe("fired_verified");
   });
 
-  it("re-arms (does not fire) on a manual skip, then fires at the next natural end", async () => {
+  it("fires on a manual skip too (any advance past the trigger track fires it)", async () => {
     const src = new FakeSource();
     setTrack(src, "Track A", 100, 0);
     const player = new DeferredPlayer(src);
-    const action = vi.fn(async () => {});
+    const action = vi.fn(async () => okOutcome);
 
-    await player.scheduleAfterCurrent(src.zone!, action);
+    const res = await player.scheduleAfterCurrent(src.zone!, action, META);
 
-    // Skip early: only 20% elapsed when the track changes -> re-arm onto B.
+    // Skip early: only 20% elapsed when the track changes. The zone left the
+    // armed track, so the action fires now (was: silently re-armed onto B).
     setSeek(src, 20);
     src.emit("zone-seek", "zone-1");
     setTrack(src, "Track B", 100, 0);
     src.emit("zones-changed");
 
-    expect(action).not.toHaveBeenCalled();
-    expect(player.isArmed()).toBe(true);
-
-    // Now let B finish naturally.
-    setSeek(src, 95);
-    src.emit("zone-seek", "zone-1");
-    setTrack(src, "Track C", 100, 0);
-    src.emit("zones-changed");
-
+    await Promise.resolve();
     await Promise.resolve();
     expect(action).toHaveBeenCalledTimes(1);
+    expect(player.isArmed()).toBe(false);
+    expect(deferralLedger.get(res.deferral_id)?.status).toBe("fired_verified");
   });
 
   it("does not fire on a same-track change (pause/settings/queue edit)", async () => {
     const src = new FakeSource();
     setTrack(src, "Track A", 100, 30);
     const player = new DeferredPlayer(src);
-    const action = vi.fn(async () => {});
+    const action = vi.fn(async () => okOutcome);
 
-    await player.scheduleAfterCurrent(src.zone!, action);
+    await player.scheduleAfterCurrent(src.zone!, action, META);
 
     // A zones-changed that does NOT change the track (e.g. volume/settings).
     src.emit("zones-changed");
@@ -128,15 +136,16 @@ describe("DeferredPlayer", () => {
     expect(player.isArmed()).toBe(true);
   });
 
-  it("cancel() disarms so the boundary no longer fires", async () => {
+  it("cancel() disarms so the boundary no longer fires; records superseded", async () => {
     const src = new FakeSource();
     setTrack(src, "Track A", 100, 90);
     const player = new DeferredPlayer(src);
-    const action = vi.fn(async () => {});
+    const action = vi.fn(async () => okOutcome);
 
-    await player.scheduleAfterCurrent(src.zone!, action);
+    const res = await player.scheduleAfterCurrent(src.zone!, action, META);
     player.cancel();
     expect(player.isArmed()).toBe(false);
+    expect(deferralLedger.get(res.deferral_id)?.status).toBe("superseded");
 
     setTrack(src, "Track B", 100, 0);
     src.emit("zones-changed");
@@ -144,15 +153,16 @@ describe("DeferredPlayer", () => {
     expect(action).not.toHaveBeenCalled();
   });
 
-  it("a second schedule supersedes the first (only the latest fires)", async () => {
+  it("a second schedule supersedes the first (only the latest fires); first recorded superseded", async () => {
     const src = new FakeSource();
     setTrack(src, "Track A", 100, 90);
     const player = new DeferredPlayer(src);
-    const first = vi.fn(async () => {});
-    const second = vi.fn(async () => {});
+    const first = vi.fn(async () => okOutcome);
+    const second = vi.fn(async () => okOutcome);
 
-    await player.scheduleAfterCurrent(src.zone!, first);
-    await player.scheduleAfterCurrent(src.zone!, second);
+    const r1 = await player.scheduleAfterCurrent(src.zone!, first, META);
+    const r2 = await player.scheduleAfterCurrent(src.zone!, second, META);
+    expect(deferralLedger.get(r1.deferral_id)?.status).toBe("superseded");
 
     setSeek(src, 95);
     src.emit("zone-seek", "zone-1");
@@ -160,8 +170,10 @@ describe("DeferredPlayer", () => {
     src.emit("zones-changed");
 
     await Promise.resolve();
+    await Promise.resolve();
     expect(first).not.toHaveBeenCalled();
     expect(second).toHaveBeenCalledTimes(1);
+    expect(deferralLedger.get(r2.deferral_id)?.status).toBe("fired_verified");
   });
 });
 

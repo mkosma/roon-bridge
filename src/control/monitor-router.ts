@@ -32,7 +32,21 @@
 
 import { Router } from "express";
 import { roonConnection } from "../roon-connection.js";
+import { deferralLedger } from "./deferral-ledger.js";
 import type { Zone } from "node-roon-api-transport";
+
+// A compact deferral view for the monitor: the daemon (and Maya) can see, per
+// zone, what is armed and how recent seam actions turned out - so a failed or
+// superseded replace is visible to a polling consumer, not just in the log.
+function deferralSnapshot(zoneId: string) {
+  const pending = deferralLedger.pending().filter((d) => d.zoneId === zoneId);
+  const recent = deferralLedger.recent(5, zoneId);
+  return {
+    armed_count: pending.length,
+    armed: pending.map((d) => ({ deferral_id: d.deferral_id, trigger: d.trigger, description: d.description, armed_at: d.armed_at })),
+    recent: recent.map((d) => ({ deferral_id: d.deferral_id, status: d.status, reason: d.reason ?? null, description: d.description, settled_at: d.settled_at ?? null })),
+  };
+}
 
 // A compact, monitor-friendly volume read for a zone. Reads only the in-memory
 // outputs (no transport round trip), mirroring the rest of /monitor/state.
@@ -75,6 +89,7 @@ function snapshot(zone: Zone) {
     queue_remaining_count: zone.queue_items_remaining ?? 0,
     queue_time_remaining_seconds: zone.queue_time_remaining ?? null,
     volume: volumeSnapshot(zone),
+    deferrals: deferralSnapshot(zone.zone_id),
   };
 }
 

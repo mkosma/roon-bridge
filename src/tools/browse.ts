@@ -15,10 +15,41 @@ import {
   type BrowseItem,
 } from "./search-core.js";
 import { deferredPlayer } from "../control/deferred-player-instance.js";
+import type { SeamOutcome } from "../control/deferred-player.js";
 import { resultingState, immediateBool } from "./resulting-state.js";
 import type RoonApiBrowse from "node-roon-api-browse";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
+
+/**
+ * Classify a searchAndPlay ToolResult into a SeamOutcome for the deferral
+ * ledger. searchAndPlay appends a JSON blob ({ ok, verified, error,
+ * resulting_state }) to its text and sets isError on hard failures; we read
+ * both. A low-confidence refusal is a clean stand-down (aborted), not a failure.
+ */
+function seamOutcomeFrom(res: ToolResult): SeamOutcome {
+  const text = res.content.map((c) => c.text).join("\n");
+  let parsed: Record<string, unknown> = {};
+  const m = text.match(/\{[\s\S]*\}\s*$/);
+  if (m) {
+    try {
+      parsed = JSON.parse(m[0]) as Record<string, unknown>;
+    } catch {
+      /* leave parsed empty; fall back to isError below */
+    }
+  }
+  const error = typeof parsed.error === "string" ? parsed.error : undefined;
+  const resulting_state = parsed.resulting_state;
+  // A refused stomp (match below the confidence gate) is intended, not a fault.
+  if (error === "low_confidence_replace") {
+    return { ok: false, verified: false, aborted: true, reason: "low_confidence", detail: text.split("\n")[0], resulting_state };
+  }
+  if (res.isError || parsed.ok === false) {
+    return { ok: false, verified: false, reason: error ?? "play_failed", detail: text.split("\n")[0], resulting_state };
+  }
+  const verified = parsed.verified === true;
+  return { ok: true, verified, reason: verified ? undefined : "not_verified", detail: verified ? undefined : text.split("\n")[0], resulting_state };
+}
 
 /** What kind of action a play-path caller wants to execute. */
 type ActionType = "play" | "queue" | "shuffle";
@@ -1366,14 +1397,28 @@ async function playWithWhen(
 
     const np = zone.now_playing;
     if (zone.state === "playing" && np && np.length != null) {
-      // Fire and forget: the replace runs server-side at the track seam.
-      deferredPlayer
-        .scheduleAfterCurrent(zone, () => searchAndPlay(query, zoneName, category, playActionType))
-        .catch((e: unknown) => console.error("[playWithWhen] schedule error:", e));
+      // The seam action is name-resolved (this is the fuzzy path). It cannot
+      // replay a pre-resolved exact id the way the provider-id tools do (browse
+      // yields ephemeral, session-scoped item_keys, not stable ids), so it
+      // resolves at the seam - but under a HARD 0.9 confidence gate so a loose
+      // match can never stomp unattended, and its result is verified and
+      // recorded. searchAndPlay already reads back the zone and refuses false
+      // success; we classify that into the ledger outcome.
+      const { deferral_id } = await deferredPlayer.scheduleAfterCurrent(
+        zone,
+        async () => seamOutcomeFrom(await searchAndPlay(query, zoneName, category, playActionType, { minConfidence: 0.9 })),
+        {
+          zoneId: zone.zone_id,
+          zoneName: zone.display_name,
+          trigger: `end of "${np.three_line.line1}"`,
+          description: `play "${query}" (${category}) - name-resolved at the seam, 0.9 confidence gate`,
+        },
+      );
       return {
         content: [{
           type: "text",
-          text: `Scheduled: "${query}" will replace the queue in '${zone.display_name}' when "${np.three_line.line1}" ends (no mid-track cut).`,
+          text:
+            `Scheduled: "${query}" will replace the queue in '${zone.display_name}' when "${np.three_line.line1}" ends (no mid-track cut; refused if the match is below 90% confidence at the seam). Track with deferred_status; cancel with cancel_deferred("${deferral_id}").`,
         }],
       };
     }
