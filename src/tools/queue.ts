@@ -49,6 +49,7 @@ import {
   promisifyBrowse,
   type QueueAction,
 } from "./search-core.js";
+import { resultingState, immediateBool } from "./resulting-state.js";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
@@ -326,6 +327,7 @@ async function findAndQueue(
       artist: r.artist,
     })),
     zone: zone.display_name,
+    resulting_state: await resultingState(zone),
   });
 }
 
@@ -363,8 +365,7 @@ export function registerQueueTools(server: McpServer): void {
     {
       queue_item_id: z.coerce.number().int().describe("queue_item_id from get_queue."),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)."),
-      immediate: z
-        .boolean()
+      immediate: immediateBool
         .optional()
         .default(false)
         .describe("Jump RIGHT NOW, cutting the current track. Default false = jump when the current track ends (no mid-track cut)."),
@@ -399,6 +400,7 @@ export function registerQueueTools(server: McpServer): void {
             now_playing: head ? { queue_item_id: head.queue_item_id, title: head.title } : null,
             verified: head?.queue_item_id === queue_item_id,
             zone: z.display_name,
+            resulting_state: await resultingState(z),
           });
         };
 
@@ -417,6 +419,7 @@ export function registerQueueTools(server: McpServer): void {
               jump_to: { queue_item_id, title: target.title, artist: target.artist },
               detail: `Armed: playback will jump to "${target.title}" when "${np.three_line?.line1 ?? "the current track"}" ends (no mid-track cut). Pass immediate:true to jump now.`,
               zone: z.display_name,
+              resulting_state: await resultingState(z),
             });
           }
           // Nothing playing - no seam to wait for; jump now.

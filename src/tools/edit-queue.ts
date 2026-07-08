@@ -39,6 +39,7 @@ import { queueProvenance } from "../control/queue-provenance.js";
 import { readQueueRows, type QueueRow } from "./queue.js";
 import { executeById, executeIdentity, type ExecResult } from "./play-by-id.js";
 import { normalizeTitle, type TrackIdentity } from "./search-core.js";
+import { resultingState, immediateBool } from "./resulting-state.js";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
@@ -318,8 +319,7 @@ export function registerEditQueueTools(server: McpServer): void {
         .optional()
         .describe("Desired order of the remaining upcoming queue_item_ids (a permutation of the ids left after deletion). Omit to keep current order."),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)."),
-      immediate: z
-        .boolean()
+      immediate: immediateBool
         .optional()
         .default(false)
         .describe("Rebuild the queue RIGHT NOW, cutting the current track. Default false = wait for the current track to end (no mid-track cut)."),
@@ -387,7 +387,7 @@ export function registerEditQueueTools(server: McpServer): void {
         if (when === "now") {
           const outcome = await runRebuild(z.zone_id, items, upcomingIds, /* guard */ false);
           return jsonResult(
-            { ok: outcome.ok, when, zone: z.display_name, deleted_playing_note: deletedPlayingNote, plan: planSummary, before_queue: rows.map((r) => ({ position: r.position, queue_item_id: r.queue_item_id, title: r.title, artist: r.artist, is_now_playing: r.is_now_playing })), outcome },
+            { ok: outcome.ok, when, zone: z.display_name, deleted_playing_note: deletedPlayingNote, plan: planSummary, before_queue: rows.map((r) => ({ position: r.position, queue_item_id: r.queue_item_id, title: r.title, artist: r.artist, is_now_playing: r.is_now_playing })), outcome, resulting_state: await resultingState(z) },
             !outcome.ok,
           );
         }
@@ -408,13 +408,14 @@ export function registerEditQueueTools(server: McpServer): void {
             deleted_playing_note: deletedPlayingNote,
             plan: planSummary,
             before_queue: rows.map((r) => ({ position: r.position, queue_item_id: r.queue_item_id, title: r.title, artist: r.artist, is_now_playing: r.is_now_playing })),
+            resulting_state: await resultingState(z),
           });
         }
 
         // Nothing playing - no seam; rebuild immediately.
         const outcome = await runRebuild(z.zone_id, items, upcomingIds, /* guard */ false);
         return jsonResult(
-          { ok: outcome.ok, when: "now (nothing was playing)", zone: z.display_name, deleted_playing_note: deletedPlayingNote, plan: planSummary, outcome },
+          { ok: outcome.ok, when: "now (nothing was playing)", zone: z.display_name, deleted_playing_note: deletedPlayingNote, plan: planSummary, outcome, resulting_state: await resultingState(z) },
           !outcome.ok,
         );
       } catch (e) {
