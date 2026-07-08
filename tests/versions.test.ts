@@ -18,6 +18,12 @@ const world = {
   executed: [] as string[],
   enqueueWorks: true,
   nextId: 2000,
+  // The zone's current now-playing title. A Play Now flips it, so the replace/
+  // now path's flip verification can observe that playback actually changed.
+  nowPlaying: "Prior Track",
+  // When false, a Play Now is acked but now-playing never changes - the false-
+  // success case the replace/now verification must catch.
+  playFlips: true,
 };
 
 function qitem(title: string, artist: string): QueueItem {
@@ -79,6 +85,12 @@ const mockBrowse = {
         const which = key.split(":")[2];
         world.queue.push(qitem(`Twist & Crawl [${which}]`, "The Beat"));
       }
+      // Play Now starts playback: flip now-playing to the played recording so
+      // the replace/now path's flip verification observes the change.
+      if (world.playFlips && key.startsWith("act:play:")) {
+        const which = key.split(":")[2];
+        world.nowPlaying = which === "live" ? "Twist & Crawl (Live 1982)" : "Twist & Crawl";
+      }
       cb(false, { action: "none" });
       return;
     }
@@ -100,6 +112,12 @@ vi.mock("../src/roon-connection.js", () => ({
     getBrowse: vi.fn(() => mockBrowse),
     getTransport: vi.fn(() => ({ change_settings: (_z: unknown, _s: unknown, cb: () => void) => cb() })),
     findZoneOrThrow: vi.fn(() => ({ zone_id: "zone-1", display_name: "WiiM + 1" })),
+    findZone: vi.fn(() => ({
+      zone_id: "zone-1",
+      display_name: "WiiM + 1",
+      state: "playing",
+      now_playing: { three_line: { line1: world.nowPlaying, line2: "The Beat" } },
+    })),
     getQueueSnapshot: vi.fn(async () => world.queue.slice()),
   },
 }));
@@ -119,7 +137,9 @@ async function call(server: unknown, name: string, args: Record<string, unknown>
   const tool = (server as any)._registeredTools[name];
   const res = await tool.handler(args, {});
   const text = res.content.map((c: { text: string }) => c.text).join("\n");
-  return { isError: res.isError === true, json: JSON.parse(text) };
+  // Unverified play/replace results prepend a warning line ahead of the JSON
+  // tail; parse from the first brace so both shapes decode.
+  return { isError: res.isError === true, text, json: JSON.parse(text.slice(text.indexOf("{"))) };
 }
 
 function reset() {
@@ -127,6 +147,8 @@ function reset() {
   world.executed = [];
   world.enqueueWorks = true;
   world.nextId = 2000;
+  world.nowPlaying = "Prior Track";
+  world.playFlips = true;
   lastBrowse = "root";
 }
 
@@ -225,6 +247,35 @@ describe("queue_version", () => {
     expect(json.when).toBe("now");
     expect(world.executed).toContain("act:play:studio");
     expect(world.executed).not.toContain("act:queue:studio");
+  });
+
+  it('when:"replace" plays now and verifies the flip to this recording', async () => {
+    const server = buildServer();
+    const ref = await refFor(server, (c) => c.subtitle?.includes("I Just Can't Stop It"));
+    const { isError, json } = await call(server, "queue_version", { ref, when: "replace" });
+    expect(isError).toBe(false);
+    expect(json.ok).toBe(true);
+    expect(json.verified).toBe(true);
+    expect(json.when).toBe("now");
+    expect(world.executed).toContain("act:play:studio");
+    // Verification is grounded in a real state read, not the browse ack.
+    expect(json.resulting_state).toBeDefined();
+  });
+
+  it('FALSE-SUCCESS: when:"replace" acked but now-playing never flips is NOT success-shaped', async () => {
+    const server = buildServer();
+    const ref = await refFor(server, (c) => c.subtitle?.includes("I Just Can't Stop It"));
+    // The Play Now action is acked (executed) but playback never changes - the
+    // exact false-success class the replace path exists to kill.
+    world.playFlips = false;
+    const { isError, json } = await call(server, "queue_version", { ref, when: "replace" });
+
+    expect(isError).toBe(true);
+    expect(json.ok).toBe(false);
+    expect(json.error).toBe("play_not_verified");
+    // The action WAS attempted (acked) - but the tool refuses to call it success.
+    expect(world.executed).toContain("act:play:studio");
+    expect(json.verified).not.toBe(true);
   });
 
   it("SAFE DEFAULT: a stray when:'now' without immediate is downgraded to a queue add (never cuts)", async () => {

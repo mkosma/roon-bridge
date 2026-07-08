@@ -41,6 +41,7 @@ import {
   promisifyBrowse,
   stripRoonLinks,
   looksInstrumental,
+  normalizeTitle,
   type ScoredCandidate,
   type QueueAction,
 } from "./search-core.js";
@@ -52,6 +53,16 @@ type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: bo
 
 function jsonResult(payload: unknown, isError = false): ToolResult {
   return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }], isError };
+}
+
+/**
+ * Render a result with a human-readable warning as the FIRST line of the text,
+ * ahead of the JSON tail - the honesty contract for an unverified play (mirrors
+ * the browse play path). Use for the replace/now path when the flip could not be
+ * confirmed, so the warning is not buried inside the JSON.
+ */
+function warnFirst(warning: string, payload: unknown, isError = false): ToolResult {
+  return { content: [{ type: "text", text: `${warning}\n${JSON.stringify(payload, null, 2)}` }], isError };
 }
 
 /** A durable descriptor for one recording, encoded into the candidate `ref`. */
@@ -349,7 +360,40 @@ export function registerVersionTools(server: McpServer): void {
         };
 
         if (!verifyAdd) {
-          return jsonResult({ ok: true, action: action.matched, when, matched, zone: zoneObj.display_name, resulting_state: await resultingState(zoneObj) });
+          // 'now'/replace: the browse action can ack while the audio never
+          // moves (the false-success class this PR exists to kill). Verify the
+          // way executeIdentity does - poll now-playing for the flip to THIS
+          // recording (bounded ~2.5s) - and report an unconfirmed replace
+          // honestly rather than a bare ok:true off the ack.
+          const want = normalizeTitle(target.title);
+          let nowOk = false;
+          let landedNP: string | null = null;
+          const deadline = Date.now() + 2500;
+          while (Date.now() < deadline) {
+            const np = roonConnection.findZone(zoneObj.zone_id)?.now_playing?.three_line?.line1 ?? null;
+            if (np) landedNP = np;
+            if (np && normalizeTitle(np) === want) { nowOk = true; break; }
+            await new Promise((r) => setTimeout(r, 150));
+          }
+          const resulting_state = await resultingState(zoneObj);
+          if (nowOk) {
+            return jsonResult({ ok: true, action: action.matched, when, matched, verified: true, zone: zoneObj.display_name, resulting_state });
+          }
+          if (landedNP != null) {
+            // Now-playing WAS readable and never became our recording: an
+            // affirmative no-change. Refuse to call it success.
+            return warnFirst(
+              `WARNING - not verified: the replace of "${target.title}" in zone '${zoneObj.display_name}' was accepted, but playback did NOT change to it (still "${landedNP}"). The replace did not land; confirm with now_playing.`,
+              { ok: false, error: "play_not_verified", action: action.matched, when, matched, landed_now_playing: landedNP, zone: zoneObj.display_name, resulting_state },
+              true,
+            );
+          }
+          // Now-playing was not observable: unconfirmed, not a false failure.
+          return warnFirst(
+            `WARNING - not verified: the replace of "${target.title}" in zone '${zoneObj.display_name}' was accepted, but playback state is not observable to confirm it. Confirm with now_playing.`,
+            { ok: true, verified: false, action: action.matched, when, matched, zone: zoneObj.display_name, resulting_state },
+            false,
+          );
         }
 
         // Verify by re-reading the queue until it grows (bounded poll).
