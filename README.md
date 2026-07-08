@@ -293,6 +293,45 @@ and a claim of success always carries the state that backs it. A play action
 that Roon acks while playback never changes is reported as **not verified**
 (isError), never as a false "Now playing".
 
+### Deferred actions (safe default) and the deferral ledger
+
+By default a play/queue/edit tool does not cut the current track: it **arms the
+action at the next track seam** (the end of the current track, event-driven off
+Roon's own zone events - never a wall-clock timer). Every such arming returns a
+**`deferral_id`** and is recorded in a shared ledger with a terminal outcome:
+
+- `fired_verified` - fired and a post-action state read confirmed it landed
+- `fired_unverified` - fired but the landing could not be confirmed (loud)
+- `failed(reason)` - the seam action threw or could not complete (e.g. a track
+  could not be resolved/played)
+- `aborted(reason)` - a clean stand-down (e.g. `interference` - the queue moved
+  under an armed `edit_queue`; or `canceled`)
+- `superseded` - a newer command (or an immediate play) replaced it
+- `expired` - dropped without firing
+
+Because a scheduled action can fail or be superseded after the schedule-time
+`ok:true`, **never report a deferred action as done off the arming alone** - read
+its outcome first:
+
+- **`deferred_status`** - list what is still armed plus recent outcomes
+  (optionally filtered by `zone`).
+- **`cancel_deferred(deferral_id)`** - cancel the armed deferral (recorded
+  `aborted(canceled)`).
+- The `GET /monitor/state` read also carries a per-zone `deferrals` block (armed
+  + recent outcomes) for the music-monitor daemon.
+
+Seam semantics worth knowing:
+
+- **Skipping the current track fires the armed action** (any advance past the
+  trigger track, natural end or manual skip - a deferral means "do this once we
+  leave THIS track"). Pause/seek/volume changes never fire it.
+- The deterministic ID tools **resolve to exact provider ids at arm time and
+  replay those exact ids at the seam** - a catalog change between arm and seam
+  cannot substitute a different track. The fuzzy name path (`play_album`/
+  `play_track` by name, deferred) resolves at the seam under the same **>= 90%
+  confidence** gate and full verification, so it can never stomp a wrong match
+  unattended.
+
 ### Version selection (studio vs live, precise pick)
 
 The universal Roon search mixes studio, live, and compilation recordings of the
