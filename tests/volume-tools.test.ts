@@ -39,6 +39,7 @@ const world = {
   queue_items_remaining: 0 as number,
   queue_time_remaining: 0 as number,
   failControl: false,
+  failVolumeOutputId: null as string | null,
 };
 
 function makeOutput(name: string, value: number, muted = false): Output {
@@ -77,6 +78,11 @@ function makeZone(): Zone {
 const mockTransport = {
   change_volume: (output: Output, how: string, value: number, cb?: (e: false | string) => void) => {
     world.volumeCalls.push({ output_id: output.output_id, how, value });
+    // A configured output rejects the write (e.g. a Muse dropout mid-group).
+    if (world.failVolumeOutputId && output.output_id === world.failVolumeOutputId) {
+      cb?.("output_unavailable");
+      return;
+    }
     // Reflect absolute writes back into world so fresh zone reads see progress.
     const o = world.outputs.find((x) => x.output_id === output.output_id);
     if (o?.volume) {
@@ -160,6 +166,7 @@ function reset(outputs: Output[], partial: Partial<typeof world> = {}) {
   world.queue_items_remaining = 0;
   world.queue_time_remaining = 0;
   world.failControl = false;
+  world.failVolumeOutputId = null;
   Object.assign(world, partial);
 }
 
@@ -369,6 +376,24 @@ describe("change_volume", () => {
     const server = buildServer();
     const { isError } = await call(server, "change_volume", { zone: "Bedroom", value: 64 });
     expect(isError).toBe(true);
+  });
+
+  it("grouped-zone partial failure (#5): one of two outputs errors -> isError, per-output detail", async () => {
+    // A Muse-style dropout: WiiM takes the write, KEF rejects it. A partial
+    // write is a FAILURE, not a silent success.
+    reset([makeOutput("WiiM", 24), makeOutput("KEF", 24)], { failVolumeOutputId: "out-KEF" });
+    const server = buildServer();
+    // snap=true forces the instant per-output path where the partial lives.
+    const { isError, text } = await call(server, "change_volume", { value: 30, how: "absolute", snap: true });
+
+    expect(isError).toBe(true);
+    // The good output still applied; the bad one is reported with its error.
+    expect(text).toContain("WiiM: Volume set to 30");
+    expect(text).toContain("KEF: Error");
+    const json = JSON.parse(text.split("\n").pop() as string);
+    expect(json.ok).toBe(false);
+    expect(json.error).toBe("partial_volume_failure");
+    expect(json.failed_outputs).toEqual([{ output: "KEF", error: "output_unavailable" }]);
   });
 });
 

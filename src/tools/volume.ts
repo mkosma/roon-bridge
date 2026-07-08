@@ -5,6 +5,7 @@ import type { ResultCallback } from "node-roon-api-transport";
 import { sharedRamper } from "../control/shared-ramper.js";
 import { VolumeRamper } from "../control/volume-ramper.js";
 import { readRoonKeyConfig } from "../control/roon-key-config.js";
+import { resultingState } from "./resulting-state.js";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
@@ -113,6 +114,7 @@ export function registerVolumeTools(server: McpServer): void {
           sharedRamper.cancel();
 
           const results: string[] = [];
+          const failedOutputs: Array<{ output: string; error: string }> = [];
           for (const output of foundZone.outputs) {
             if (!output.volume) continue;
             const error = await promisifyResult((cb) =>
@@ -120,6 +122,7 @@ export function registerVolumeTools(server: McpServer): void {
             );
             if (error) {
               results.push(`${output.display_name}: Error - ${error}`);
+              failedOutputs.push({ output: output.display_name, error: String(error) });
             } else {
               results.push(`${output.display_name}: Volume ${how === "absolute" ? "set to" : "adjusted by"} ${value}`);
             }
@@ -131,7 +134,20 @@ export function registerVolumeTools(server: McpServer): void {
             };
           }
 
-          return { content: [{ type: "text", text: results.join("\n") }] };
+          // Grouped-zone honesty: a partial write (one output errored, e.g. a
+          // Muse dropout) is a FAILURE, not a success - flag isError with the
+          // per-output detail so a caller checking the flag is not misled.
+          const partialFailure = failedOutputs.length > 0;
+          const resulting_state = await resultingState(foundZone);
+          return {
+            content: [{
+              type: "text",
+              text:
+                results.join("\n") + "\n" +
+                JSON.stringify({ ok: !partialFailure, ...(partialFailure ? { error: "partial_volume_failure", failed_outputs: failedOutputs } : {}), resulting_state }),
+            }],
+            isError: partialFailure,
+          };
         }
 
         // Default: ramp as a short audible fade. rampAbsolute/rampDelta increment
@@ -148,11 +164,15 @@ export function registerVolumeTools(server: McpServer): void {
         }
 
         const target = how === "absolute" ? value : (currentMax as number) + value;
+        const resulting_state = await resultingState(foundZone);
         return {
           content: [
             {
               type: "text",
-              text: `Fading '${foundZone.display_name}' from ${currentMax} to ${target} (snap=true to jump instantly).`,
+              text:
+                `Fading '${foundZone.display_name}' from ${currentMax} to ${target} (snap=true to jump instantly). ` +
+                `Ramp started, not yet complete.\n` +
+                JSON.stringify({ ok: true, ramp: "in_progress", target, resulting_state }),
             },
           ],
         };
@@ -223,8 +243,14 @@ export function registerVolumeTools(server: McpServer): void {
         }
 
         const dur = duration_ms != null ? `${duration_ms}ms (${rampShape})` : `${steps} steps`;
+        const resulting_state = await resultingState(foundZone);
         return {
-          content: [{ type: "text", text: `Ramping '${foundZone.display_name}' from ${currentMax} to ${target} over ${dur}.` }],
+          content: [{
+            type: "text",
+            text:
+              `Ramping '${foundZone.display_name}' from ${currentMax} to ${target} over ${dur}. Ramp started, not yet complete.\n` +
+              JSON.stringify({ ok: true, ramp: "in_progress", target, resulting_state }),
+          }],
         };
       } catch (error) {
         return {
@@ -327,8 +353,14 @@ export function registerVolumeTools(server: McpServer): void {
         }
 
         const verb = dir === "next" ? "skipped to next" : "went to previous";
+        const resulting_state = await resultingState(foundZone);
         return {
-          content: [{ type: "text", text: `Smooth skip: ducked to ${floor}, ${verb} track, faded back up to ${original} in zone '${foundZone.display_name}'.` }],
+          content: [{
+            type: "text",
+            text:
+              `Smooth skip: ducked to ${floor}, ${verb} track, faded back up to ${original} in zone '${foundZone.display_name}'.\n` +
+              JSON.stringify({ ok: true, resulting_state }),
+          }],
         };
       } catch (error) {
         return {
@@ -353,11 +385,13 @@ export function registerVolumeTools(server: McpServer): void {
         const how = mute ? "mute" : "unmute";
 
         const results: string[] = [];
+        const failedOutputs: Array<{ output: string; error: string }> = [];
         for (const output of foundZone.outputs) {
           if (!output.volume) continue;
           const error = await promisifyResult((cb) => transport.mute(output, how, cb));
           if (error) {
             results.push(`${output.display_name}: Error - ${error}`);
+            failedOutputs.push({ output: output.display_name, error: String(error) });
           } else {
             results.push(`${output.display_name}: ${mute ? "Muted" : "Unmuted"}`);
           }
@@ -369,7 +403,17 @@ export function registerVolumeTools(server: McpServer): void {
           };
         }
 
-        return { content: [{ type: "text", text: results.join("\n") }] };
+        const partialFailure = failedOutputs.length > 0;
+        const resulting_state = await resultingState(foundZone);
+        return {
+          content: [{
+            type: "text",
+            text:
+              results.join("\n") + "\n" +
+              JSON.stringify({ ok: !partialFailure, ...(partialFailure ? { error: "partial_mute_failure", failed_outputs: failedOutputs } : {}), resulting_state }),
+          }],
+          isError: partialFailure,
+        };
       } catch (error) {
         return {
           content: [{ type: "text", text: String(error instanceof Error ? error.message : error) }],
@@ -443,8 +487,12 @@ export function registerVolumeTools(server: McpServer): void {
 
         await sharedRamper.toggleMute(getZone, transport);
 
+        const resulting_state = await resultingState(foundZone);
         return {
-          content: [{ type: "text", text: `${willUnmute ? "Unmuted" : "Muted"} zone '${foundZone.display_name}'.` }],
+          content: [{
+            type: "text",
+            text: `${willUnmute ? "Unmuted" : "Muted"} zone '${foundZone.display_name}'.\n` + JSON.stringify({ ok: true, resulting_state }),
+          }],
         };
       } catch (error) {
         return {
@@ -491,8 +539,15 @@ export function registerVolumeTools(server: McpServer): void {
             .catch((e: unknown) => console.error("[volume_preset] error:", e));
         }
 
+        const resulting_state = await resultingState(foundZone);
         return {
-          content: [{ type: "text", text: `Preset ${index} -> volume ${target}${useInstant ? " (instant)" : ""} in zone '${foundZone.display_name}'.` }],
+          content: [{
+            type: "text",
+            text:
+              `Preset ${index} -> volume ${target}${useInstant ? " (instant)" : ""} in zone '${foundZone.display_name}'.` +
+              `${useInstant ? "" : " Ramp started, not yet complete."}\n` +
+              JSON.stringify({ ok: true, ...(useInstant ? {} : { ramp: "in_progress" }), target, resulting_state }),
+          }],
         };
       } catch (error) {
         return {
