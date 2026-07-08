@@ -22,7 +22,25 @@ const world = {
   // shape this navigate-into-item fix targets.
   shuffleNestedInPlaySubmenu: false,
   executed: [] as string[],
+  // The zone's current now-playing title; a Play Now / Shuffle flips it, so the
+  // tool's play-path verification can observe that playback actually changed.
+  nowPlaying: "Prior Track",
 };
+
+function makeZone() {
+  return {
+    zone_id: "zone-1",
+    display_name: "WiiM + 1",
+    state: "playing",
+    now_playing: {
+      one_line: { line1: world.nowPlaying },
+      two_line: { line1: world.nowPlaying, line2: "Artist" },
+      three_line: { line1: world.nowPlaying, line2: "Artist" },
+      length: 200,
+      seek_position: 0,
+    },
+  };
+}
 
 // The playlist's action list. Includes a native Shuffle action unless the
 // world says this item exposes none.
@@ -81,6 +99,11 @@ const mockBrowse = {
     if (key.startsWith("act:")) {
       // Action execution: record which one fired, report plain success.
       world.executed.push(key);
+      // Play Now / Shuffle actually start playback: flip now-playing so the
+      // tool's play-path verification observes the change.
+      if (key === "act:play" || key === "act:shuffle" || key === "act:fromhere") {
+        world.nowPlaying = "Discovered Opener";
+      }
       cb(false, { action: "none" });
       return;
     }
@@ -105,7 +128,7 @@ vi.mock("../src/roon-connection.js", () => ({
       change_settings: (_z: unknown, _s: unknown, cb: () => void) => cb(),
     })),
     findZoneOrThrow: vi.fn(() => ({ zone_id: "zone-1", display_name: "WiiM + 1" })),
-    findZone: vi.fn(() => ({ zone_id: "zone-1", display_name: "WiiM + 1" })),
+    findZone: vi.fn(() => makeZone()),
     getQueueSnapshot: vi.fn(async () => []),
     // play_playlist now routes through the deferral machinery (immediate gate),
     // which cancels any armed deferral via source.on/off.
@@ -135,6 +158,7 @@ function reset(partial: Partial<typeof world> = {}) {
   world.hasShuffleAction = true;
   world.shuffleNestedInPlaySubmenu = false;
   world.executed = [];
+  world.nowPlaying = "Prior Track";
   lastBrowse = "root";
   Object.assign(world, partial);
 }

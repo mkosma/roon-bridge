@@ -211,6 +211,11 @@ const mockBrowse = {
     }
     if (key.startsWith("act:")) {
       world.executed.push(key);
+      // A Play Now flips the zone's now-playing, so the tool's play-path
+      // verification can observe that playback actually changed.
+      if (key === "act:play") {
+        mockConn.zone = playingZone("Some Album Opener", 100, 0);
+      }
       cb(false, { action: "none" });
       return;
     }
