@@ -18,6 +18,7 @@ const world = {
   albumTitle: "Some Album",
   nowPlaying: "Prior Track",
   flipOnPlay: true, // whether Play Now actually changes what is playing
+  state: "playing", // zone transport state; "stopped" models a silent zone
   executed: [] as string[],
 };
 
@@ -70,8 +71,8 @@ function zoneObj(): Zone {
   return {
     zone_id: "zone-1",
     display_name: "WiiM + 1",
-    state: "playing",
-    outputs: [{ output_id: "o", zone_id: "zone-1", display_name: "WiiM", state: "playing", volume: { type: "number", value: 48, min: 0, max: 100, is_muted: false } }],
+    state: world.state,
+    outputs: [{ output_id: "o", zone_id: "zone-1", display_name: "WiiM", state: world.state, volume: { type: "number", value: 48, min: 0, max: 100, is_muted: false } }],
     now_playing: {
       one_line: { line1: world.nowPlaying },
       two_line: { line1: world.nowPlaying, line2: "Artist" },
@@ -115,6 +116,7 @@ function reset(partial: Partial<typeof world> = {}) {
   world.albumTitle = "Some Album";
   world.nowPlaying = "Prior Track";
   world.flipOnPlay = true;
+  world.state = "playing";
   world.executed = [];
   lastBrowse = "root";
   Object.assign(world, partial);
@@ -169,9 +171,31 @@ describe("false-success guard (#4): an acked play that never changes now-playing
     const { isError, text } = await call(server, "play_album", { album: "Some Album", immediate: true });
 
     expect(isError).toBe(true);
-    expect(text).toMatch(/not verified/i);
+    // The warning is the FIRST line of the text, not buried in the JSON tail.
+    expect(text).toMatch(/^WARNING - not verified/);
     expect(text).toMatch(/did NOT change/);
     // The action was attempted (acked) - but the tool refuses to call it success.
+    expect(world.executed).toContain("act:play");
+    expect(text).not.toMatch(/^Now playing:/);
+  });
+});
+
+describe("from-silence guard (fix 3): a play that never starts from silence is NOT success", () => {
+  beforeEach(() => {
+    reset();
+    vi.clearAllMocks();
+  });
+
+  it("play_album immediate:true against a silent zone that never starts reports NOT verified, isError, warning-first", async () => {
+    // The zone is silent (stopped, no now-playing) and the Play Now never starts
+    // anything - an affirmative no-start, not merely unobservable, so isError.
+    reset({ nowPlaying: null as unknown as string, flipOnPlay: false, state: "stopped" });
+    const server = buildServer();
+    const { isError, text } = await call(server, "play_album", { album: "Some Album", immediate: true });
+
+    expect(isError).toBe(true);
+    expect(text).toMatch(/^WARNING - not verified/);
+    expect(text).toMatch(/nothing started playing/);
     expect(world.executed).toContain("act:play");
     expect(text).not.toMatch(/^Now playing:/);
   });

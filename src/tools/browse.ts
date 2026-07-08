@@ -1061,6 +1061,23 @@ async function searchAndPlay(
     let shuffleUnavailable = false;
     let targetAction = findAction(actionItems, actionType);
 
+    // A play/shuffle action must change what is playing; capture the current
+    // now-playing so Step 8b can prove the flip (and not assert "Now playing"
+    // off a browse-action success that never touched the audio - the false
+    // "Now playing: The National" while Gidge kept playing).
+    //
+    // Capture from a FRESH zone read (not the `zone` snapshot taken at search
+    // start, which a natural track advance during the long browse walk could
+    // have staled), but do it HERE - after the search walk and BEFORE the
+    // shuffle-deeper probe below. findShuffleDeeper opens candidate action nodes,
+    // and browsing an action node executes it in Roon; capturing beforeNP after
+    // that would read the already-started track and mislabel a real play as
+    // unverified. This point is post-walk (fresh) yet pre-any-action-fire (true).
+    const isPlayAction = actionType !== "queue";
+    const beforeNP = isPlayAction
+      ? (roonConnection.findZone(zone.zone_id)?.now_playing?.three_line?.line1 ?? zone.now_playing?.three_line?.line1 ?? null)
+      : null;
+
     // Shuffle requested but not at level one (the search-result popup commonly
     // exposes only Play Now / Queue / Add Next). The native Shuffle action lives
     // on the item's OPENED page - inside a "Play" submenu or the item's content
@@ -1098,13 +1115,6 @@ async function searchAndPlay(
         content: [{ type: "text", text: `Available actions for "${matchedResult.title}":\n${formatItems(actionItems)}\n\nNo "${actionType}" action found.` }],
       };
     }
-
-    // A play/shuffle action must change what is playing; capture the current
-    // now-playing so Step 8b can prove the flip (and not assert "Now playing"
-    // off a browse-action success that never touched the audio - the false
-    // "Now playing: The National" while Gidge kept playing).
-    const isPlayAction = actionType !== "queue";
-    const beforeNP = isPlayAction ? (zone.now_playing?.three_line?.line1 ?? null) : null;
 
     // Step 7: Execute. For a queue add, capture the pre-action queue so we can
     // verify the add actually landed afterward.
@@ -1238,15 +1248,16 @@ async function searchAndPlay(
       let landedNP: string | null = null;
       let sawNowPlaying = false;
       let verified = false;
+      let playing = false;
       const deadline = Date.now() + 2500;
       for (;;) {
         const z = roonConnection.findZone(zone.zone_id);
         const np = z?.now_playing?.three_line?.line1 ?? null;
+        playing = z?.state === "playing" || z?.state === "loading" || z?.state == null;
         if (np != null) {
           sawNowPlaying = true;
           landedNP = np;
         }
-        const playing = z?.state === "playing" || z?.state === "loading" || z?.state == null;
         // Flipped to a different track (or started from silence) while playing.
         if (np != null && np !== beforeNP && playing) {
           verified = true;
@@ -1267,6 +1278,23 @@ async function searchAndPlay(
             type: "text",
             text:
               `WARNING - not verified: the browse action for "${matchedResult.title}"${subtitle} in zone '${zone.display_name}' was accepted, but playback did NOT change (still "${beforeNP}"). The play did not land; confirm with now_playing.${confNote}\n` +
+              JSON.stringify({ ok: false, error: "play_not_verified", resulting_state }, null, 2),
+          }],
+          isError: true,
+        };
+      }
+
+      // From-silence no-start: nothing was playing before and the zone is still
+      // not in a playing state after the action - an affirmative "did not start"
+      // (a zone that IS playing but whose now-playing is momentarily unreadable
+      // stays on the soft/unobservable path below). So this is an isError, not a
+      // soft ok:true, verified:false.
+      if (!verified && beforeNP == null && !playing) {
+        return {
+          content: [{
+            type: "text",
+            text:
+              `WARNING - not verified: the browse action for "${matchedResult.title}"${subtitle} in zone '${zone.display_name}' was accepted, but nothing started playing (the zone was silent and stayed silent). The play did not land; confirm with now_playing.${confNote}\n` +
               JSON.stringify({ ok: false, error: "play_not_verified", resulting_state }, null, 2),
           }],
           isError: true,
