@@ -416,14 +416,41 @@ export async function executeIdentity(
     if (recordingMismatch(landedTitle)) {
       return { ok: false, error: "wrong_recording_queued", detail: `Expected ${intendedLive ? "a live" : "the studio"} recording of "${identity.title}" but "${landedTitle}" played.`, matched, queued_title: landedTitle, zone: zone.display_name };
     }
-    // Best-effort: remember the now-playing head so a rebuild can replay it.
     if (nowOk) {
+      // Best-effort: remember the now-playing head so a rebuild can replay it.
       try {
         const after = await roonConnection.getQueueSnapshot(zone);
         if (after[0]) remember(after[0].queue_item_id);
       } catch { /* non-critical */ }
+      return { ok: true, action: action.matched, when, matched, verified: true, queued_title: landedTitle, zone: zone.display_name };
     }
-    return { ok: true, action: action.matched, when, matched, verified: nowOk, queued_title: landedTitle, zone: zone.display_name };
+    // Not flipped to our recording. Surface the failure as a first-line warning
+    // (the wrapper renders `warning` ahead of the JSON) instead of burying
+    // verified:false. Affirmative no-change (now-playing readable, never ours)
+    // is an isError; merely unobservable now-playing stays ok:true, verified:false.
+    if (landedTitle != null) {
+      return {
+        ok: false,
+        error: "play_not_verified",
+        warning: `WARNING - not verified: "${identity.title}" was accepted for play in zone '${zone.display_name}', but now-playing did NOT change to it (still "${landedTitle}"). The play did not land; confirm with now_playing.`,
+        action: action.matched,
+        when,
+        matched,
+        verified: false,
+        queued_title: landedTitle,
+        zone: zone.display_name,
+      };
+    }
+    return {
+      ok: true,
+      warning: `WARNING - not verified: "${identity.title}" was accepted for play in zone '${zone.display_name}', but playback state is not observable to confirm it. Confirm with now_playing.`,
+      action: action.matched,
+      when,
+      matched,
+      verified: false,
+      queued_title: landedTitle,
+      zone: zone.display_name,
+    };
   }
 
   // Verify by re-reading the queue until our track appears (bounded poll).
@@ -529,6 +556,16 @@ async function queueOrPlayById(
     const zone = roonConnection.findZoneOrThrow(zoneName);
     const result = await executeById(trackId, provider, zone, when);
     const resulting_state = await resultingState(zone);
+    // An unconfirmed play carries a `warning`; render it as the first line of
+    // the text (ahead of the JSON) so the caller cannot miss it, matching the
+    // browse play path. Otherwise emit the plain JSON result.
+    const { warning, ...rest } = result as ExecResult & { warning?: string };
+    if (warning) {
+      return {
+        content: [{ type: "text", text: `${warning}\n${JSON.stringify({ ...rest, resulting_state }, null, 2)}` }],
+        isError: !result.ok,
+      };
+    }
     return jsonResult({ ...result, resulting_state }, !result.ok);
   } catch (e) {
     return jsonResult({ ok: false, error: e instanceof Error ? e.message : String(e) }, true);
