@@ -34,7 +34,8 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { roonConnection } from "../roon-connection.js";
-import { DeferredPlayer } from "../control/deferred-player.js";
+import { deferredPlayer } from "../control/deferred-player-instance.js";
+import type { SeamOutcome } from "../control/deferred-player.js";
 import { queueProvenance } from "../control/queue-provenance.js";
 import { readQueueRows, type QueueRow } from "./queue.js";
 import { executeById, executeIdentity, type ExecResult } from "./play-by-id.js";
@@ -47,11 +48,12 @@ function jsonResult(payload: unknown, isError = false): ToolResult {
   return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }], isError };
 }
 
-// One DeferredPlayer for edit_queue's after-current arming. Independent of the
-// browse tool's instance; cross-tool collisions (e.g. a play_track after_current
-// firing too) are caught by the rebuild's snapshot interference check, which
-// aborts rather than fighting.
-const deferredPlayer = new DeferredPlayer(roonConnection);
+// edit_queue arms the SINGLE shared DeferredPlayer (deferred-player-instance),
+// the same one play_track/play_by_id/play_from_here use. One shared scheduler
+// (and one shared deferral ledger) means an immediate play from any tool
+// supersedes an edit_queue rebuild and vice versa, and every deferral - whoever
+// armed it - shows up in deferred_status. The rebuild's snapshot interference
+// check still aborts cleanly if the queue moved under it.
 
 // ---------------------------------------------------------------------------
 // Pure planning helpers (unit-tested in isolation - no Roon needed).
@@ -396,14 +398,33 @@ export function registerEditQueueTools(server: McpServer): void {
         // length; otherwise there is no seam to wait for, so rebuild now.
         const np = z.now_playing;
         if (z.state === "playing" && np && np.length != null) {
-          deferredPlayer
-            .scheduleAfterCurrent(z, () => runRebuild(z.zone_id, items, upcomingIds, /* guard */ true))
-            .catch((e: unknown) => console.error("[edit_queue] schedule error:", e));
+          // Adapt the rebuild's RebuildOutcome to a SeamOutcome so the ledger
+          // records how it ended - crucially, a clean interference abort becomes
+          // aborted(interference) (was silently discarded before), never a lost
+          // action the caller believes succeeded.
+          const seamAction = async (): Promise<SeamOutcome> => {
+            const outcome = await runRebuild(z.zone_id, items, upcomingIds, /* guard */ true);
+            return {
+              ok: outcome.ok,
+              verified: outcome.ok && outcome.final_match !== false,
+              aborted: outcome.aborted === true,
+              reason: outcome.reason,
+              detail: outcome.detail,
+              resulting_state: await resultingState(roonConnection.findZone(z.zone_id) ?? z),
+            };
+          };
+          const { deferral_id } = await deferredPlayer.scheduleAfterCurrent(z, seamAction, {
+            zoneId: z.zone_id,
+            zoneName: z.display_name,
+            trigger: `end of "${np.three_line?.line1 ?? "the current track"}"`,
+            description: `rebuild upcoming queue to ${items.length} track(s)`,
+          });
           return jsonResult({
             ok: true,
             scheduled: true,
             when,
-            detail: `Armed: the queue will be rebuilt when "${np.three_line?.line1 ?? "the current track"}" ends (no mid-track cut). Aborts cleanly if the queue or playback changes before then.`,
+            deferral_id,
+            detail: `Armed: the queue will be rebuilt when "${np.three_line?.line1 ?? "the current track"}" ends (no mid-track cut). Aborts cleanly if the queue or playback changes before then. Track with deferred_status; cancel with cancel_deferred("${deferral_id}").`,
             zone: z.display_name,
             deleted_playing_note: deletedPlayingNote,
             plan: planSummary,

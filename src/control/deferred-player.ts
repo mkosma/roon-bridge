@@ -13,17 +13,47 @@
  *
  * Boundary detection: while armed, we watch the zone's seek progress (the
  * lightweight "zone-seek" tick) and its track-identity changes ("zones-changed").
- * When the watched track is replaced, we distinguish a NATURAL end (the outgoing
- * track had played past NATURAL_END_RATIO of its length) from a MANUAL skip
- * (it had not) - on a natural end we fire; on a skip we re-arm onto the new
- * current track so a skip never causes a mid-track stomp. Pause/seek never
- * change track identity, so they never fire it.
+ * The action fires when the watched track is left - whether it ended naturally
+ * or the user skipped it. (The old code re-armed onto the new track on an early
+ * skip, so "skip the current track" silently swallowed the armed replace - the
+ * 2026-07-05 surprise. A deferral means "do this once we leave THIS track"; a
+ * skip leaves it just as an end does, so both fire.) Pause/seek never change
+ * track identity, so they never fire it.
+ *
+ * Accountability: every arming is recorded in the shared DeferralLedger with an
+ * id, its trigger, and a terminal outcome. The seam action returns a structured
+ * SeamOutcome (did it run? did a post-action read verify it landed?) which the
+ * player classifies into the ledger's terminal states. A seam action that fails
+ * or aborts is loud - a warn-level ledger entry - never a silent console.error.
  */
 
 import type { Zone, NowPlaying } from "node-roon-api-transport";
+import { deferralLedger, type DeferralMeta } from "./deferral-ledger.js";
 
-/** Fraction of a track that must have elapsed to count its end as "natural". */
-const NATURAL_END_RATIO = 0.85;
+/**
+ * What a seam action reports back so the player can record a truthful outcome.
+ * Every deferred action MUST verify its own landing (reuse the same queue-
+ * snapshot / now_playing read the direct path uses) and return the result here.
+ */
+export interface SeamOutcome {
+  /** Did the action complete the work it was armed to do? */
+  ok: boolean;
+  /** Did a post-action state read confirm the change actually landed? */
+  verified: boolean;
+  /** A clean, intended stand-down (interference, playback changed) - not a failure. */
+  aborted?: boolean;
+  /** Machine-readable reason for !ok / aborted / !verified (e.g. "resolve", "interference"). */
+  reason?: string;
+  /** Human detail for the ledger and logs. */
+  detail?: string;
+  /** The post-action state snapshot that backs the outcome. */
+  resulting_state?: unknown;
+}
+
+export type SeamAction = () => Promise<SeamOutcome>;
+
+/** The reason a supersede/cancel happened; drives the ledger terminal state. */
+export type CancelReason = "superseded" | "canceled";
 
 /** The slice of roonConnection the player needs; lets tests inject a fake. */
 export interface ZoneSource {
@@ -37,12 +67,18 @@ function trackKeyOf(np: NowPlaying): string {
 }
 
 interface Pending {
+  id: string;
   generation: number;
   zoneId: string;
   trackKey: string;
   length: number;
   lastSeek: number;
-  action: () => Promise<unknown>;
+  action: SeamAction;
+}
+
+export interface ScheduleResult {
+  deferral_id: string;
+  status: "fired" | "scheduled";
 }
 
 export class DeferredPlayer {
@@ -53,16 +89,38 @@ export class DeferredPlayer {
 
   constructor(private readonly source: ZoneSource) {}
 
-  /** Cancel any armed deferral. A new command (incl. an immediate play) supersedes. */
-  cancel(): void {
+  /**
+   * Cancel any armed deferral. A new command (incl. an immediate play)
+   * supersedes; an explicit user cancel is an abort. Records the terminal
+   * state in the ledger.
+   */
+  cancel(reason: CancelReason = "superseded"): void {
     this.generation++;
     this.detach();
+    if (this.pending) {
+      deferralLedger.settle(this.pending.id, reason === "canceled" ? "aborted" : "superseded", reason);
+    }
     this.pending = null;
+  }
+
+  /**
+   * Cancel a specific armed deferral by id (the cancel_deferred tool). Returns
+   * true if that id was the armed deferral and is now canceled.
+   */
+  cancelById(deferral_id: string, reason: CancelReason = "canceled"): boolean {
+    if (this.pending?.id !== deferral_id) return false;
+    this.cancel(reason);
+    return true;
   }
 
   /** True while a deferral is armed (exposed for status/tests). */
   isArmed(): boolean {
     return this.pending !== null;
+  }
+
+  /** The armed deferral's id, or null. */
+  armedId(): string | null {
+    return this.pending?.id ?? null;
   }
 
   private attach(): void {
@@ -76,24 +134,34 @@ export class DeferredPlayer {
   }
 
   /**
-   * Arm `action` to run at the end of the zone's current track. If nothing is
-   * playing there is no seam to wait for, so the action runs immediately.
-   * Returns "fired" if it ran now, "scheduled" if armed.
+   * Arm `action` to run at the end of the zone's current track, recording it in
+   * the ledger under `meta`. If nothing is playing there is no seam to wait for,
+   * so the action runs immediately. Returns the deferral id plus whether it
+   * fired now ("fired") or is armed ("scheduled").
+   *
+   * Arming supersedes any prior armed deferral (single-armed by design): the old
+   * one is recorded `superseded` before the new one arms.
    */
-  async scheduleAfterCurrent(zone: Zone, action: () => Promise<unknown>): Promise<"fired" | "scheduled"> {
+  async scheduleAfterCurrent(zone: Zone, action: SeamAction, meta: DeferralMeta): Promise<ScheduleResult> {
     this.generation++;
     const captured = this.generation;
     // Supersede any prior arming before deciding.
     this.detach();
+    if (this.pending) {
+      deferralLedger.settle(this.pending.id, "superseded", "a newer deferral was armed");
+    }
     this.pending = null;
+
+    const deferral_id = deferralLedger.arm(meta);
 
     const np = zone.now_playing;
     if (zone.state !== "playing" || !np || np.length == null) {
-      await action();
-      return "fired";
+      await this.runAction(deferral_id, action);
+      return { deferral_id, status: "fired" };
     }
 
     this.pending = {
+      id: deferral_id,
       generation: captured,
       zoneId: zone.zone_id,
       trackKey: trackKeyOf(np),
@@ -102,7 +170,41 @@ export class DeferredPlayer {
       action,
     };
     this.attach();
-    return "scheduled";
+    return { deferral_id, status: "scheduled" };
+  }
+
+  /**
+   * Run a seam action and record its outcome. Any throw becomes failed(<msg>);
+   * a returned SeamOutcome is classified into the ledger's terminal states.
+   */
+  private async runAction(deferral_id: string, action: SeamAction): Promise<void> {
+    deferralLedger.markFired(deferral_id);
+    let outcome: SeamOutcome;
+    try {
+      outcome = await action();
+    } catch (e) {
+      deferralLedger.settle(deferral_id, "failed", e instanceof Error ? e.message : String(e));
+      return;
+    }
+    if (outcome.aborted) {
+      deferralLedger.settle(deferral_id, "aborted", outcome.reason ?? "aborted", outcome.resulting_state);
+    } else if (!outcome.ok) {
+      deferralLedger.settle(
+        deferral_id,
+        "failed",
+        outcome.reason ?? outcome.detail ?? "action did not complete",
+        outcome.resulting_state,
+      );
+    } else if (outcome.verified) {
+      deferralLedger.settle(deferral_id, "fired_verified", undefined, outcome.resulting_state);
+    } else {
+      deferralLedger.settle(
+        deferral_id,
+        "fired_unverified",
+        outcome.reason ?? outcome.detail ?? "landing not confirmed",
+        outcome.resulting_state,
+      );
+    }
   }
 
   private handleSeek(zoneId: string): void {
@@ -135,23 +237,16 @@ export class DeferredPlayer {
       return;
     }
 
-    // Track changed. Natural end -> fire; manual skip -> re-arm onto the new track.
-    const ratio = p.length > 0 ? p.lastSeek / p.length : 1;
-    if (ratio >= NATURAL_END_RATIO) {
-      this.fire(p);
-    } else {
-      p.trackKey = currentKey;
-      p.length = np.length ?? 0;
-      p.lastSeek = np.seek_position ?? 0;
-    }
+    // Track identity changed = the zone left the armed trigger track. Fire,
+    // whether the track ended naturally or the user skipped it. Firing happens
+    // AT the new track's boundary (event-driven), never mid-track.
+    this.fire(p);
   }
 
   private fire(p: Pending): void {
     this.detach();
     if (this.generation !== p.generation) return; // superseded
     this.pending = null;
-    Promise.resolve()
-      .then(() => p.action())
-      .catch((e: unknown) => console.error("[DeferredPlayer] deferred action failed:", e));
+    void this.runAction(p.id, p.action);
   }
 }

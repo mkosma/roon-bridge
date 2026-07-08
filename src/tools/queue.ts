@@ -40,6 +40,7 @@ import { z } from "zod";
 import { roonConnection } from "../roon-connection.js";
 import type { Zone, QueueItem } from "node-roon-api-transport";
 import { deferredPlayer } from "../control/deferred-player-instance.js";
+import type { SeamOutcome } from "../control/deferred-player.js";
 import {
   newSessionKey,
   browseAndLoad,
@@ -388,21 +389,36 @@ export function registerQueueTools(server: McpServer): void {
         }
 
         // The jump itself (Roon play_from_here) + verification by re-read.
-        const doJump = async (): Promise<ToolResult> => {
+        // Returns a structured outcome so both the direct path (ToolResult) and
+        // the deferred path (SeamOutcome) report from the same verified read.
+        const runJump = async (): Promise<SeamOutcome> => {
           await roonConnection.playFromHere(z, queue_item_id);
           // Verify: re-read; the target should now be the head / now-playing.
           await new Promise((r) => setTimeout(r, 200));
           const after = await readQueueRows(z);
           const head = after[0];
-          return jsonResult({
+          const verified = head?.queue_item_id === queue_item_id;
+          return {
             ok: true,
-            jumped_to: { queue_item_id, title: target.title, artist: target.artist },
-            now_playing: head ? { queue_item_id: head.queue_item_id, title: head.title } : null,
-            verified: head?.queue_item_id === queue_item_id,
-            zone: z.display_name,
+            verified,
+            reason: verified ? undefined : "not_head",
+            detail: verified ? undefined : `after the jump the head is "${head?.title ?? "(none)"}", not the target`,
             resulting_state: await resultingState(z),
-          });
+          };
         };
+
+        const jumpResult = (o: SeamOutcome): ToolResult =>
+          jsonResult(
+            {
+              ok: o.ok,
+              jumped_to: { queue_item_id, title: target.title, artist: target.artist },
+              verified: o.verified,
+              ...(o.detail ? { detail: o.detail } : {}),
+              zone: z.display_name,
+              resulting_state: o.resulting_state,
+            },
+            !o.ok,
+          );
 
         // SAFE DEFAULT: defer the jump to the current track's natural end so the
         // playing track is never cut. Only when something is actually playing
@@ -410,14 +426,18 @@ export function registerQueueTools(server: McpServer): void {
         if (!immediate) {
           const np = z.now_playing;
           if (z.state === "playing" && np && np.length != null) {
-            deferredPlayer
-              .scheduleAfterCurrent(z, () => doJump())
-              .catch((e: unknown) => console.error("[play_from_here] schedule error:", e));
+            const { deferral_id } = await deferredPlayer.scheduleAfterCurrent(z, () => runJump(), {
+              zoneId: z.zone_id,
+              zoneName: z.display_name,
+              trigger: `end of "${np.three_line?.line1 ?? "the current track"}"`,
+              description: `jump to "${target.title}"`,
+            });
             return jsonResult({
               ok: true,
               scheduled: true,
+              deferral_id,
               jump_to: { queue_item_id, title: target.title, artist: target.artist },
-              detail: `Armed: playback will jump to "${target.title}" when "${np.three_line?.line1 ?? "the current track"}" ends (no mid-track cut). Pass immediate:true to jump now.`,
+              detail: `Armed: playback will jump to "${target.title}" when "${np.three_line?.line1 ?? "the current track"}" ends (no mid-track cut). Pass immediate:true to jump now. Track with deferred_status; cancel with cancel_deferred("${deferral_id}").`,
               zone: z.display_name,
               resulting_state: await resultingState(z),
             });
@@ -427,7 +447,7 @@ export function registerQueueTools(server: McpServer): void {
 
         // immediate:true (or nothing playing): jump now, superseding any deferral.
         deferredPlayer.cancel();
-        return await doJump();
+        return jumpResult(await runJump());
       } catch (e) {
         return jsonResult({ ok: false, error: e instanceof Error ? e.message : String(e) }, true);
       }

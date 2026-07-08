@@ -39,6 +39,7 @@ import type { ProviderName, ProviderTrack } from "../providers/types.js";
 import type { Zone, QueueItem } from "node-roon-api-transport";
 import type RoonApiBrowse from "node-roon-api-browse";
 import { deferredPlayer } from "../control/deferred-player-instance.js";
+import type { SeamOutcome } from "../control/deferred-player.js";
 import { resultingState, immediateBool } from "./resulting-state.js";
 import {
   newSessionKey,
@@ -727,25 +728,71 @@ function upcomingCount(items: QueueItem[], zone: Zone): number {
 }
 
 /**
- * Replace the queue with an ordered set, fresh-resolved at call time. Used by
- * the after_current deferral (item_keys captured at arming go stale by the seam,
- * so we re-resolve) and is the now-sequence's core: Play Now the first
- * resolvable track, then append the rest to the tail in order.
+ * Replace the queue with an ordered set at the track seam, then VERIFY and
+ * report. Used by the after_current deferral.
+ *
+ * `trackIds` are the EXACT provider ids resolved (and confidence-checked) at arm
+ * time - a fixed set. We re-resolve each id to a fresh Roon row at the seam
+ * because the item_keys captured at arming go stale, but the id set never
+ * changes, so no fuzzy match can substitute a different album minutes later
+ * (unlike the browse name path). Play Now the first resolvable track, append the
+ * rest in order, then re-read the queue and confirm the block landed. A resolve
+ * or play failure is reported in the SeamOutcome, never silently skipped.
  */
-async function runReplaceSequence(
+async function runReplaceSequenceVerified(
   browse: RoonApiBrowse,
   trackIds: string[],
   provider: ProviderName | undefined,
   zone: Zone,
-): Promise<void> {
+): Promise<SeamOutcome> {
+  const played: ResolvedTrack[] = [];
+  const failures: Array<{ trackId: string; reason: string }> = [];
   let replaced = false;
   for (let i = 0; i < trackIds.length; i++) {
     const t = await resolveOneForBatch(browse, trackIds[i], i, provider, zone);
-    if (!isResolved(t)) continue;
-    await execTrackAction(browse, t, zone, replaced ? "queue" : "play_now");
-    replaced = true;
+    if (!isResolved(t)) {
+      failures.push({ trackId: trackIds[i], reason: t.reason });
+      continue;
+    }
+    const r = await execTrackAction(browse, t, zone, replaced ? "queue" : "play_now");
+    if (r.ok) {
+      played.push(t);
+      replaced = true;
+    } else {
+      failures.push({ trackId: trackIds[i], reason: "exec_failed" });
+    }
   }
   await autoRadioOff(zone);
+
+  const resulting_state = await resultingState(zone);
+
+  // Nothing could be played: the replace did not happen. This is the failure the
+  // ledger must show loud (failed(resolve)) instead of a silently-lost action.
+  if (!replaced) {
+    return {
+      ok: false,
+      verified: false,
+      reason: "resolve",
+      detail: `no track could be resolved/played at the seam (${failures.length} of ${trackIds.length} failed)`,
+      resulting_state,
+    };
+  }
+
+  // 'now'/replace anchors the block at the HEAD (beforeIds empty).
+  const v = await verifyBlock(zone, played, new Set<number>(), "head");
+  const trailing = Math.max(0, v.queue_length - v.count_queued);
+  const verified = v.in_order && v.count_queued === played.length && failures.length === 0 && trailing === 0;
+  return {
+    ok: true,
+    verified,
+    reason: verified ? undefined : failures.length ? "resolve" : "verify",
+    detail: failures.length
+      ? `replace landed but ${failures.length} track(s) failed to resolve/play at the seam`
+      : verified
+        ? undefined
+        : "the queue did not settle to exactly the requested block",
+    resulting_state,
+  };
 }
 
 interface BlockVerification {
@@ -889,17 +936,27 @@ async function queueOrPlayTracks(
     if (when === "after_current") {
       const np = zone.now_playing;
       if (zone.state === "playing" && np && np.length != null) {
-        deferredPlayer
-          .scheduleAfterCurrent(zone, () => runReplaceSequence(browse, trackIds, provider, zone))
-          .catch((e: unknown) => console.error("[queueTracks] schedule error:", e));
+        // Replay only the ids that RESOLVED at arm time (exact, fixed set).
+        const armedIds = resolved.map((t) => t.trackId);
+        const { deferral_id } = await deferredPlayer.scheduleAfterCurrent(
+          zone,
+          () => runReplaceSequenceVerified(browse, armedIds, provider, zone),
+          {
+            zoneId: zone.zone_id,
+            zoneName: zone.display_name,
+            trigger: `end of "${np.three_line.line1}"`,
+            description: `replace queue with ${resolved.length} track(s) (exact ids resolved at arm)`,
+          },
+        );
         return jsonResult({
           ok: true,
           when,
           scheduled: true,
+          deferral_id,
           zone: zone.display_name,
           count_requested: trackIds.length,
           count_queued: resolved.length,
-          note: `${resolved.length} track(s) will replace the queue in order when "${np.three_line.line1}" ends (re-resolved at the seam; prior queue discarded).`,
+          note: `${resolved.length} track(s) will replace the queue in order when "${np.three_line.line1}" ends (exact ids resolved now, replayed at the seam; prior queue discarded). Track with deferred_status; cancel with cancel_deferred("${deferral_id}").`,
           tracks: trackStatus(),
           resulting_state: await resultingState(zone),
         });
