@@ -71,6 +71,7 @@ vi.mock("../src/roon-connection.js", () => ({
 }));
 
 const { createMonitorRouter } = await import("../src/control/monitor-router.js");
+const { deferralLedger } = await import("../src/control/deferral-ledger.js");
 
 async function withApp(fn: (base: string) => Promise<void>): Promise<void> {
   const app = express();
@@ -102,6 +103,27 @@ describe("GET /monitor/state", () => {
       expect(json.queue_remaining_count).toBe(29);
       expect(json.now_playing).toMatchObject({ title: "Karoo (Original)", artist: "Larse" });
     });
+  });
+
+  it("surfaces per-zone deferral outcomes (armed + recent)", async () => {
+    deferralLedger.reset();
+    const armed = deferralLedger.arm({ zoneId: "zone-1", zoneName: "WiiM + 1", trigger: 'end of "Karoo"', description: "replace queue with 4 track(s)" });
+    const failed = deferralLedger.arm({ zoneId: "zone-1", zoneName: "WiiM + 1", trigger: "t", description: "earlier replace" });
+    deferralLedger.settle(failed, "failed", "resolve");
+    // A deferral for another zone must NOT leak into this zone's view.
+    deferralLedger.arm({ zoneId: "zone-2", zoneName: "MacBook", trigger: "t", description: "other zone" });
+
+    await withApp(async (base) => {
+      const res = await fetch(`${base}/monitor/state?zone=WiiM`);
+      const json = (await res.json()) as Record<string, unknown>;
+      const def = json.deferrals as { armed_count: number; armed: Array<{ deferral_id: string }>; recent: Array<{ deferral_id: string; status: string; reason: string | null }> };
+      expect(def.armed_count).toBe(1);
+      expect(def.armed[0].deferral_id).toBe(armed);
+      expect(def.recent.find((r) => r.deferral_id === failed)).toMatchObject({ status: "failed", reason: "resolve" });
+      // The other zone's deferral is absent.
+      expect(def.recent.some((r) => r.deferral_id.startsWith("d-") && r.status === "armed" && r.deferral_id !== armed)).toBe(false);
+    });
+    deferralLedger.reset();
   });
 
   it("includes a representative volume plus per-output detail", async () => {
