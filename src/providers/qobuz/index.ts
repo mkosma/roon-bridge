@@ -8,6 +8,7 @@
 
 import {
   type MusicProvider,
+  type ProviderAlbum,
   type ProviderPlaylist,
   type ProviderTrack,
   ProviderError,
@@ -56,6 +57,15 @@ interface QobuzPlaylist {
   is_public?: boolean;
   tracks_count?: number;
 }
+interface QobuzAlbum {
+  id?: number | string;
+  title?: string;
+  artist?: { name?: string };
+  release_date_original?: string;
+  tracks_count?: number;
+  parental_warning?: boolean;
+  hires?: boolean;
+}
 
 function mapTrack(t: QobuzTrack): ProviderTrack {
   const version = t.version || undefined;
@@ -76,6 +86,18 @@ function mapTrack(t: QobuzTrack): ProviderTrack {
     version,
     instrumental: inferInstrumental(t.title ?? "", version ?? ""),
     hires: typeof t.hires === "boolean" ? t.hires : undefined,
+  };
+}
+function mapAlbum(a: QobuzAlbum): ProviderAlbum {
+  return {
+    provider: "qobuz",
+    id: String(a.id ?? ""),
+    title: a.title ?? "",
+    artist: a.artist?.name ?? "Unknown",
+    trackCount: a.tracks_count ?? 0,
+    year: yearFromReleaseDate(a.release_date_original),
+    explicit: typeof a.parental_warning === "boolean" ? a.parental_warning : undefined,
+    hires: typeof a.hires === "boolean" ? a.hires : undefined,
   };
 }
 function mapPlaylist(p: QobuzPlaylist): ProviderPlaylist {
@@ -123,6 +145,27 @@ export class QobuzProvider implements MusicProvider {
       throw new ProviderError("not_found", `Qobuz track ${id} not found`, "qobuz");
     }
     return mapTrack(data as QobuzTrack);
+  }
+
+  async searchAlbums(query: string, limit = 10): Promise<ProviderAlbum[]> {
+    const api = await this.api();
+    const data = await api.request("GET", "catalog/search", {
+      query,
+      type: "albums",
+      limit: Math.min(limit, 50),
+      offset: 0,
+    });
+    const items = ((data.albums as { items?: QobuzAlbum[] })?.items) ?? [];
+    return items.map(mapAlbum);
+  }
+
+  async getAlbum(id: string): Promise<ProviderAlbum> {
+    const api = await this.api();
+    const data = await api.request("GET", "album/get", { album_id: id });
+    if (!data.id && !data.title) {
+      throw new ProviderError("not_found", `Qobuz album ${id} not found`, "qobuz");
+    }
+    return mapAlbum(data as QobuzAlbum);
   }
 
   /**
