@@ -90,6 +90,13 @@ function snapshot(zone: Zone) {
     queue_time_remaining_seconds: zone.queue_time_remaining ?? null,
     volume: volumeSnapshot(zone),
     deferrals: deferralSnapshot(zone.zone_id),
+    // Freshness signal (prompts/03, item 3): the zone map above is served
+    // ok:true whenever core !== null, which hides a stalled WebSocket that
+    // stopped delivering events without dropping the core reference. A
+    // polling daemon should treat subscription_alive:false or an old
+    // last_zone_event_ts as stale, not trust ok:true alone.
+    subscription_alive: roonConnection.isSubscriptionAlive(),
+    last_zone_event_ts: roonConnection.getLastZoneEventTs(),
   };
 }
 

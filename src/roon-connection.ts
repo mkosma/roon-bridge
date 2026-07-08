@@ -62,6 +62,13 @@ export class RoonConnection extends EventEmitter {
   private core: RoonCore | null = null;
   private zones: Map<string, Zone> = new Map();
   private defaultZone: string = "";
+  // Freshness signal for /monitor/state (prompts/03, item 3): the in-memory
+  // zone map serves ok:true whenever core !== null, which hides a stalled
+  // WebSocket that stopped delivering zone events without dropping the
+  // core reference. subscriptionAlive tracks the zone SUBSCRIPTION (not the
+  // raw socket) so a poller can tell "connected" from "actually fresh".
+  private subscriptionAlive = false;
+  private lastZoneEventTs: number | null = null;
 
   constructor() {
     super();
@@ -96,6 +103,7 @@ export class RoonConnection extends EventEmitter {
         console.error(`[roon-bridge] Unpaired from core: ${core.display_name}`);
         this.core = null;
         this.zones.clear();
+        this.subscriptionAlive = false;
       },
     });
 
@@ -119,6 +127,7 @@ export class RoonConnection extends EventEmitter {
           console.error("[roon-bridge] Connection lost, reconnecting in 3s...");
           this.core = null;
           this.zones.clear();
+          this.subscriptionAlive = false;
           setTimeout(doConnect, 3000);
         },
         onerror: () => {
@@ -135,6 +144,11 @@ export class RoonConnection extends EventEmitter {
     if (!transport) return;
 
     transport.subscribe_zones((response, msg) => {
+      // Any callback firing - including a seek-only tick - proves the
+      // subscription is alive and still delivering events.
+      this.subscriptionAlive = true;
+      this.lastZoneEventTs = Date.now();
+
       let changed = false;
       if (response === "Subscribed" && msg.zones) {
         this.zones.clear();
@@ -216,6 +230,20 @@ export class RoonConnection extends EventEmitter {
 
   isConnected(): boolean {
     return this.core !== null;
+  }
+
+  /**
+   * Whether the zone SUBSCRIPTION is delivering events, as opposed to merely
+   * "core !== null". A stalled WebSocket that never dropped the core
+   * reference still reports isConnected() true; this catches that case.
+   */
+  isSubscriptionAlive(): boolean {
+    return this.subscriptionAlive;
+  }
+
+  /** Epoch ms of the last zone subscription event (Subscribed/Changed/seek), or null before the first one. */
+  getLastZoneEventTs(): number | null {
+    return this.lastZoneEventTs;
   }
 
   getZones(): Zone[] {
