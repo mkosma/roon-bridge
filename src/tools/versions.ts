@@ -46,6 +46,7 @@ import {
 } from "./search-core.js";
 import type { Zone } from "node-roon-api-transport";
 import type RoonApiBrowse from "node-roon-api-browse";
+import { resultingState, immediateBool } from "./resulting-state.js";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
@@ -234,25 +235,24 @@ export function registerVersionTools(server: McpServer): void {
   // ---------------------------------------------------------------------------
   server.tool(
     "queue_version",
-    "Queue (or play) the EXACT recording identified by a `ref` from find_versions. Re-resolves the ref deterministically by exact title+subtitle match - not a fuzzy top pick - then runs the chosen action and verifies the queue actually grew. Use this to pin the studio cut after find_versions shows live/comp variants. SAFE DEFAULT: never cuts the current track. when: 'queue' adds to end (default), 'next' plays after the current track. To play immediately (replacing the current track), pass immediate:true.",
+    "Queue (or play) the EXACT recording identified by a `ref` from find_versions. Re-resolves the ref deterministically by exact title+subtitle match - not a fuzzy top pick - then runs the chosen action and verifies the queue actually grew. Use this to pin the studio cut after find_versions shows live/comp variants. SAFE DEFAULT: never cuts the current track. when: 'queue' adds to end (default), 'next' plays after the current track, 'replace' interrupts now and replaces the queue with this recording (the harness-safe one-call stomp; immediate:true is the legacy equivalent).",
     {
       ref: z.string().describe("A candidate `ref` returned by find_versions."),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)."),
-      immediate: z
-        .boolean()
+      immediate: immediateBool
         .optional()
         .default(false)
-        .describe("Interrupt/replace the currently-playing track RIGHT NOW. Default false = never cut the current track (uses `when` for non-interrupting placement)."),
+        .describe("Interrupt/replace the currently-playing track RIGHT NOW. Default false = never cut the current track. Prefer when:\"replace\" for the same effect without a boolean."),
       when: z
-        .enum(["queue", "next"])
+        .enum(["queue", "next", "replace"])
         .default("queue")
-        .describe("Non-interrupting placement: 'queue' adds to end (default); 'next' plays after the current track. Ignored when immediate:true."),
+        .describe("Placement: 'queue' adds to end (default); 'next' plays after the current track; 'replace' interrupts and replaces the queue RIGHT NOW. Ignored when immediate:true (which forces replace)."),
     },
     async ({ ref, zone, immediate, when: whenArg }): Promise<ToolResult> => {
       try {
-        // `immediate` is the ONLY switch that authorizes cutting the current
-        // track; without it a stray 'now' is downgraded to the safe placement.
-        const when: "queue" | "next" | "now" = immediate ? "now" : whenArg === "next" ? "next" : "queue";
+        // `immediate` / when:"replace" are the only switches that authorize
+        // cutting the current track; otherwise use the safe placement.
+        const when: "queue" | "next" | "now" = (immediate || whenArg === "replace") ? "now" : whenArg === "next" ? "next" : "queue";
         const decoded = decodeRef(ref);
         if (!decoded) return jsonResult({ ok: false, error: "bad_ref", detail: "ref did not decode; get a fresh one from find_versions." }, true);
 
@@ -349,7 +349,7 @@ export function registerVersionTools(server: McpServer): void {
         };
 
         if (!verifyAdd) {
-          return jsonResult({ ok: true, action: action.matched, when, matched, zone: zoneObj.display_name });
+          return jsonResult({ ok: true, action: action.matched, when, matched, zone: zoneObj.display_name, resulting_state: await resultingState(zoneObj) });
         }
 
         // Verify by re-reading the queue until it grows (bounded poll).
@@ -387,7 +387,7 @@ export function registerVersionTools(server: McpServer): void {
           );
         }
 
-        return jsonResult({ ok: true, action: action.matched, when, matched, verified: true, queue_count_before: beforeCount, queue_count_after: afterCount, zone: zoneObj.display_name });
+        return jsonResult({ ok: true, action: action.matched, when, matched, verified: true, queue_count_before: beforeCount, queue_count_after: afterCount, zone: zoneObj.display_name, resulting_state: await resultingState(zoneObj) });
       } catch (e) {
         return jsonResult({ ok: false, error: e instanceof Error ? e.message : String(e) }, true);
       }
