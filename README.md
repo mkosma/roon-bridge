@@ -496,39 +496,47 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.roon-bridge.plist
 Override the Roon Core address with `ROON_HOST` / `ROON_PORT` env vars
 (defaults: `127.0.0.1:9330`).
 
-## Deploy / coordinated restart (queue + monitor + roon-playlist build)
+## Deploy
 
-The live daemon serves Maya's MCP connection and active playback, so deploy
-the `feat/queue-editing-and-state-read` work in a single coordinated restart:
+The live daemon serves Maya's MCP connection and active playback. A deploy is:
+**pull, build, kickstart, smoke.sh, gen:toolref, handoff note.**
 
 ```bash
-# 1. Land the branch
-git -C ~/dev/roon-bridge checkout feat/queue-editing-and-state-read
-git -C ~/dev/roon-bridge merge --ff-only main   # or merge to main first
+# 1. Pull (merge to main first, or fast-forward it)
+git -C ~/dev/roon-bridge checkout main
+git -C ~/dev/roon-bridge pull
 
 # 2. Build + test green BEFORE touching the running daemon
 npm --prefix ~/dev/roon-bridge run build
 npm --prefix ~/dev/roon-bridge test
 
-# 3. (Optional, bridge stopped) confirm the Roon-native Playlists path.
-#    perf:probe pairs as the SAME extension, so stop the bridge first.
-launchctl bootout gui/$(id -u)/com.roon-bridge
-npm --prefix ~/dev/roon-bridge run perf:probe   # look for the Playlists node block
-# (skip step 3 to minimize downtime; go straight to restart)
+# 3. Restart the daemon onto the new build
+launchctl kickstart -k gui/$(id -u)/com.roon-bridge
 
-# 4. Restart the daemon onto the new build
-launchctl kickstart -k gui/$(id -u)/com.roon-bridge   # if you did NOT stop it
-# or, if you stopped it in step 3:
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.roon-bridge.plist
+# 4. Smoke-check - fails loudly if the daemon is still serving the old
+#    build (stale-bridge class) or Roon/the subscription looks unhealthy.
+#    Never pass --live-mutation as part of an unattended deploy.
+~/dev/roon-bridge/scripts/smoke.sh
 
-# 5. Smoke-check
-curl -s http://localhost:3100/health
-curl -s -H "Authorization: Bearer $TOKEN" \
-  "http://localhost:3100/monitor/state?zone=WiiM%20%2B%201"
+# 5. Regenerate Maya's tool reference from the now-live schema
+python3 ~/dev/agents/agents/Maya/code/gen-tool-reference.py
+
+# 6. Handoff note - tell Maya (and anyone else relying on the bridge) what
+#    changed, especially if scripts/smoke.sh flagged a schema/enum change.
 ```
 
 Restarting drops in-flight MCP sessions (clients auto-reconnect) but does not
 disturb Roon playback. The new MCP tools appear after the client reconnects.
+
+For the Roon-native Playlists path specifically (perf:probe pairs as the same
+extension, so it needs the bridge stopped first):
+
+```bash
+launchctl bootout gui/$(id -u)/com.roon-bridge
+npm --prefix ~/dev/roon-bridge run perf:probe   # look for the Playlists node block
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.roon-bridge.plist
+~/dev/roon-bridge/scripts/smoke.sh
+```
 
 ## Credits
 
