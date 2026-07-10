@@ -16,7 +16,7 @@ import {
 } from "./search-core.js";
 import { deferredPlayer } from "../control/deferred-player-instance.js";
 import type { SeamOutcome } from "../control/deferred-player.js";
-import { resultingState, immediateBool } from "./resulting-state.js";
+import { resultingState, immediateBool, boolish } from "./resulting-state.js";
 import type RoonApiBrowse from "node-roon-api-browse";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
@@ -1605,8 +1605,7 @@ export function registerBrowseTools(server: McpServer): void {
       artist: z.string().describe("Artist name to search for"),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
       immediate: immediateArg,
-      shuffle: z
-        .boolean()
+      shuffle: boolish()
         .optional()
         .default(false)
         .describe("Play in shuffled order via Roon's native Shuffle action (default false)"),
@@ -1626,8 +1625,7 @@ export function registerBrowseTools(server: McpServer): void {
         .enum(["after_current", "replace"])
         .default("after_current")
         .describe("Placement: 'after_current' (default) replaces the queue when the current track ends (no mid-track cut); 'replace' does it RIGHT NOW. immediate:true forces replace."),
-      shuffle: z
-        .boolean()
+      shuffle: boolish()
         .optional()
         .default(false)
         .describe("Play in shuffled order via Roon's native Shuffle action (default false = album order)"),
@@ -1649,8 +1647,7 @@ export function registerBrowseTools(server: McpServer): void {
         .enum(["after_current", "replace"])
         .default("after_current")
         .describe("Placement: 'after_current' (default) starts the playlist when the current track ends (no mid-track cut); 'replace' does it RIGHT NOW. immediate:true forces replace."),
-      shuffle: z
-        .boolean()
+      shuffle: boolish()
         .optional()
         .default(false)
         .describe("Play in shuffled order via Roon's native Shuffle action (default false = playlist order)"),

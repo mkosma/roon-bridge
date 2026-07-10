@@ -1,0 +1,1342 @@
+[
+  {
+    "name": "add_to_library",
+    "required": [
+      "query"
+    ],
+    "params": {
+      "category": {
+        "enum": [
+          "album",
+          "artist"
+        ]
+      },
+      "query": {
+        "type": "string"
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "add_to_queue",
+    "required": [
+      "query"
+    ],
+    "params": {
+      "category": {
+        "enum": [
+          "album",
+          "artist",
+          "playlist",
+          "track"
+        ]
+      },
+      "query": {
+        "type": "string"
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "add_tracks_to_playlist",
+    "required": [
+      "playlist_id",
+      "track_ids"
+    ],
+    "params": {
+      "playlist_id": {
+        "type": "string"
+      },
+      "provider": {
+        "enum": [
+          "qobuz",
+          "tidal"
+        ]
+      },
+      "track_ids": {
+        "type": "array"
+      }
+    }
+  },
+  {
+    "name": "cancel_deferred",
+    "required": [
+      "deferral_id"
+    ],
+    "params": {
+      "deferral_id": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "change_volume",
+    "required": [
+      "value"
+    ],
+    "params": {
+      "how": {
+        "enum": [
+          "absolute",
+          "relative",
+          "relative_step"
+        ]
+      },
+      "snap": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "value": {
+        "type": "number"
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "create_playlist",
+    "required": [
+      "name"
+    ],
+    "params": {
+      "description": {
+        "type": "string"
+      },
+      "is_public": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "name": {
+        "type": "string"
+      },
+      "provider": {
+        "enum": [
+          "qobuz",
+          "tidal"
+        ]
+      }
+    }
+  },
+  {
+    "name": "deferred_status",
+    "required": [],
+    "params": {
+      "limit": {
+        "type": "integer"
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "delete_playlist",
+    "required": [
+      "confirm",
+      "playlist_id"
+    ],
+    "params": {
+      "confirm": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "playlist_id": {
+        "type": "string"
+      },
+      "provider": {
+        "enum": [
+          "qobuz",
+          "tidal"
+        ]
+      }
+    }
+  },
+  {
+    "name": "edit_queue",
+    "required": [],
+    "params": {
+      "delete": {
+        "type": "array"
+      },
+      "immediate": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "reorder": {
+        "type": "array"
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "find_versions",
+    "required": [
+      "query"
+    ],
+    "params": {
+      "category": {
+        "enum": [
+          "album",
+          "track"
+        ]
+      },
+      "exclude_live": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "limit": {
+        "type": "integer"
+      },
+      "query": {
+        "type": "string"
+      },
+      "source": {
+        "enum": [
+          "all",
+          "library"
+        ]
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "get_playlist",
+    "required": [
+      "playlist_id"
+    ],
+    "params": {
+      "limit": {
+        "type": "integer"
+      },
+      "playlist_id": {
+        "type": "string"
+      },
+      "provider": {
+        "enum": [
+          "qobuz",
+          "tidal"
+        ]
+      }
+    }
+  },
+  {
+    "name": "get_queue",
+    "required": [],
+    "params": {
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "get_roon_playlist",
+    "required": [],
+    "params": {
+      "item_key": {
+        "type": "string"
+      },
+      "limit": {
+        "type": "integer"
+      },
+      "name": {
+        "type": "string"
+      },
+      "offset": {
+        "type": "integer"
+      }
+    }
+  },
+  {
+    "name": "get_volume",
+    "required": [],
+    "params": {
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "group_zones",
+    "required": [
+      "zones"
+    ],
+    "params": {
+      "zones": {
+        "type": "array"
+      }
+    }
+  },
+  {
+    "name": "insert_tracks_at",
+    "required": [
+      "at_index",
+      "playlist_id",
+      "track_ids"
+    ],
+    "params": {
+      "at_index": {
+        "type": "integer"
+      },
+      "playlist_id": {
+        "type": "string"
+      },
+      "provider": {
+        "enum": [
+          "qobuz",
+          "tidal"
+        ]
+      },
+      "track_ids": {
+        "type": "array"
+      }
+    }
+  },
+  {
+    "name": "list_playlists",
+    "required": [],
+    "params": {
+      "limit": {
+        "type": "integer"
+      },
+      "provider": {
+        "enum": [
+          "qobuz",
+          "tidal"
+        ]
+      }
+    }
+  },
+  {
+    "name": "list_roon_playlists",
+    "required": [],
+    "params": {}
+  },
+  {
+    "name": "list_zones",
+    "required": [],
+    "params": {}
+  },
+  {
+    "name": "loop",
+    "required": [
+      "mode"
+    ],
+    "params": {
+      "mode": {
+        "enum": [
+          "disabled",
+          "loop",
+          "loop_one",
+          "next"
+        ]
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "mute",
+    "required": [
+      "mute"
+    ],
+    "params": {
+      "mute": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "mute_toggle",
+    "required": [],
+    "params": {
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "next_track",
+    "required": [],
+    "params": {
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "now_playing",
+    "required": [],
+    "params": {
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "pause",
+    "required": [],
+    "params": {
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "play",
+    "required": [],
+    "params": {
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "play_after_current",
+    "required": [
+      "track"
+    ],
+    "params": {
+      "track": {
+        "type": "string"
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "play_album",
+    "required": [
+      "album"
+    ],
+    "params": {
+      "album": {
+        "type": "string"
+      },
+      "immediate": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "shuffle": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "when": {
+        "enum": [
+          "after_current",
+          "replace"
+        ]
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "play_album_by_id",
+    "required": [
+      "album_id"
+    ],
+    "params": {
+      "album_id": {
+        "type": "string"
+      },
+      "immediate": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "provider": {
+        "enum": [
+          "qobuz",
+          "tidal"
+        ]
+      },
+      "when": {
+        "enum": [
+          "next",
+          "queue",
+          "replace"
+        ]
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "play_artist",
+    "required": [
+      "artist"
+    ],
+    "params": {
+      "artist": {
+        "type": "string"
+      },
+      "immediate": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "shuffle": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "play_by_id",
+    "required": [
+      "track_id"
+    ],
+    "params": {
+      "immediate": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "provider": {
+        "enum": [
+          "qobuz",
+          "tidal"
+        ]
+      },
+      "track_id": {
+        "type": "string"
+      },
+      "when": {
+        "enum": [
+          "next",
+          "queue",
+          "replace"
+        ]
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "play_from_here",
+    "required": [
+      "queue_item_id"
+    ],
+    "params": {
+      "immediate": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "queue_item_id": {
+        "type": "integer"
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "play_pause",
+    "required": [],
+    "params": {
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "play_playlist",
+    "required": [
+      "playlist"
+    ],
+    "params": {
+      "immediate": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "playlist": {
+        "type": "string"
+      },
+      "shuffle": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "when": {
+        "enum": [
+          "after_current",
+          "replace"
+        ]
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "play_track",
+    "required": [
+      "track"
+    ],
+    "params": {
+      "immediate": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "track": {
+        "type": "string"
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "play_tracks",
+    "required": [
+      "track_ids"
+    ],
+    "params": {
+      "immediate": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "provider": {
+        "enum": [
+          "qobuz",
+          "tidal"
+        ]
+      },
+      "track_ids": {
+        "type": "array"
+      },
+      "when": {
+        "enum": [
+          "after_current",
+          "next",
+          "queue",
+          "replace"
+        ]
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "previous_track",
+    "required": [],
+    "params": {
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "queue_album_by_id",
+    "required": [
+      "album_id"
+    ],
+    "params": {
+      "album_id": {
+        "type": "string"
+      },
+      "immediate": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "provider": {
+        "enum": [
+          "qobuz",
+          "tidal"
+        ]
+      },
+      "when": {
+        "enum": [
+          "next",
+          "queue",
+          "replace"
+        ]
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "queue_by_id",
+    "required": [
+      "track_id"
+    ],
+    "params": {
+      "immediate": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "provider": {
+        "enum": [
+          "qobuz",
+          "tidal"
+        ]
+      },
+      "track_id": {
+        "type": "string"
+      },
+      "when": {
+        "enum": [
+          "next",
+          "queue",
+          "replace"
+        ]
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "queue_next",
+    "required": [
+      "query"
+    ],
+    "params": {
+      "category": {
+        "enum": [
+          "album",
+          "artist",
+          "playlist",
+          "track"
+        ]
+      },
+      "query": {
+        "type": "string"
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "queue_tracks",
+    "required": [
+      "track_ids"
+    ],
+    "params": {
+      "immediate": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "provider": {
+        "enum": [
+          "qobuz",
+          "tidal"
+        ]
+      },
+      "track_ids": {
+        "type": "array"
+      },
+      "when": {
+        "enum": [
+          "after_current",
+          "next",
+          "queue",
+          "replace"
+        ]
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "queue_version",
+    "required": [
+      "ref"
+    ],
+    "params": {
+      "immediate": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "ref": {
+        "type": "string"
+      },
+      "when": {
+        "enum": [
+          "next",
+          "queue",
+          "replace"
+        ]
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "ramp_volume",
+    "required": [
+      "value"
+    ],
+    "params": {
+      "curve": {
+        "enum": [
+          "ease",
+          "linear",
+          "perceptual"
+        ]
+      },
+      "duration_ms": {
+        "type": "integer"
+      },
+      "how": {
+        "enum": [
+          "absolute",
+          "relative"
+        ]
+      },
+      "value": {
+        "type": "number"
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "remove_from_queue",
+    "required": [
+      "queue_item_ids"
+    ],
+    "params": {
+      "queue_item_ids": {
+        "type": "array"
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "remove_tracks_from_playlist",
+    "required": [
+      "playlist_id",
+      "track_ids"
+    ],
+    "params": {
+      "playlist_id": {
+        "type": "string"
+      },
+      "provider": {
+        "enum": [
+          "qobuz",
+          "tidal"
+        ]
+      },
+      "track_ids": {
+        "type": "array"
+      }
+    }
+  },
+  {
+    "name": "rename_playlist",
+    "required": [
+      "name",
+      "playlist_id"
+    ],
+    "params": {
+      "name": {
+        "type": "string"
+      },
+      "playlist_id": {
+        "type": "string"
+      },
+      "provider": {
+        "enum": [
+          "qobuz",
+          "tidal"
+        ]
+      }
+    }
+  },
+  {
+    "name": "reorder_playlist_tracks",
+    "required": [
+      "playlist_id",
+      "to_index",
+      "track_ids"
+    ],
+    "params": {
+      "playlist_id": {
+        "type": "string"
+      },
+      "provider": {
+        "enum": [
+          "qobuz",
+          "tidal"
+        ]
+      },
+      "to_index": {
+        "type": "integer"
+      },
+      "track_ids": {
+        "type": "array"
+      }
+    }
+  },
+  {
+    "name": "reorder_queue",
+    "required": [
+      "new_position",
+      "queue_item_id"
+    ],
+    "params": {
+      "new_position": {
+        "type": "integer"
+      },
+      "queue_item_id": {
+        "type": "integer"
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "search",
+    "required": [
+      "query"
+    ],
+    "params": {
+      "category": {
+        "enum": [
+          "album",
+          "artist",
+          "composer",
+          "genre",
+          "playlist",
+          "track"
+        ]
+      },
+      "limit": {
+        "type": "integer"
+      },
+      "offset": {
+        "type": "integer"
+      },
+      "query": {
+        "type": "string"
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "search_albums",
+    "required": [
+      "query"
+    ],
+    "params": {
+      "limit": {
+        "type": "integer"
+      },
+      "provider": {
+        "enum": [
+          "qobuz",
+          "tidal"
+        ]
+      },
+      "query": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "search_tracks",
+    "required": [
+      "query"
+    ],
+    "params": {
+      "limit": {
+        "type": "integer"
+      },
+      "provider": {
+        "enum": [
+          "qobuz",
+          "tidal"
+        ]
+      },
+      "query": {
+        "type": "string"
+      },
+      "source": {
+        "enum": [
+          "all",
+          "library"
+        ]
+      }
+    }
+  },
+  {
+    "name": "seek",
+    "required": [
+      "seconds"
+    ],
+    "params": {
+      "relative": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "seconds": {
+        "type": "number"
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "set_default_zone",
+    "required": [
+      "zone"
+    ],
+    "params": {
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "shuffle",
+    "required": [
+      "enabled"
+    ],
+    "params": {
+      "enabled": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "smooth_skip",
+    "required": [],
+    "params": {
+      "direction": {
+        "enum": [
+          "next",
+          "previous"
+        ]
+      },
+      "fade_in_ms": {
+        "type": "integer"
+      },
+      "fade_ms": {
+        "type": "integer"
+      },
+      "fade_out_ms": {
+        "type": "integer"
+      },
+      "floor": {
+        "type": "integer"
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "stop",
+    "required": [],
+    "params": {
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "transfer_zone",
+    "required": [
+      "from_zone",
+      "to_zone"
+    ],
+    "params": {
+      "from_zone": {
+        "type": "string"
+      },
+      "to_zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "ungroup_zone",
+    "required": [
+      "zone"
+    ],
+    "params": {
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "volume_preset",
+    "required": [
+      "index"
+    ],
+    "params": {
+      "index": {
+        "type": "integer"
+      },
+      "instant": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "enum": [
+              "false",
+              "true"
+            ]
+          }
+        ]
+      },
+      "zone": {
+        "type": "string"
+      }
+    }
+  },
+  {
+    "name": "zone_state",
+    "required": [],
+    "params": {
+      "zone": {
+        "type": "string"
+      }
+    }
+  }
+]

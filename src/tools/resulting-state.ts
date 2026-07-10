@@ -98,8 +98,16 @@ export async function resultingState(zone: Zone): Promise<ResultingState> {
 /**
  * Harness-safe boolean: accepts a real boolean OR the strings "true"/"false"
  * (which a scalar-stringifying MCP client sends), normalizing to a boolean.
- * Wrap with `.optional().default(false).describe(...)` at each call site.
+ * Every public tool boolean param must use this instead of a plain
+ * z.boolean() - enforced by tests/no-plain-boolean.test.ts. Wrap with
+ * `.optional().default(false).describe(...)` at each call site same as a
+ * plain z.boolean() would be.
  */
-export const immediateBool = z
-  .union([z.boolean(), z.enum(["true", "false"])])
-  .transform((v) => v === true || v === "true");
+export function boolish(): z.ZodEffects<z.ZodUnion<[z.ZodBoolean, z.ZodEnum<["true", "false"]>]>, boolean, boolean | "true" | "false"> {
+  return z
+    .union([z.boolean(), z.enum(["true", "false"])])
+    .transform((v) => v === true || v === "true");
+}
+
+/** The single shared instance used for the `immediate` interrupt switch. */
+export const immediateBool = boolish();

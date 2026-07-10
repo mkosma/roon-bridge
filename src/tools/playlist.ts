@@ -10,6 +10,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { initProviders } from "../providers/bootstrap.js";
 import type { MusicProvider, ProviderName } from "../providers/types.js";
+import { boolish } from "./resulting-state.js";
 
 const providerArg = z
   .enum(["qobuz", "tidal"])
@@ -149,7 +150,7 @@ export function registerPlaylistTools(server: McpServer): void {
     {
       name: z.string().describe("Playlist name"),
       description: z.string().optional().describe("Optional description"),
-      is_public: z.boolean().optional().describe("Public playlist (default false)"),
+      is_public: boolish().optional().describe("Public playlist (default false)"),
       provider: providerArg,
     },
     async ({ name, description, is_public, provider }) => {
@@ -274,9 +275,7 @@ export function registerPlaylistTools(server: McpServer): void {
     "Delete a playlist. IRREVERSIBLE — requires confirm: true.",
     {
       playlist_id: z.string().describe("Provider playlist ID"),
-      confirm: z
-        .boolean()
-        .describe("Must be true to actually delete (guards against accidental deletion)"),
+      confirm: boolish().describe("Must be true to actually delete (guards against accidental deletion)"),
       provider: providerArg,
     },
     async ({ playlist_id, confirm, provider }) => {

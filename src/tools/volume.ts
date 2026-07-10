@@ -5,7 +5,7 @@ import type { ResultCallback } from "node-roon-api-transport";
 import { sharedRamper } from "../control/shared-ramper.js";
 import { VolumeRamper } from "../control/volume-ramper.js";
 import { readRoonKeyConfig } from "../control/roon-key-config.js";
-import { resultingState } from "./resulting-state.js";
+import { resultingState, boolish } from "./resulting-state.js";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
@@ -84,8 +84,7 @@ export function registerVolumeTools(server: McpServer): void {
         .enum(["absolute", "relative", "relative_step"])
         .default("absolute")
         .describe("How to interpret the value: 'absolute' sets exact level, 'relative' adds/subtracts, 'relative_step' adjusts by hardware step increments (always instant)"),
-      snap: z
-        .boolean()
+      snap: boolish()
         .default(false)
         .describe("If true, jump to the new level instantly (the old behavior); otherwise apply it as a short audible fade. Small changes (<=2 units) snap regardless."),
     },
@@ -376,7 +375,7 @@ export function registerVolumeTools(server: McpServer): void {
     "Mute or unmute a Roon zone",
     {
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
-      mute: z.boolean().describe("true to mute, false to unmute"),
+      mute: boolish().describe("true to mute, false to unmute"),
     },
     async ({ zone, mute }): Promise<ToolResult> => {
       try {
@@ -509,8 +508,7 @@ export function registerVolumeTools(server: McpServer): void {
     {
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
       index: z.number().int().positive().describe("1-based preset index into the configured presets list"),
-      instant: z
-        .boolean()
+      instant: boolish()
         .default(false)
         .describe("If true, jump instantly; otherwise ramp smoothly to the preset level"),
     },
