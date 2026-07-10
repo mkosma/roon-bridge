@@ -519,7 +519,7 @@ launchctl kickstart -k gui/$(id -u)/com.roon-bridge
 ~/dev/roon-bridge/scripts/smoke.sh
 
 # 5. Regenerate Maya's tool reference from the now-live schema
-python3 ~/dev/agents/agents/Maya/code/gen-tool-reference.py
+python3 ~/.agents/Maya/code/gen-tool-reference.py
 
 # 6. Handoff note - tell Maya (and anyone else relying on the bridge) what
 #    changed, especially if scripts/smoke.sh flagged a schema/enum change.
