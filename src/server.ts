@@ -23,16 +23,30 @@ import express from "express";
 import { randomUUID } from "node:crypto";
 import { Bonjour } from "bonjour-service";
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-const _pkgPath = join(dirname(dirname(fileURLToPath(import.meta.url))), "package.json");
+const _repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const _pkgPath = join(_repoRoot, "package.json");
 let _pkgVersion = "1.0.0";
 try {
   const pkg = JSON.parse(readFileSync(_pkgPath, { encoding: "utf8" })) as { version?: string };
   _pkgVersion = pkg.version ?? "1.0.0";
 } catch {
   // ignore
+}
+
+// Commit the RUNNING process was built from, so a post-deploy smoke check
+// can catch a stale bridge: a `git rev-parse HEAD` here reflects the repo
+// state at request time, which only matches what the running code actually
+// does if the daemon was restarted after the last pull - exactly the
+// deployed-code-vs-running-code drift scripts/smoke.sh checks for.
+let _gitCommit: string | null = null;
+try {
+  _gitCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: _repoRoot, encoding: "utf8" }).trim();
+} catch {
+  // Not running from a git checkout (e.g. a packaged install) - not fatal.
 }
 
 // Prevent process crashes from unhandled errors in node-roon-api's WebSocket
@@ -116,6 +130,8 @@ async function startHttpServer(): Promise<void> {
   app.get("/health", (_req, res) => {
     res.json({
       status: "ok",
+      version: _pkgVersion,
+      commit: _gitCommit,
       roon_connected: roonConnection.isConnected(),
       zones: roonConnection.getZones().map((z) => ({
         name: z.display_name,
