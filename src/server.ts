@@ -12,23 +12,11 @@
  * Claude Desktop / Claude Code integration when running locally.
  */
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { roonConnection } from "./roon-connection.js";
-import { registerZoneTools } from "./tools/zone.js";
-import { registerPlaybackTools } from "./tools/playback.js";
-import { registerVolumeTools } from "./tools/volume.js";
-import { registerBrowseTools } from "./tools/browse.js";
-import { registerQueueTools } from "./tools/queue.js";
-import { registerVersionTools } from "./tools/versions.js";
-import { registerRoonPlaylistTools } from "./tools/roon-playlists.js";
-import { registerPlaylistTools } from "./tools/playlist.js";
-import { registerPlayByIdTools } from "./tools/play-by-id.js";
-import { registerAlbumByIdTools } from "./tools/album-by-id.js";
-import { registerEditQueueTools } from "./tools/edit-queue.js";
-import { registerDeferredTools } from "./tools/deferred.js";
-import { registerTopologyTools } from "./tools/topology.js";
+import { createMcpServer } from "./mcp-server-factory.js";
 import { createControlRouter, createConfigRouter } from "./control/control-router.js";
 import { createMonitorRouter } from "./control/monitor-router.js";
 import express from "express";
@@ -59,34 +47,6 @@ const BRIDGE_PORT = parseInt(process.env.BRIDGE_PORT || "3100", 10);
 const BRIDGE_HOST = process.env.BRIDGE_HOST || "0.0.0.0";
 const AUTH_TOKEN = process.env.BRIDGE_AUTH_TOKEN;
 const USE_STDIO = process.argv.includes("--stdio");
-
-/**
- * Create and configure a fresh MCP server instance.
- * Each HTTP session gets its own McpServer so that browse state,
- * session counters, etc. are isolated between clients.
- */
-function createMcpServer(): McpServer {
-  const server = new McpServer({
-    name: "roon-bridge",
-    version: "1.0.0",
-  });
-
-  registerZoneTools(server);
-  registerPlaybackTools(server);
-  registerVolumeTools(server);
-  registerBrowseTools(server);
-  registerQueueTools(server);
-  registerVersionTools(server);
-  registerRoonPlaylistTools(server);
-  registerPlaylistTools(server);
-  registerPlayByIdTools(server);
-  registerAlbumByIdTools(server);
-  registerEditQueueTools(server);
-  registerDeferredTools(server);
-  registerTopologyTools(server);
-
-  return server;
-}
 
 /** Bearer token auth middleware */
 function authMiddleware(
