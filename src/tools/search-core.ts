@@ -468,6 +468,51 @@ export function pickTrackRow(
   return { item: pool[0], unambiguous: pool.length === 1, tiedCount: pool.length };
 }
 
+/** An album-identity descriptor coming from a provider (Qobuz), for exact pinning. */
+export interface AlbumIdentity {
+  title: string;
+  artist: string;
+  year?: number;
+}
+
+/**
+ * Deterministically pick the browse row for an EXACT album from a list of
+ * candidate Albums-category rows, using a provider's authoritative
+ * title/artist/year. Never falls back to a fuzzy top-1 match (bestMatch) - the
+ * whole point of an ID-anchored resolve is that a loose word-score guess can
+ * never substitute a different release.
+ *
+ *   1. Keep rows whose normalized title equals the target title.
+ *   2. If the row subtitle carries an artist, require it to match.
+ *   3. If still tied, prefer a row whose subtitle carries the target year
+ *      (Roon album subtitles are often "Artist · Year" or similar).
+ *
+ * Returns the chosen row plus whether the pick was unambiguous, so the caller
+ * can report a tie honestly instead of guessing.
+ */
+export function pickAlbumRow(
+  rows: BrowseItem[],
+  target: AlbumIdentity,
+): { item: BrowseItem; unambiguous: boolean; tiedCount: number } | undefined {
+  const wantTitle = normalizeTitle(target.title);
+  const playable = rows.filter((r) => r.item_key && r.hint !== "header");
+
+  let titleHits = playable.filter((r) => normalizeTitle(r.title) === wantTitle);
+  if (!titleHits.length) return undefined;
+
+  let pool = titleHits;
+  const artistHits = pool.filter((r) => artistMatches(stripRoonLinks(r.subtitle || ""), target.artist));
+  if (artistHits.length) pool = artistHits;
+
+  if (pool.length > 1 && target.year != null) {
+    const yearStr = String(target.year);
+    const yearHits = pool.filter((r) => stripRoonLinks(r.subtitle || "").includes(yearStr));
+    if (yearHits.length) pool = yearHits;
+  }
+
+  return { item: pool[0], unambiguous: pool.length === 1, tiedCount: pool.length };
+}
+
 /**
  * Run a search and return the scored candidate list for a single category,
  * without drilling into any action list. This is the read-only half of the

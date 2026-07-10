@@ -974,24 +974,27 @@ async function searchAndPlay(
       };
     }
 
-    // Step 4b: Interrupt-confidence gate. When this call is a deliberate stomp
-    // (immediate / replace), a loose name match must NOT be allowed to replace
-    // the queue - that is the "Gas instead of Spoon" failure. Below the
-    // threshold, return the ranked candidates and play nothing.
-    if (opts.minConfidence != null && matchConfidence < opts.minConfidence) {
+    // Step 4b: Confidence gate. A loose name match must NOT be allowed to act
+    // silently - that is the "Gas instead of Spoon" failure. Below the
+    // threshold, return the ranked candidates and mutate nothing. Every call
+    // is gated at DEFAULT_MIN_CONFIDENCE unless the caller passes a higher
+    // explicit threshold (REPLACE_MIN_CONFIDENCE for an interrupt/stomp).
+    const confidenceThreshold = opts.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
+    if (matchConfidence < confidenceThreshold) {
       const candidates = ranked.slice(0, 5).map((c) => ({
         title: c.item.title,
         artist: c.artist || null,
         confidence: Number(c.confidence.toFixed(2)),
       }));
-      log("step4b-low-confidence-refuse", { query, matchConfidence, threshold: opts.minConfidence, candidates });
+      log("step4b-low-confidence-refuse", { query, matchConfidence, threshold: confidenceThreshold, candidates });
+      const verb = actionType === "queue" ? "queue" : actionType === "shuffle" ? "shuffle" : "play";
       return {
         content: [{
           type: "text",
           text: JSON.stringify({
             ok: false,
             error: "low_confidence_replace",
-            detail: `Refused to replace the queue: the best match for "${query}" is "${matchedResult.title}" at ${Math.round(matchConfidence * 100)}% confidence, below the ${Math.round(opts.minConfidence * 100)}% required to stomp the current track. Pick an exact one below (or use queue_by_id / play_tracks with a provider ID).`,
+            detail: `Refused to ${verb} "${query}": the best match is "${matchedResult.title}" at ${Math.round(matchConfidence * 100)}% confidence, below the ${Math.round(confidenceThreshold * 100)}% required. Pick an exact one below (or use queue_by_id / play_tracks, or search_albums + play_album_by_id / queue_album_by_id, with a provider ID).`,
             query,
             zone: zone.display_name,
             candidates,
@@ -1425,8 +1428,10 @@ async function playWithWhen(
     // Nothing playing - no seam to wait for; play now.
   }
 
-  // An immediate play supersedes any armed deferral. The stomp is gated on match
-  // confidence when minConfidence is set (immediate / replace on a fuzzy tool).
+  // An immediate play supersedes any armed deferral. Gated on match confidence -
+  // REPLACE_MIN_CONFIDENCE (0.9) when this is a deliberate stomp (the caller
+  // passes minConfidence explicitly), else searchAndPlay's DEFAULT_MIN_CONFIDENCE
+  // floor (0.75) applies.
   deferredPlayer.cancel();
   return searchAndPlay(query, zoneName, category, playActionType, { minConfidence });
 }
@@ -1446,11 +1451,18 @@ const immediateArg = immediateBool
   );
 
 /**
+ * Confidence a fuzzy name match must clear before ANY name-based play/queue
+ * tool acts on it. Below this the tool returns the candidate list and
+ * mutates nothing - a loose match may never ride through silently (the "Gas
+ * instead of Spoon" rule). This is the floor for every searchAndPlay call
+ * that does not pass a higher explicit threshold.
+ */
+const DEFAULT_MIN_CONFIDENCE = 0.75;
+
+/**
  * Confidence a fuzzy name match must clear before an INTERRUPT (immediate /
- * replace) is allowed to stomp the current track. Below this the tool returns
- * the candidate list and plays nothing - a stomp may never ride on a loose
- * match (the "Gas instead of Spoon" rule). The safe after-current default is
- * NOT gated; only the deliberate stomp is.
+ * replace) is allowed to stomp the current track - stricter than the default
+ * floor above, since a stomp is destructive and irreversible mid-track.
  */
 const REPLACE_MIN_CONFIDENCE = 0.9;
 

@@ -54,6 +54,8 @@ const stoppedZone = {
 } as unknown as Zone;
 
 let connected = true;
+let subscriptionAlive = true;
+let lastZoneEventTs: number | null = 1700000000000;
 
 vi.mock("../src/roon-connection.js", () => ({
   roonConnection: {
@@ -67,6 +69,8 @@ vi.mock("../src/roon-connection.js", () => ({
       if (lower.includes("macbook")) return stoppedZone;
       return null;
     }),
+    isSubscriptionAlive: vi.fn(() => subscriptionAlive),
+    getLastZoneEventTs: vi.fn(() => lastZoneEventTs),
   },
 }));
 
@@ -90,6 +94,8 @@ async function withApp(fn: (base: string) => Promise<void>): Promise<void> {
 describe("GET /monitor/state", () => {
   beforeEach(() => {
     connected = true;
+    subscriptionAlive = true;
+    lastZoneEventTs = 1700000000000;
     vi.clearAllMocks();
   });
 
@@ -102,6 +108,34 @@ describe("GET /monitor/state", () => {
       expect(json.state).toBe("playing");
       expect(json.queue_remaining_count).toBe(29);
       expect(json.now_playing).toMatchObject({ title: "Karoo (Original)", artist: "Larse" });
+    });
+  });
+
+  it("surfaces subscription freshness: alive with a recent event by default", async () => {
+    await withApp(async (base) => {
+      const res = await fetch(`${base}/monitor/state?zone=WiiM`);
+      const json = (await res.json()) as Record<string, unknown>;
+      expect(json.subscription_alive).toBe(true);
+      expect(json.last_zone_event_ts).toBe(1700000000000);
+    });
+  });
+
+  it("prompts/03 item 4: a killed subscription reports subscription_alive:false and a stale last_zone_event_ts", async () => {
+    // Model a stalled WebSocket that never dropped the core reference (still
+    // isConnected() true, still 200/ok:true) but stopped delivering zone
+    // events - the exact case the old ok:true-whenever-core-is-set contract
+    // hid from a polling daemon.
+    subscriptionAlive = false;
+    const staleTs = Date.now() - 10 * 60 * 1000; // 10 minutes stale
+    lastZoneEventTs = staleTs;
+
+    await withApp(async (base) => {
+      const res = await fetch(`${base}/monitor/state?zone=WiiM`);
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as Record<string, unknown>;
+      expect(json.ok).toBe(true); // core is still paired - isConnected() unaffected
+      expect(json.subscription_alive).toBe(false);
+      expect(json.last_zone_event_ts).toBe(staleTs);
     });
   });
 

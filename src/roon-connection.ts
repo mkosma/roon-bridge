@@ -51,12 +51,24 @@ function savePersistedState(state: Record<string, unknown>): void {
   saveConfig({ roonstate: state });
 }
 
+export type ZoneResolution =
+  | { kind: "found"; zone: Zone }
+  | { kind: "ambiguous"; candidates: Zone[] }
+  | { kind: "not_found" };
+
 export class RoonConnection extends EventEmitter {
   private roon: RoonApi;
   private status: RoonApiStatus;
   private core: RoonCore | null = null;
   private zones: Map<string, Zone> = new Map();
   private defaultZone: string = "";
+  // Freshness signal for /monitor/state (prompts/03, item 3): the in-memory
+  // zone map serves ok:true whenever core !== null, which hides a stalled
+  // WebSocket that stopped delivering zone events without dropping the
+  // core reference. subscriptionAlive tracks the zone SUBSCRIPTION (not the
+  // raw socket) so a poller can tell "connected" from "actually fresh".
+  private subscriptionAlive = false;
+  private lastZoneEventTs: number | null = null;
 
   constructor() {
     super();
@@ -91,6 +103,7 @@ export class RoonConnection extends EventEmitter {
         console.error(`[roon-bridge] Unpaired from core: ${core.display_name}`);
         this.core = null;
         this.zones.clear();
+        this.subscriptionAlive = false;
       },
     });
 
@@ -114,6 +127,7 @@ export class RoonConnection extends EventEmitter {
           console.error("[roon-bridge] Connection lost, reconnecting in 3s...");
           this.core = null;
           this.zones.clear();
+          this.subscriptionAlive = false;
           setTimeout(doConnect, 3000);
         },
         onerror: () => {
@@ -130,6 +144,11 @@ export class RoonConnection extends EventEmitter {
     if (!transport) return;
 
     transport.subscribe_zones((response, msg) => {
+      // Any callback firing - including a seek-only tick - proves the
+      // subscription is alive and still delivering events.
+      this.subscriptionAlive = true;
+      this.lastZoneEventTs = Date.now();
+
       let changed = false;
       if (response === "Subscribed" && msg.zones) {
         this.zones.clear();
@@ -213,27 +232,54 @@ export class RoonConnection extends EventEmitter {
     return this.core !== null;
   }
 
+  /**
+   * Whether the zone SUBSCRIPTION is delivering events, as opposed to merely
+   * "core !== null". A stalled WebSocket that never dropped the core
+   * reference still reports isConnected() true; this catches that case.
+   */
+  isSubscriptionAlive(): boolean {
+    return this.subscriptionAlive;
+  }
+
+  /** Epoch ms of the last zone subscription event (Subscribed/Changed/seek), or null before the first one. */
+  getLastZoneEventTs(): number | null {
+    return this.lastZoneEventTs;
+  }
+
   getZones(): Zone[] {
     return Array.from(this.zones.values());
   }
 
-  findZone(nameOrId: string): Zone | null {
-    // Try exact zone_id match first
+  /**
+   * Resolve a zone name/id deterministically, never picking by map-iteration
+   * order. Exact zone_id, then exact display_name (case-insensitive), then a
+   * substring match (covers prefix matches like "wiim u" -> "WiiM Ultra") -
+   * each stage stops at the first stage with any hits, and more than one hit
+   * at that stage is reported as ambiguous rather than silently taking the
+   * first. This closes the wrong-zone risk: `zone:"WiiM"` used to resolve to
+   * "WiiM + 1" or a solo "WiiM" nondeterministically as grouping changed.
+   */
+  resolveZone(nameOrId: string): ZoneResolution {
     const byId = this.zones.get(nameOrId);
-    if (byId) return byId;
+    if (byId) return { kind: "found", zone: byId };
 
-    // Try case-insensitive display_name match
-    const lower = nameOrId.toLowerCase();
-    for (const zone of this.zones.values()) {
-      if (zone.display_name.toLowerCase() === lower) return zone;
-    }
+    const lower = nameOrId.trim().toLowerCase();
+    const all = this.getZones();
 
-    // Try partial match
-    for (const zone of this.zones.values()) {
-      if (zone.display_name.toLowerCase().includes(lower)) return zone;
-    }
+    const exact = all.filter((z) => z.display_name.toLowerCase() === lower);
+    if (exact.length === 1) return { kind: "found", zone: exact[0] };
+    if (exact.length > 1) return { kind: "ambiguous", candidates: exact };
 
-    return null;
+    const partial = all.filter((z) => z.display_name.toLowerCase().includes(lower));
+    if (partial.length === 1) return { kind: "found", zone: partial[0] };
+    if (partial.length > 1) return { kind: "ambiguous", candidates: partial };
+
+    return { kind: "not_found" };
+  }
+
+  findZone(nameOrId: string): Zone | null {
+    const r = this.resolveZone(nameOrId);
+    return r.kind === "found" ? r.zone : null;
   }
 
   findZoneOrThrow(nameOrId: string): Zone {
@@ -247,8 +293,14 @@ export class RoonConnection extends EventEmitter {
         `No zone specified and no default zone is set. Use set_default_zone to configure one. Available: ${available || "(none - is Roon paired?)"}`,
       );
     }
-    const zone = this.findZone(target);
-    if (!zone) {
+    const resolution = this.resolveZone(target);
+    if (resolution.kind === "ambiguous") {
+      const candidates = resolution.candidates.map((z) => z.display_name).join(", ");
+      throw new Error(
+        `Zone '${target}' is ambiguous - it matches more than one zone: ${candidates}. Use the exact zone name.`,
+      );
+    }
+    if (resolution.kind === "not_found") {
       const available = this.getZones()
         .map((z) => z.display_name)
         .join(", ");
@@ -256,7 +308,7 @@ export class RoonConnection extends EventEmitter {
         `Zone '${target}' not found. Available zones: ${available || "(none - is Roon paired?)"}`,
       );
     }
-    return zone;
+    return resolution.zone;
   }
 
   getDefaultZone(): string {
@@ -347,9 +399,15 @@ export class RoonConnection extends EventEmitter {
   }
 
   setDefaultZone(nameOrId: string): string {
-    // Verify it actually exists before saving
-    const zone = this.findZone(nameOrId);
-    if (!zone) {
+    // Verify it actually exists (and is unambiguous) before saving
+    const resolution = this.resolveZone(nameOrId);
+    if (resolution.kind === "ambiguous") {
+      const candidates = resolution.candidates.map((z) => z.display_name).join(", ");
+      throw new Error(
+        `Zone '${nameOrId}' is ambiguous - it matches more than one zone: ${candidates}. Use the exact zone name.`,
+      );
+    }
+    if (resolution.kind === "not_found") {
       const available = this.getZones()
         .map((z) => z.display_name)
         .join(", ");
@@ -357,10 +415,10 @@ export class RoonConnection extends EventEmitter {
         `Zone '${nameOrId}' not found. Available zones: ${available || "(none - is Roon paired?)"}`,
       );
     }
-    this.defaultZone = zone.display_name;
+    this.defaultZone = resolution.zone.display_name;
     saveConfig({ defaultZone: this.defaultZone });
     console.error(`[roon-bridge] Default zone set to: "${this.defaultZone}"`);
-    return zone.display_name;
+    return resolution.zone.display_name;
   }
 }
 

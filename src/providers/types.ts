@@ -52,6 +52,21 @@ export interface ProviderPlaylist {
   description?: string;
 }
 
+export interface ProviderAlbum {
+  provider: ProviderName;
+  /** Provider-native album id. */
+  id: string;
+  title: string;
+  artist: string;
+  trackCount: number;
+  /** Release year (4-digit), derived from the provider's release date. */
+  year?: number;
+  /** Explicit-content flag, when the provider exposes one at the album level. */
+  explicit?: boolean;
+  /** Hi-res (>CD quality) availability, when the provider exposes it. */
+  hires?: boolean;
+}
+
 export interface MusicProvider {
   readonly name: ProviderName;
 
@@ -59,6 +74,12 @@ export interface MusicProvider {
 
   /** Fetch one track's full metadata by its provider-native id. */
   getTrack(id: string): Promise<ProviderTrack>;
+
+  /** Search for albums, returning stable provider-native album ids. */
+  searchAlbums(query: string, limit?: number): Promise<ProviderAlbum[]>;
+
+  /** Fetch one album's metadata by its provider-native id. */
+  getAlbum(id: string): Promise<ProviderAlbum>;
 
   /**
    * Given provider track ids, return the subset that are in the user's

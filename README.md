@@ -267,6 +267,29 @@ All the same tools as [roon-mcp](https://github.com/AzureStackNerd/roon-mcp):
 - `add_to_queue` - search and queue (re-verified against a queue read). Prefers
   the studio cut by default - live takes, compilations, and tributes are
   demoted unless the query asks for one.
+- `search_albums` / `play_album_by_id` / `queue_album_by_id` - the deterministic
+  album counterpart of `search_tracks` / `play_by_id` / `queue_by_id` (below):
+  search a provider (Qobuz) for albums, then play/queue the EXACT album by its
+  provider id - pinned by title+artist+year, never a fuzzy name guess.
+
+### Fuzzy name matching: a confidence floor, always
+
+Every name-based play/queue tool (`play_artist`, `play_album`, `play_playlist`,
+`play_track`, `add_to_queue`) scores its candidates and refuses to act below a
+confidence floor - **0.75 by default**, **0.9** for a deliberate interrupt/
+replace stomp (see below). Below the floor it returns the ranked candidates
+(title, artist, confidence) and mutates nothing; it never silently substitutes
+a loose match. For a query where the top match is genuinely ambiguous or
+wrong, pick an exact candidate from the list, or resolve deterministically:
+`search_tracks` + `play_by_id`/`queue_by_id`, or `search_albums` +
+`play_album_by_id`/`queue_album_by_id`.
+
+### Zone resolution
+
+`zone` accepts an exact display name, a zone id, or a unique substring/prefix
+(`"wiim u"` resolves to a lone "WiiM Ultra"). A name matching more than one
+zone (e.g. `"WiiM"` when both "WiiM + 1" and "WiiM Ultra" exist) is an error
+listing every candidate - it is never resolved by map-iteration order.
 
 ### Replacing the queue and playing now (the deliberate stomp)
 

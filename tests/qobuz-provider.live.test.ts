@@ -23,4 +23,17 @@ describe.skipIf(!live)("QobuzProvider (live, read-only)", () => {
     expect(Array.isArray(pls)).toBe(true);
     if (pls.length) expect(pls[0].provider).toBe("qobuz");
   });
+
+  it("searches albums and fetches one by id", async () => {
+    const p = new QobuzProvider();
+    const albums = await p.searchAlbums("Trouble Will Find Me The National", 3);
+    expect(albums.length).toBeGreaterThan(0);
+    expect(albums[0]).toHaveProperty("id");
+    expect(albums[0].provider).toBe("qobuz");
+    expect(albums[0].trackCount).toBeGreaterThan(0);
+
+    const album = await p.getAlbum(albums[0].id);
+    expect(album.id).toBe(albums[0].id);
+    expect(album.title).toBe(albums[0].title);
+  });
 });

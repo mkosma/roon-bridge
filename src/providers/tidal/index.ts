@@ -7,6 +7,7 @@
 
 import {
   type MusicProvider,
+  type ProviderAlbum,
   type ProviderPlaylist,
   type ProviderTrack,
   ProviderError,
@@ -28,6 +29,12 @@ export class TidalProvider implements MusicProvider {
   }
   async getTrack(): Promise<ProviderTrack> {
     notImplemented("getTrack");
+  }
+  async searchAlbums(): Promise<ProviderAlbum[]> {
+    notImplemented("searchAlbums");
+  }
+  async getAlbum(): Promise<ProviderAlbum> {
+    notImplemented("getAlbum");
   }
   async tracksInLibrary(): Promise<Set<string>> {
     notImplemented("tracksInLibrary");
