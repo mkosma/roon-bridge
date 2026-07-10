@@ -47,7 +47,7 @@ import {
 } from "./search-core.js";
 import type { Zone } from "node-roon-api-transport";
 import type RoonApiBrowse from "node-roon-api-browse";
-import { resultingState, immediateBool } from "./resulting-state.js";
+import { resultingState, immediateBool, boolish } from "./resulting-state.js";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
@@ -188,8 +188,7 @@ export function registerVersionTools(server: McpServer): void {
         .enum(["library", "all"])
         .default("all")
         .describe("'all' searches library + Qobuz/Tidal (default); 'library' scopes to Monty's library (album/artist only - Roon has no library-only track hierarchy)."),
-      exclude_live: z
-        .boolean()
+      exclude_live: boolish()
         .default(false)
         .describe("Drop candidates flagged as live recordings from the results."),
       limit: z.coerce.number().int().min(1).max(50).default(10).describe("Max candidates to return (default 10)."),

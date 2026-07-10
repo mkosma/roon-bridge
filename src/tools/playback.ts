@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { roonConnection } from "../roon-connection.js";
-import { resultingState } from "./resulting-state.js";
+import { resultingState, boolish } from "./resulting-state.js";
 
 export function registerPlaybackTools(server: McpServer): void {
   server.tool(
@@ -64,8 +64,7 @@ export function registerPlaybackTools(server: McpServer): void {
     {
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
       seconds: z.number().describe("Target position in seconds"),
-      relative: z
-        .boolean()
+      relative: boolish()
         .default(false)
         .describe("If true, seek relative to current position (positive = forward, negative = backward). If false, seek to absolute position."),
     },
@@ -102,7 +101,7 @@ export function registerPlaybackTools(server: McpServer): void {
     "Enable or disable shuffle mode in a Roon zone",
     {
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
-      enabled: z.boolean().describe("true to enable shuffle, false to disable"),
+      enabled: boolish().describe("true to enable shuffle, false to disable"),
     },
     async ({ zone: zoneName, enabled }): Promise<ToolResult> => {
       try {
