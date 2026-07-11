@@ -357,7 +357,7 @@ export async function executeAlbumById(
   return executeAlbumIdentity(identity, zone, when, { albumId, provider: meta.provider ?? provider });
 }
 
-async function playOrQueueAlbumById(
+export async function playOrQueueAlbumById(
   albumId: string,
   provider: ProviderName | undefined,
   zoneName: string,
