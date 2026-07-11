@@ -528,6 +528,29 @@ python3 ~/.agents/Maya/code/gen-tool-reference.py
 Restarting drops in-flight MCP sessions (clients auto-reconnect) but does not
 disturb Roon playback. The new MCP tools appear after the client reconnects.
 
+### Mutation smoke (`--live-mutation`)
+
+`scripts/smoke.sh --live-mutation` adds one write round trip on top of the
+read-only checks: it appends a designated test track at the queue tail with
+`queue_by_id`, confirms exactly one item landed, deletes it with `edit_queue`,
+and confirms the queue is net-zero. This exercises the exact write path the
+07-05 incident lived in, end to end. It has two requirements:
+
+- **`SMOKE_TEST_TRACK_ID`** must name a stable provider track id (from
+  `search_tracks`); provider defaults to `qobuz`, override with
+  `SMOKE_TEST_TRACK_PROVIDER`. There is no implicit default - `get_queue` does
+  not expose provider ids and provenance only covers self-queued items, so the
+  canary track must be designated once. Any stable in-library track works (the
+  probe is net-zero and never plays it).
+- **An idle zone.** `edit_queue`'s immediate rebuild would cut a playing track,
+  so the probe SKIPS when the zone is playing. Run it in a paused/stopped
+  window only - it is Monty-approved-window work, never part of an unattended
+  deploy.
+
+```bash
+SMOKE_TEST_TRACK_ID=<qobuz track id> ~/dev/roon-bridge/scripts/smoke.sh --live-mutation --zone "WiiM + 1"
+```
+
 For the Roon-native Playlists path specifically (perf:probe pairs as the same
 extension, so it needs the bridge stopped first):
 
