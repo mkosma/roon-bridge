@@ -232,6 +232,27 @@ describe("play_playlist shuffle", () => {
     expect(text).toMatch(/shuffle unavailable/i);
   });
 
+  it("shuffle:true probing for a deeper Shuffle never fires the leaf Play Now/Queue/Start Radio actions", async () => {
+    // Level one exposes only leaf `action` rows (no Shuffle, no navigable
+    // submenu): Play Now, Queue, Start Radio. findShuffleDeeper must not open
+    // any of them while hunting - opening a leaf action EXECUTES it in Roon,
+    // so probing them would fire Queue/Start Radio as side effects, and would
+    // fire Play Now early (from the probe, not Step 7's deliberate execute).
+    reset({ hasShuffleAction: false });
+    const server = buildServer();
+    const { isError, text } = await call(server, "play_playlist", {
+      playlist: "Discovered",
+      shuffle: true,
+    });
+
+    expect(isError).toBe(false);
+    expect(world.executed).not.toContain("act:queue");
+    expect(world.executed).not.toContain("act:radio");
+    // Play Now fires exactly once - from Step 7's fallback, not a probe.
+    expect(world.executed.filter((k) => k === "act:play")).toHaveLength(1);
+    expect(text).toMatch(/shuffle unavailable/i);
+  });
+
   it("shuffle omitted behaves exactly as before: Play Now, no shuffle, no shuffle note", async () => {
     const server = buildServer();
     const { isError, text } = await call(server, "play_playlist", {

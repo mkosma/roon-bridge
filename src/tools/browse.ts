@@ -120,16 +120,21 @@ async function findShuffleDeeper(
 ): Promise<BrowseItem | undefined> {
   const hierarchy = "search";
 
-  // Candidate sub-lists to open: every navigable action/list row at level one
+  // Candidate sub-lists to open: every navigable submenu row at level one
   // (e.g. a "Play" submenu that nests Shuffle), plus the matched item's own
   // node again (its opened content page, where some sources put the Shuffle
   // header action). De-duped by item_key; the matched key goes last so a real
   // "Play" submenu is preferred over re-opening the content page.
+  //
+  // A leaf "action" row (Play Now / Queue / Start Radio) is NOT a navigable
+  // container - Roon's browse API executes an action node when you open it,
+  // it doesn't peek inside it. Opening one here would fire that action as a
+  // side effect of hunting for Shuffle, so only action_list/list rows qualify.
   const candidates: BrowseItem[] = [];
   const seen = new Set<string>();
   for (const it of level1Items) {
     if (!it.item_key || it.hint === "header") continue;
-    if (it.hint !== "action_list" && it.hint !== "list" && it.hint !== "action") continue;
+    if (it.hint !== "action_list" && it.hint !== "list") continue;
     if (seen.has(it.item_key)) continue;
     seen.add(it.item_key);
     candidates.push(it);
