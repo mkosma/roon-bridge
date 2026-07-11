@@ -188,28 +188,102 @@ async function main() {
   process.exit(failures === 0 ? 0 : 1);
 }
 
+/** All text content items of a tool result, joined. */
+function resultText(result) {
+  return result.content?.map((c) => c.text ?? "").join("\n") ?? "";
+}
+
+/** The structured queue rows from a get_queue result ([] if the queue is empty). */
+function queueItems(result) {
+  for (const c of result.content ?? []) {
+    if (typeof c.text !== "string") continue;
+    try {
+      const parsed = JSON.parse(c.text);
+      if (Array.isArray(parsed?.items)) return parsed.items;
+    } catch {
+      // human-readable line, not the JSON payload - keep looking
+    }
+  }
+  return [];
+}
+
 /**
- * One queue_by_id + edit_queue delete of the SAME track at the queue tail,
- * net-zero. Only reached behind --live-mutation.
+ * Net-zero write probe: append the designated test track at the queue tail
+ * with queue_by_id, confirm exactly one new item landed, delete it with
+ * edit_queue, and confirm the queue is byte-for-byte back to its prior item
+ * set. This exercises the exact write path the incident lived in, end to end.
+ *
+ * Two hard preconditions, both enforced here:
+ *   - SMOKE_TEST_TRACK_ID must name a stable provider track (default provider
+ *     qobuz). There is no safe implicit default - get_queue does not expose
+ *     provider ids and provenance only covers self-queued items, so the track
+ *     must be designated. See README "Deploy > mutation smoke".
+ *   - The zone must be IDLE. edit_queue's immediate rebuild would cut a playing
+ *     track; on an idle zone the append+delete never reaches an output. If the
+ *     zone is playing, this SKIPS rather than risk a cut - run it in a paused
+ *     or stopped window.
+ *
+ * Only reached behind --live-mutation.
  */
 async function mutationSmoke() {
+  const TEST_TRACK_ID = process.env.SMOKE_TEST_TRACK_ID;
+  const PROVIDER = process.env.SMOKE_TEST_TRACK_PROVIDER || "qobuz";
+  if (!TEST_TRACK_ID) {
+    check("mutation smoke: designated test track", false,
+      "set SMOKE_TEST_TRACK_ID to a stable provider track id (see README Deploy > mutation smoke)");
+    return;
+  }
+  const zoneArgs = ZONE_ARG ? { zone: ZONE_ARG } : {};
+
   const client = new Client({ name: "smoke-mutation", version: "0.0.0" });
   const transport = new StreamableHTTPClientTransport(new URL(`${BASE_URL}/mcp`), {
     requestInit: { headers: authHeaders },
   });
   await client.connect(transport);
   try {
-    const queueBefore = await client.callTool({ name: "get_queue", arguments: ZONE_ARG ? { zone: ZONE_ARG } : {} });
-    if (queueBefore.isError) {
-      check("mutation smoke: get_queue", false, queueBefore.content?.[0]?.text);
+    // Precondition: idle zone. Parse now_playing's "State:" line.
+    const np = await client.callTool({ name: "now_playing", arguments: zoneArgs });
+    const stateLine = resultText(np).split("\n").find((l) => /^\s*State:/i.test(l)) ?? "";
+    if (/playing/i.test(stateLine)) {
+      info("mutation smoke", `zone is playing (${stateLine.trim()}) - skipped; run in a paused/stopped window`);
       return;
     }
-    // A net-zero probe needs a real track ID and zone context this script
-    // does not have without a full browse round trip. Ship the gate and the
-    // read-side setup; a follow-up can wire the exact queue_by_id/edit_queue
-    // pair against a known-good test track once one is designated for this
-    // purpose (see the PR description's noted spec gap).
-    info("mutation smoke", "queue read ok; queue_by_id/edit_queue round trip not yet wired - see PR notes");
+
+    const before = queueItems(await client.callTool({ name: "get_queue", arguments: zoneArgs }));
+    const beforeIds = new Set(before.map((r) => r.queue_item_id));
+
+    // 1. Append at the tail (when:"queue" = append, never cuts the head).
+    const appended = await client.callTool({
+      name: "queue_by_id",
+      arguments: { track_id: TEST_TRACK_ID, provider: PROVIDER, when: "queue", ...zoneArgs },
+    });
+    if (appended.isError) {
+      check("mutation smoke: queue_by_id append", false, resultText(appended).split("\n")[0]);
+      return;
+    }
+
+    // 2. Exactly one new item at the tail.
+    const after = queueItems(await client.callTool({ name: "get_queue", arguments: zoneArgs }));
+    const added = after.filter((r) => !beforeIds.has(r.queue_item_id));
+    if (!check("mutation smoke: append landed (+1 item)", added.length === 1, `got +${added.length}`)) {
+      for (const r of added) {
+        await client.callTool({ name: "edit_queue", arguments: { delete: [r.queue_item_id], immediate: true, ...zoneArgs } });
+      }
+      return;
+    }
+
+    // 3. Delete it (immediate rebuild is safe on an idle zone).
+    const del = await client.callTool({
+      name: "edit_queue",
+      arguments: { delete: [added[0].queue_item_id], immediate: true, ...zoneArgs },
+    });
+    check("mutation smoke: edit_queue delete", del.isError !== true, resultText(del).split("\n")[0]);
+
+    // 4. Net-zero: no item we did not start with remains.
+    const restored = queueItems(await client.callTool({ name: "get_queue", arguments: zoneArgs }));
+    const leftover = restored.map((r) => r.queue_item_id).filter((id) => !beforeIds.has(id));
+    check("mutation smoke: net-zero (queue restored)", leftover.length === 0,
+      leftover.length ? `test item(s) still queued: ${leftover.join(",")}` : "queue matches pre-probe state");
   } finally {
     await client.close();
   }
