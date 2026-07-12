@@ -883,7 +883,7 @@ async function verifyBlock(
   };
 }
 
-async function queueOrPlayTracks(
+export async function queueOrPlayTracks(
   trackIds: string[],
   provider: ProviderName | undefined,
   zoneName: string,

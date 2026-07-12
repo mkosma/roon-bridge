@@ -15,8 +15,11 @@ import {
   type BrowseItem,
 } from "./search-core.js";
 import { deferredPlayer } from "../control/deferred-player-instance.js";
-import type { SeamOutcome } from "../control/deferred-player.js";
+import type { SeamAction, SeamOutcome } from "../control/deferred-player.js";
 import { resultingState, immediateBool, boolish } from "./resulting-state.js";
+import { queueOrPlayTracks } from "./play-by-id.js";
+import { playOrQueueAlbumById } from "./album-by-id.js";
+import { initProviders } from "../providers/bootstrap.js";
 import type RoonApiBrowse from "node-roon-api-browse";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
@@ -1377,11 +1380,105 @@ async function searchAndPlay(
 }
 
 /**
+ * A deferred target after arm-time resolution. Monty's ruling: a deferred play
+ * is resolved to exact provider id(s) WHEN Maya creates the future queue, never
+ * re-resolved at play time. Categories with no stable provider id
+ * (artist/composer/genre) cannot be pinned, so a deferred play of one is
+ * refused at arm time; a track/album query with no confident provider match is
+ * likewise refused (fail early, while Maya can still ask). album pins the album
+ * id; track pins the track id; playlist snapshots its ordered track-id list.
+ */
+type DeferredTarget =
+  | { kind: "refuse"; detail: string; candidates?: Array<{ title: string; artist?: string; confidence: number }> }
+  | { kind: "album"; albumId: string; label: string }
+  | { kind: "tracks"; trackIds: string[]; label: string };
+
+/** Score provider search rows with the SAME confidence model that gates an
+ *  immediate name play, by synthesizing BrowseItems (title + credited artist). */
+function scoreProviderMatches(
+  rows: Array<{ id: string; title: string; artist?: string }>,
+  query: string,
+  penalizeVariants: boolean,
+) {
+  const items = rows.map(
+    (r) => ({ item_key: r.id, title: r.title, subtitle: r.artist ?? "", hint: "action_list" }) as BrowseItem,
+  );
+  return scoreCandidates(items, query, penalizeVariants);
+}
+
+function refuseWithCandidates(
+  query: string,
+  category: string,
+  scored: ReturnType<typeof scoreCandidates>,
+): DeferredTarget {
+  const best = scored[0];
+  return {
+    kind: "refuse",
+    detail:
+      `No confident match to pin for "${query}" (${category}) at arm time` +
+      (best ? ` - best is "${best.item.title}" at ${Math.round(best.confidence * 100)}%, below the ${Math.round(REPLACE_MIN_CONFIDENCE * 100)}% required` : "") +
+      `. Play it now, or defer a more specific query.`,
+    candidates: scored.slice(0, 5).map((s) => ({
+      title: s.item.title,
+      artist: s.item.subtitle || undefined,
+      confidence: Number(s.confidence.toFixed(2)),
+    })),
+  };
+}
+
+/**
+ * Resolve (query, category) to a pinnable target at ARM TIME, using the music
+ * provider's search (stable ids) rather than Roon browse (whose item_keys
+ * expire by the seam). Pins against the provider (e.g. Qobuz): a query only
+ * reachable via Roon browse (local files, a Roon-only playlist) refuses here
+ * and should be played immediately instead.
+ */
+async function resolveDeferredTarget(query: string, category: string): Promise<DeferredTarget> {
+  if (category === "artist" || category === "composer" || category === "genre") {
+    return {
+      kind: "refuse",
+      detail: `A deferred ${category} play can't be pinned to an exact id, so it can't be guaranteed for later. Play it now (immediate), or name a specific album or track to defer.`,
+    };
+  }
+  try {
+    const provider = initProviders().get(undefined);
+    if (category === "album") {
+      const albums = await provider.searchAlbums(query, 10);
+      const scored = scoreProviderMatches(albums.map((a) => ({ id: a.id, title: a.title, artist: a.artist })), query, true);
+      if (!scored[0] || scored[0].confidence < REPLACE_MIN_CONFIDENCE) return refuseWithCandidates(query, category, scored);
+      const album = albums.find((a) => a.id === scored[0].item.item_key)!;
+      return { kind: "album", albumId: album.id, label: `${album.title}${album.artist ? ` - ${album.artist}` : ""}` };
+    }
+    if (category === "track") {
+      const tracks = await provider.searchTracks(query, 10);
+      const scored = scoreProviderMatches(tracks.map((t) => ({ id: t.id, title: t.title, artist: t.artist })), query, true);
+      if (!scored[0] || scored[0].confidence < REPLACE_MIN_CONFIDENCE) return refuseWithCandidates(query, category, scored);
+      const track = tracks.find((t) => t.id === scored[0].item.item_key)!;
+      return { kind: "tracks", trackIds: [track.id], label: `${track.title}${track.artist ? ` - ${track.artist}` : ""}` };
+    }
+    if (category === "playlist") {
+      const playlists = await provider.listPlaylists(50);
+      const scored = scoreProviderMatches(playlists.map((p) => ({ id: p.id, title: p.name })), query, false);
+      if (!scored[0] || scored[0].confidence < REPLACE_MIN_CONFIDENCE) return refuseWithCandidates(query, category, scored);
+      const pl = playlists.find((p) => p.id === scored[0].item.item_key)!;
+      const { tracks } = await provider.getPlaylist(pl.id, 500);
+      const trackIds = tracks.map((t) => t.id).filter((id): id is string => !!id);
+      if (!trackIds.length) return { kind: "refuse", detail: `Playlist "${pl.name}" has no pinnable provider tracks; play it now instead.` };
+      return { kind: "tracks", trackIds, label: `playlist "${pl.name}" (${trackIds.length} tracks, snapshot at arm time)` };
+    }
+    return { kind: "refuse", detail: `Cannot defer category "${category}".` };
+  } catch (e) {
+    return { kind: "refuse", detail: `Couldn't resolve "${query}" (${category}) to a pinnable id: ${e instanceof Error ? e.message : String(e)}. Play it now instead.` };
+  }
+}
+
+/**
  * Play a match, honoring `when`. `now` replaces immediately (current behavior).
  * `after_current` arms an event-driven deferral so the queue-replace fires at
- * the end of the current track - clean queue AND no mid-track stomp - instead
- * of the agent trying (and failing) to time it. If nothing is playing there is
- * no seam to wait for, so it plays now.
+ * the end of the current track - clean queue AND no mid-track stomp. The
+ * deferred target is PINNED to exact provider id(s) at arm time (see
+ * resolveDeferredTarget) so it never re-resolves at play time. If nothing is
+ * playing there is no seam to wait for, so the pinned action fires now.
  */
 async function playWithWhen(
   query: string,
@@ -1405,32 +1502,48 @@ async function playWithWhen(
 
     const np = zone.now_playing;
     if (zone.state === "playing" && np && np.length != null) {
-      // The seam action is name-resolved (this is the fuzzy path). It cannot
-      // replay a pre-resolved exact id the way the provider-id tools do (browse
-      // yields ephemeral, session-scoped item_keys, not stable ids), so it
-      // resolves at the seam - but under a HARD 0.9 confidence gate so a loose
-      // match can never stomp unattended, and its result is verified and
-      // recorded. searchAndPlay already reads back the zone and refuses false
-      // success; we classify that into the ledger outcome.
-      const { deferral_id } = await deferredPlayer.scheduleAfterCurrent(
-        zone,
-        async () => seamOutcomeFrom(await searchAndPlay(query, zoneName, category, playActionType, { minConfidence: 0.9 })),
-        {
-          zoneId: zone.zone_id,
-          zoneName: zone.display_name,
-          trigger: `end of "${np.three_line.line1}"`,
-          description: `play "${query}" (${category}) - name-resolved at the seam, 0.9 confidence gate`,
-        },
-      );
+      // There is a real seam to wait for. Pin the target to exact provider
+      // id(s) NOW (Monty's ruling: the future queue is resolved when Maya
+      // creates it, never re-resolved at play time).
+      const target = await resolveDeferredTarget(query, category);
+      if (target.kind === "refuse") {
+        const lines = [`Can't defer this: ${target.detail}`];
+        if (target.candidates?.length) {
+          lines.push("Closest matches:");
+          for (const c of target.candidates) {
+            lines.push(`  - ${c.title}${c.artist ? ` - ${c.artist}` : ""} [${Math.round(c.confidence * 100)}%]`);
+          }
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }], isError: true };
+      }
+
+      // The seam action fires the PINNED exact id(s) as a replace at the track
+      // boundary. Provider ids are stable, so the same recording plays no
+      // matter how long the wait or how the library shifts. Both entry points
+      // read back the zone and return a verified outcome for the ledger.
+      // (shuffle is not applied to a deferred pinned set - it plays in order.)
+      const seamAction: SeamAction =
+        target.kind === "album"
+          ? async () => seamOutcomeFrom(await playOrQueueAlbumById(target.albumId, undefined, zoneName, "now"))
+          : async () => seamOutcomeFrom(await queueOrPlayTracks(target.trackIds, undefined, zoneName, "now"));
+
+      const { deferral_id } = await deferredPlayer.scheduleAfterCurrent(zone, seamAction, {
+        zoneId: zone.zone_id,
+        zoneName: zone.display_name,
+        trigger: `end of "${np.three_line.line1}"`,
+        description: `play ${target.label} - pinned at arm time`,
+      });
       return {
         content: [{
           type: "text",
           text:
-            `Scheduled: "${query}" will replace the queue in '${zone.display_name}' when "${np.three_line.line1}" ends (no mid-track cut; refused if the match is below 90% confidence at the seam). Track with deferred_status; cancel with cancel_deferred("${deferral_id}").`,
+            `Scheduled: ${target.label} will replace the queue in '${zone.display_name}' when "${np.three_line.line1}" ends - pinned now to exact id(s), not re-resolved at play time. Track with deferred_status; cancel with cancel_deferred("${deferral_id}").`,
         }],
       };
     }
-    // Nothing playing - no seam to wait for; play now.
+    // Nothing playing - no seam to wait for. There is nothing to pin against
+    // and no re-resolution risk (it plays right now), so fall through to the
+    // immediate browse play, which preserves shuffle and library semantics.
   }
 
   // An immediate play supersedes any armed deferral. Gated on match confidence -

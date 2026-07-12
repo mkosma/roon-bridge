@@ -261,6 +261,34 @@ vi.mock("../src/roon-connection.js", () => ({
   roonConnection: mockConn,
 }));
 
+// A deferred play is now PINNED to exact provider id(s) at arm time
+// (resolveDeferredTarget), so the browse tool reaches the music provider when
+// arming. Mock it deterministically: title === query -> a confident match; the
+// query "EMPTY" -> no results (drives the no-confident-match refusal).
+vi.mock("../src/providers/bootstrap.js", () => ({
+  initProviders: () => ({
+    get: () => ({
+      searchAlbums: async (q: string) =>
+        q === "EMPTY" ? [] : [{ provider: "qobuz", id: "alb1", title: q, artist: "Test Artist" }],
+      searchTracks: async (q: string) =>
+        q === "EMPTY" ? [] : [{ provider: "qobuz", id: "trk1", title: q, artist: "Test Artist" }],
+      listPlaylists: async () => [
+        { provider: "qobuz", id: "pl1", name: "Some Album" },
+        { provider: "qobuz", id: "pl2", name: "Other List" },
+      ],
+      getPlaylist: async (id: string) => ({
+        playlist: { provider: "qobuz", id, name: "Some Album" },
+        tracks: [
+          { provider: "qobuz", id: "t1", title: "Track One", artist: "X" },
+          { provider: "qobuz", id: "t2", title: "Track Two", artist: "X" },
+        ],
+      }),
+      getTrack: async (id: string) => ({ provider: "qobuz", id, title: "Some Album", artist: "Test Artist" }),
+      getAlbum: async (id: string) => ({ provider: "qobuz", id, title: "Some Album", artist: "Test Artist" }),
+    }),
+  }),
+}));
+
 const { registerBrowseTools } = await import("../src/tools/browse.js");
 
 function buildServer() {
@@ -294,30 +322,26 @@ describe("default-safe playback: the immediate gate (browse play tools)", () => 
     mockConn.zone = playingZone("Now Playing", 100, 0);
   });
 
-  // Each browse play tool: WITHOUT immediate, a playing track is never cut - the
-  // pick is deferred to the track seam. WITH immediate:true, it plays now.
+  // Pinnable browse play tools WITHOUT immediate never cut the current track:
+  // they ARM a deferral resolved to exact provider id(s) at arm time (Monty's
+  // ruling: the future queue is resolved when Maya creates it, never at play
+  // time). Nothing executes at arm time. WITH immediate:true, they play now.
   for (const [tool, arg] of [
     ["play_album", "album"],
     ["play_track", "track"],
-    ["play_artist", "artist"],
     ["play_playlist", "playlist"],
   ] as const) {
-    it(`${tool} SAFE DEFAULT (no immediate) does NOT cut the current track - it defers to the seam`, async () => {
+    it(`${tool} SAFE DEFAULT (no immediate) arms a deferral pinned at arm time, cuts nothing`, async () => {
+      deferralLedger.reset();
       const server = buildServer();
       const { isError, text } = await call(server, tool, { [arg]: "Some Album" });
 
       expect(isError).toBe(false);
       expect(text).toContain("Scheduled");
-      // The browse Play Now must NOT have run yet - the playing track is intact.
-      expect(world.executed).not.toContain("act:play");
-
-      // Drive the current track to its natural end -> the deferred pick fires.
-      if (mockConn.zone.now_playing) mockConn.zone.now_playing.seek_position = 96;
-      mockConn.emit("zone-seek", "zone-1");
-      mockConn.zone = playingZone("Next Track", 100, 0);
-      mockConn.emit("zones-changed");
-
-      await waitFor(() => world.executed.includes("act:play"));
+      expect(text).toContain("pinned"); // resolved to exact id(s) up front
+      expect(text).toContain("cancel_deferred"); // a deferral was armed
+      // Nothing executed at arm time - the playing track is intact.
+      expect(world.executed).toHaveLength(0);
     });
 
     it(`${tool} immediate:true replaces and plays right now`, async () => {
@@ -329,4 +353,35 @@ describe("default-safe playback: the immediate gate (browse play tools)", () => 
       expect(world.executed).toContain("act:play");
     });
   }
+
+  // Artist has no stable provider id, so a DEFERRED artist play can't be pinned
+  // -> refuse at arm time (Maya plays it now or names a specific album/track).
+  it("play_artist SAFE DEFAULT (no immediate) refuses - an artist can't be pinned", async () => {
+    const server = buildServer();
+    const { isError, text } = await call(server, "play_artist", { artist: "Radiohead" });
+
+    expect(isError).toBe(true);
+    expect(text.toLowerCase()).toContain("can't be pinned");
+    expect(world.executed).toHaveLength(0);
+  });
+
+  it("play_artist immediate:true still replaces and plays right now (browse path)", async () => {
+    const server = buildServer();
+    const { isError, text } = await call(server, "play_artist", { artist: "Some Album", immediate: true });
+
+    expect(isError).toBe(false);
+    expect(text).toContain("Now playing");
+    expect(world.executed).toContain("act:play");
+  });
+
+  // A deferred track/album with no confident provider match refuses at arm time
+  // (fail early, while Maya can still ask) - never silently at the seam.
+  it("deferred play with no confident provider match refuses at arm time", async () => {
+    const server = buildServer();
+    const { isError, text } = await call(server, "play_track", { track: "EMPTY" });
+
+    expect(isError).toBe(true);
+    expect(text.toLowerCase()).toContain("no confident match");
+    expect(world.executed).toHaveLength(0);
+  });
 });
