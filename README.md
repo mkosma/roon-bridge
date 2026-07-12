@@ -534,7 +534,7 @@ disturb Roon playback. The new MCP tools appear after the client reconnects.
 read-only checks: it appends a designated test track at the queue tail with
 `queue_by_id`, confirms exactly one item landed, deletes it with `edit_queue`,
 and confirms the queue is net-zero. This exercises the exact write path the
-07-05 incident lived in, end to end. It has two requirements:
+07-05 incident lived in, end to end. It has three requirements:
 
 - **`SMOKE_TEST_TRACK_ID`** must name a stable provider track id (from
   `search_tracks`); provider defaults to `qobuz`, override with
@@ -546,6 +546,17 @@ and confirms the queue is net-zero. This exercises the exact write path the
   so the probe SKIPS when the zone is playing. Run it in a paused/stopped
   window only - it is Monty-approved-window work, never part of an unattended
   deploy.
+- **At least one pre-existing upcoming track.** `edit_queue` cannot leave the
+  upcoming queue empty (it returns `cannot_empty_queue`), so if the appended
+  test track is the only upcoming item its delete is refused and the track is
+  stranded live. The probe SKIPS (before appending) when there is no upcoming
+  track - queue a track ahead first, then rerun.
+
+Regardless of outcome, the appended test track is always removed before the
+probe returns: a safety-net cleanup re-reads the queue and force-deletes it,
+raising a loud FAIL (with the `queue_item_id` to remove by hand) only if it
+genuinely cannot. A refused or failed delete can no longer strand the canary in
+the live queue (the 2026-07-12 failure mode).
 
 ```bash
 SMOKE_TEST_TRACK_ID=<qobuz track id> ~/dev/roon-bridge/scripts/smoke.sh --live-mutation --zone "WiiM + 1"

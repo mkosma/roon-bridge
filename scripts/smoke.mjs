@@ -213,7 +213,7 @@ function queueItems(result) {
  * edit_queue, and confirm the queue is byte-for-byte back to its prior item
  * set. This exercises the exact write path the incident lived in, end to end.
  *
- * Two hard preconditions, both enforced here:
+ * Three hard preconditions, all enforced here:
  *   - SMOKE_TEST_TRACK_ID must name a stable provider track (default provider
  *     qobuz). There is no safe implicit default - get_queue does not expose
  *     provider ids and provenance only covers self-queued items, so the track
@@ -222,6 +222,17 @@ function queueItems(result) {
  *     track; on an idle zone the append+delete never reaches an output. If the
  *     zone is playing, this SKIPS rather than risk a cut - run it in a paused
  *     or stopped window.
+ *   - There must be >=1 pre-existing UPCOMING track. edit_queue cannot leave the
+ *     upcoming queue empty (it rebuilds by playing a first track then appending,
+ *     so an empty result is unreachable - it returns cannot_empty_queue). With
+ *     no upcoming track, our appended item is the ONLY upcoming item, so the
+ *     net-zero delete is impossible and would strand the test track. If there is
+ *     no upcoming track, this SKIPS before appending anything.
+ *
+ * Whatever happens after the append, the appended test track is removed before
+ * this returns - a finally-block safety net re-reads the queue and force-deletes
+ * it, raising a loud FAIL (remove-it-manually) if it cannot. This is the fix for
+ * the 2026-07-12 incident where a refused delete stranded the test track live.
  *
  * Only reached behind --live-mutation.
  */
@@ -240,6 +251,8 @@ async function mutationSmoke() {
     requestInit: { headers: authHeaders },
   });
   await client.connect(transport);
+  // Set only once the append lands; the finally block guarantees its removal.
+  let appendedId = null;
   try {
     // Precondition: idle zone. Parse now_playing's "State:" line.
     const np = await client.callTool({ name: "now_playing", arguments: zoneArgs });
@@ -251,6 +264,19 @@ async function mutationSmoke() {
 
     const before = queueItems(await client.callTool({ name: "get_queue", arguments: zoneArgs }));
     const beforeIds = new Set(before.map((r) => r.queue_item_id));
+
+    // Precondition: >=1 pre-existing upcoming track (rows after the now-playing
+    // head; if nothing is now-playing, every row is upcoming). Without one, the
+    // net-zero delete would empty the upcoming queue (cannot_empty_queue) and
+    // strand the test track - so skip before appending anything.
+    const nowIdx = before.findIndex((r) => r.is_now_playing);
+    const upcomingBefore = nowIdx >= 0 ? before.length - nowIdx - 1 : before.length;
+    if (upcomingBefore < 1) {
+      info("mutation smoke",
+        `no pre-existing upcoming track (queue has ${before.length} item(s), ${upcomingBefore} upcoming) - skipped; ` +
+        `the net-zero delete would empty the upcoming queue (cannot_empty_queue). Queue a track ahead, then rerun.`);
+      return;
+    }
 
     // 1. Append at the tail (when:"queue" = append, never cuts the head).
     const appended = await client.callTool({
@@ -265,7 +291,10 @@ async function mutationSmoke() {
     // 2. Exactly one new item at the tail.
     const after = queueItems(await client.callTool({ name: "get_queue", arguments: zoneArgs }));
     const added = after.filter((r) => !beforeIds.has(r.queue_item_id));
+    if (added.length === 1) appendedId = added[0].queue_item_id;
     if (!check("mutation smoke: append landed (+1 item)", added.length === 1, `got +${added.length}`)) {
+      // Abnormal count - delete every added id here; the finally net covers
+      // appendedId (unset in this branch), these cover the rest.
       for (const r of added) {
         await client.callTool({ name: "edit_queue", arguments: { delete: [r.queue_item_id], immediate: true, ...zoneArgs } });
       }
@@ -275,7 +304,7 @@ async function mutationSmoke() {
     // 3. Delete it (immediate rebuild is safe on an idle zone).
     const del = await client.callTool({
       name: "edit_queue",
-      arguments: { delete: [added[0].queue_item_id], immediate: true, ...zoneArgs },
+      arguments: { delete: [appendedId], immediate: true, ...zoneArgs },
     });
     check("mutation smoke: edit_queue delete", del.isError !== true, resultText(del).split("\n")[0]);
 
@@ -285,6 +314,27 @@ async function mutationSmoke() {
     check("mutation smoke: net-zero (queue restored)", leftover.length === 0,
       leftover.length ? `test item(s) still queued: ${leftover.join(",")}` : "queue matches pre-probe state");
   } finally {
+    // Safety net: the appended test track must never survive the probe. If a
+    // delete above refused or failed, it is still queued - force-remove it and
+    // raise a loud FAIL (with the id) if it cannot be removed.
+    if (appendedId != null) {
+      try {
+        const stillQueued = async () =>
+          queueItems(await client.callTool({ name: "get_queue", arguments: zoneArgs }))
+            .some((r) => r.queue_item_id === appendedId);
+        if (await stillQueued()) {
+          await client.callTool({ name: "edit_queue", arguments: { delete: [appendedId], immediate: true, ...zoneArgs } });
+          const survived = await stillQueued();
+          check("mutation smoke: cleanup (test track removed)", !survived,
+            survived
+              ? `FAILED to remove test track (queue_item_id ${appendedId}) - REMOVE IT MANUALLY from the live queue`
+              : `removed stranded test track (queue_item_id ${appendedId})`);
+        }
+      } catch (e) {
+        check("mutation smoke: cleanup (test track removed)", false,
+          `cleanup threw (${e instanceof Error ? e.message : String(e)}) - REMOVE test track (queue_item_id ${appendedId}) MANUALLY`);
+      }
+    }
     await client.close();
   }
 }
