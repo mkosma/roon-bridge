@@ -8,12 +8,17 @@ import {
   stripRoonLinks,
   formatItems,
   browseAndLoad,
-  scoreCandidates,
   bestMatch,
   resolveActionItem,
   waitForStableQueue,
   type BrowseItem,
 } from "./search-core.js";
+import {
+  selectUnique,
+  type ResolveCategory,
+  type UniqueCandidate,
+  type RankedCandidate,
+} from "./resolve-unique.js";
 import { deferredPlayer } from "../control/deferred-player-instance.js";
 import type { SeamAction, SeamOutcome } from "../control/deferred-player.js";
 import { resultingState, immediateBool, boolish } from "./resulting-state.js";
@@ -43,9 +48,10 @@ function seamOutcomeFrom(res: ToolResult): SeamOutcome {
   }
   const error = typeof parsed.error === "string" ? parsed.error : undefined;
   const resulting_state = parsed.resulting_state;
-  // A refused stomp (match below the confidence gate) is intended, not a fault.
-  if (error === "low_confidence_replace") {
-    return { ok: false, verified: false, aborted: true, reason: "low_confidence", detail: text.split("\n")[0], resulting_state };
+  // A refused resolution (ambiguous / not_found) is an intended stand-down, not
+  // a fault - the deferral aborts cleanly rather than logging a failure.
+  if (error === "ambiguous" || error === "not_found") {
+    return { ok: false, verified: false, aborted: true, reason: error, detail: text.split("\n")[0], resulting_state };
   }
   if (res.isError || parsed.ok === false) {
     return { ok: false, verified: false, reason: error ?? "play_failed", detail: text.split("\n")[0], resulting_state };
@@ -341,7 +347,25 @@ async function resolveActionItems(
   if (categoryData.error) return { error: `Error browsing ${targetCategory.title}: ${categoryData.error}` };
   if (!categoryData.items?.length) return { error: `No ${targetCategory.title.toLowerCase()} found for "${query}".` };
 
-  const matched = bestMatch(categoryData.items, query);
+  // Deterministic selection (the poka-yoke, Roon substrate): the ONE exact
+  // match on the normalized key, or an honest error - never a fuzzy best-match
+  // guess. This is the artist-resolution path; artist has no stable provider id
+  // to funnel through the *_by_id gateway.
+  const resolveCat: ResolveCategory =
+    category === "artist" ? "artist" : category === "playlist" ? "playlist" : category === "album" ? "album" : "track";
+  const playable = categoryData.items.filter((i) => i.item_key && i.hint !== "header");
+  const cands: UniqueCandidate[] = playable.map((i) => ({
+    id: i.item_key!,
+    title: i.title,
+    artist: stripRoonLinks(i.subtitle || "").split(/[,/]/)[0].trim() || undefined,
+  }));
+  const selection = selectUnique(cands, query, resolveCat);
+  if (selection.kind === "not_found") return { error: `No exact ${resolveCat} match for "${query}".` };
+  if (selection.kind === "ambiguous") {
+    const names = selection.candidates.map((c) => `"${c.title}"${c.artist ? ` - ${c.artist}` : ""}`).join(", ");
+    return { error: `"${query}" matches ${selection.candidates.length} ${resolveCat}s exactly (${names}) - refusing to guess; name one exactly.` };
+  }
+  const matched = playable.find((i) => i.item_key === selection.candidate.id);
   if (!matched?.item_key) return { error: `No playable match for "${query}".` };
 
   const actionData = await browseAndLoad(browse, {
@@ -751,129 +775,11 @@ async function queueArtist(query: string, zoneName: string): Promise<ToolResult>
   }
 }
 
-/**
- * Queue a WHOLE album, and verify the whole album actually landed.
- *
- * The generic add path (searchAndPlay) verifies only that the queue GREW by at
- * least one item, then claims success. For an album-level Queue action that is
- * not enough: if Roon commits the album incrementally and the verify reads too
- * early - or under-commits outright - the tool reports success while only ONE
- * track landed (the BUG C under-add). This path instead reads the album's real
- * track count, queues it, waits for the queue to SETTLE, and reports the actual
- * tracks_added: the full album, or an honest under-add with its count. This is
- * the safer album-journey default (album order, canonical recordings) - but only
- * worth defaulting to if it reliably adds the whole album or says it did not.
- */
-async function queueAlbum(query: string, zoneName: string): Promise<ToolResult> {
-  try {
-    const browse = roonConnection.getBrowse();
-    const zone = roonConnection.findZoneOrThrow(zoneName);
-    const sessionKey = newSessionKey();
-    const hierarchy = "search";
-    const log = (step: string, data: unknown) =>
-      console.error(`[roon-bridge] queueAlbum[${sessionKey}] ${step}:`, JSON.stringify(data));
-    const errText = (text: string): ToolResult => ({ content: [{ type: "text", text }], isError: true });
-
-    // Resolve the album entity (scored, variants penalized so a live/comp album
-    // does not outrank the studio release).
-    const searchData = await browseAndLoad(browse, {
-      hierarchy, input: query, pop_all: true, zone_or_output_id: zone.zone_id, multi_session_key: sessionKey,
-    });
-    if (searchData.error) return errText(`Search error: ${searchData.error}`);
-    if (!searchData.items?.length) return errText(`No results found for "${query}".`);
-    const albumsCat =
-      searchData.items.find((i) => i.item_key && i.title.toLowerCase() === "albums") ||
-      searchData.items.find((i) => i.item_key && i.title.toLowerCase().includes("album"));
-    if (!albumsCat?.item_key) return errText(`No album results for "${query}".`);
-
-    const catData = await browseAndLoad(browse, {
-      hierarchy, item_key: albumsCat.item_key, zone_or_output_id: zone.zone_id, multi_session_key: sessionKey,
-    });
-    if (catData.error || !catData.items?.length) return errText(`No albums found for "${query}".`);
-    const album = scoreCandidates(catData.items, query, true)[0]?.item ?? bestMatch(catData.items, query);
-    if (!album?.item_key) return errText(`No album match for "${query}".`);
-
-    // The album's real length, so we can tell a full add from an under-add. Read
-    // it from the album's own page; if Roon returned only an action popup (no
-    // track rows), descend one level into the album's content listing.
-    const opened = await browseAndLoad(browse, {
-      hierarchy, item_key: album.item_key, zone_or_output_id: zone.zone_id, multi_session_key: sessionKey,
-    });
-    let expectedTracks = (opened.items ?? []).filter((i) => i.item_key && isTrackRow(i)).length;
-    if (!expectedTracks) {
-      const navChild = (opened.items ?? []).find(
-        (i) => i.item_key && (i.hint === "list" || i.hint === "action_list") && !isTrackRow(i),
-      );
-      if (navChild?.item_key) {
-        const deeper = await browseAndLoad(browse, {
-          hierarchy, item_key: navChild.item_key, zone_or_output_id: zone.zone_id, multi_session_key: sessionKey,
-        });
-        const deepRows = (deeper.items ?? []).filter((i) => i.item_key && isTrackRow(i)).length;
-        expectedTracks = deepRows || deeper.total || 0;
-      }
-    }
-    if (!expectedTracks && opened.total) expectedTracks = opened.total;
-    log("album-resolved", { album: album.title, expectedTracks });
-
-    // Snapshot, queue the whole album, then verify against the SETTLED queue.
-    let preIds = new Set<number>();
-    let preCount = 0;
-    try {
-      const pre = await roonConnection.getQueueSnapshot(zone);
-      preIds = new Set(pre.map((i) => i.queue_item_id));
-      preCount = pre.length;
-    } catch {
-      preIds = new Set();
-    }
-
-    const queued = await executeQueueAction(browse, album.item_key, zone.zone_id, sessionKey, log);
-    if (!queued) {
-      return errText(`Could not queue album "${album.title}" - no queue action available in '${zone.display_name}'.`);
-    }
-
-    // Best-effort auto_radio off, matching the other play/queue paths.
-    try {
-      const transport = roonConnection.getTransport();
-      await new Promise<void>((resolve) => transport.change_settings(zone, { auto_radio: false }, () => resolve()));
-    } catch {
-      /* non-critical */
-    }
-
-    let tracksAdded = 0;
-    try {
-      const after = await waitForStableQueue(() => roonConnection.getQueueSnapshot(zone), { quietMs: 300, deadlineMs: 12000 });
-      const newItems = after.filter((i) => !preIds.has(i.queue_item_id));
-      tracksAdded = Math.max(newItems.length, after.length - preCount);
-    } catch (verifyErr) {
-      log("verify-error", String(verifyErr));
-      return {
-        content: [{ type: "text", text: `Queued album "${album.title}" in '${zone.display_name}' (queue growth unverified: ${String(verifyErr)}).` }],
-      };
-    }
-
-    const full = expectedTracks > 0 ? tracksAdded >= expectedTracks : tracksAdded > 0;
-    const payload = {
-      ok: full,
-      album: album.title,
-      tracks_added: tracksAdded,
-      tracks_expected: expectedTracks || null,
-      zone: zone.display_name,
-      ...(full
-        ? {}
-        : { reason: "album_under_added", detail: `Only ${tracksAdded} of ${expectedTracks || "?"} track(s) from "${album.title}" landed in the queue.` }),
-    };
-    return { content: [{ type: "text", text: JSON.stringify(payload) }], isError: !full };
-  } catch (error) {
-    return { content: [{ type: "text", text: String(error instanceof Error ? error.message : error) }], isError: true };
-  }
-}
-
 async function searchAndPlay(
   query: string,
   zoneName: string,
   category?: string,
   actionType: ActionType = "play",
-  opts: { minConfidence?: number } = {},
 ): Promise<ToolResult> {
   try {
     const browse = roonConnection.getBrowse();
@@ -967,48 +873,35 @@ async function searchAndPlay(
       return { content: [{ type: "text", text: `No ${targetCategory.title.toLowerCase()} found for "${query}".` }] };
     }
 
-    // Step 4: Select best match (scored, with a confidence signal so a loose
-    // match is visible in the result rather than silently substituted).
-    const ranked = scoreCandidates(categoryData.items, query, category !== "playlist");
-    const matchedResult = ranked[0]?.item ?? bestMatch(categoryData.items, query);
-    const matchConfidence = ranked[0]?.confidence ?? 0;
-    const runnerUp = ranked[1];
+    // Step 4: Deterministic selection over the Roon substrate. Keep only rows
+    // that are EXACTLY the named thing on the normalized key, then resolve to
+    // the one survivor - or error with candidates. No fuzzy "best match"
+    // auto-select and no confidence threshold: a name play acts on exactly the
+    // named thing or refuses (the "Gas instead of Spoon" poka-yoke). This path
+    // serves the categories that have no stable provider id to pin (artist), a
+    // shuffle request (needs Roon's native Shuffle action), and the generic
+    // auto-detect add; album/track/playlist plays funnel through the provider
+    // *_by_id gateway instead (see playWithWhen / addByNameToQueue).
+    const playable = categoryData.items.filter((i) => i.item_key && i.hint !== "header");
+    const resolveCat: ResolveCategory =
+      category === "artist" ? "artist" : category === "playlist" ? "playlist" : category === "album" ? "album" : "track";
+    const uniqueCands: UniqueCandidate[] = playable.map((i) => ({
+      id: i.item_key!,
+      title: i.title,
+      artist: stripRoonLinks(i.subtitle || "").split(/[,/]/)[0].trim() || undefined,
+    }));
+    const selection = selectUnique(uniqueCands, query, resolveCat);
+    if (selection.kind !== "unique") {
+      log("step4-not-unique", { query, kind: selection.kind, candidates: selection.candidates.length });
+      return renderUniqueError(query, resolveCat, zone.display_name, selection.kind, selection.candidates);
+    }
+    const matchedResult = playable.find((i) => i.item_key === selection.candidate.id)!;
 
-    log("step4-bestMatch", { selected: matchedResult?.title, subtitle: matchedResult?.subtitle, confidence: matchConfidence, hint: matchedResult?.hint, item_key: matchedResult?.item_key });
+    log("step4-unique", { selected: matchedResult.title, subtitle: matchedResult.subtitle, item_key: matchedResult.item_key });
 
     if (!matchedResult?.item_key) {
       return {
         content: [{ type: "text", text: `${targetCategory.title} for "${query}":\n${formatItems(categoryData.items)}\n\nNo playable item found.` }],
-      };
-    }
-
-    // Step 4b: Confidence gate. A loose name match must NOT be allowed to act
-    // silently - that is the "Gas instead of Spoon" failure. Below the
-    // threshold, return the ranked candidates and mutate nothing. Every call
-    // is gated at DEFAULT_MIN_CONFIDENCE unless the caller passes a higher
-    // explicit threshold (REPLACE_MIN_CONFIDENCE for an interrupt/stomp).
-    const confidenceThreshold = opts.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
-    if (matchConfidence < confidenceThreshold) {
-      const candidates = ranked.slice(0, 5).map((c) => ({
-        title: c.item.title,
-        artist: c.artist || null,
-        confidence: Number(c.confidence.toFixed(2)),
-      }));
-      log("step4b-low-confidence-refuse", { query, matchConfidence, threshold: confidenceThreshold, candidates });
-      const verb = actionType === "queue" ? "queue" : actionType === "shuffle" ? "shuffle" : "play";
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            ok: false,
-            error: "low_confidence_replace",
-            detail: `Refused to ${verb} "${query}": the best match is "${matchedResult.title}" at ${Math.round(matchConfidence * 100)}% confidence, below the ${Math.round(confidenceThreshold * 100)}% required. Pick an exact one below (or use queue_by_id / play_tracks, or search_albums + play_album_by_id / queue_album_by_id, with a provider ID).`,
-            query,
-            zone: zone.display_name,
-            candidates,
-          }, null, 2),
-        }],
-        isError: true,
       };
     }
 
@@ -1275,11 +1168,9 @@ async function searchAndPlay(
     const shuffleNote = shuffleUnavailable
       ? ` [shuffle unavailable for this item - no native Shuffle action; played in playlist order instead]`
       : "";
-    const confPct = Math.round(matchConfidence * 100);
-    const confNote =
-      matchConfidence < 0.5 && runnerUp
-        ? ` [loose match, ${confPct}% confidence; runner-up: "${runnerUp.title}"${runnerUp.artist ? ` - ${runnerUp.artist}` : ""}]`
-        : ` [match confidence ${confPct}%]`;
+    // The match is now exact by construction (step 4 uniqueness gate), so there
+    // is no confidence figure to report.
+    const confNote = "";
 
     // Step 8b: verify a PLAY/SHUFFLE actually changed what is playing. The
     // browse action can return success while the zone never moves (the false-
@@ -1380,105 +1271,158 @@ async function searchAndPlay(
 }
 
 /**
- * A deferred target after arm-time resolution. Monty's ruling: a deferred play
- * is resolved to exact provider id(s) WHEN Maya creates the future queue, never
- * re-resolved at play time. Categories with no stable provider id
- * (artist/composer/genre) cannot be pinned, so a deferred play of one is
- * refused at arm time; a track/album query with no confident provider match is
- * likewise refused (fail early, while Maya can still ask). album pins the album
- * id; track pins the track id; playlist snapshots its ordered track-id list.
+ * Render the poka-yoke error return shared by every name-based play/queue tool:
+ * the resolution was NOT a single exact match, so the tool mutates nothing and
+ * hands back the candidates (each with an exact provider/Roon id) on the ERROR
+ * path. `ambiguous` = 2+ rows that are exactly the named thing; `not_found` = a
+ * ranked fuzzy list of near-misses. Candidates ride the error path ONLY - there
+ * is no success return that carries a candidate list, and a candidate is never
+ * itself directly playable (the caller must re-issue a by-id call).
  */
-type DeferredTarget =
-  | { kind: "refuse"; detail: string; candidates?: Array<{ title: string; artist?: string; confidence: number }> }
-  | { kind: "album"; albumId: string; label: string }
-  | { kind: "tracks"; trackIds: string[]; label: string };
-
-/** Score provider search rows with the SAME confidence model that gates an
- *  immediate name play, by synthesizing BrowseItems (title + credited artist). */
-function scoreProviderMatches(
-  rows: Array<{ id: string; title: string; artist?: string }>,
+function renderUniqueError(
   query: string,
-  penalizeVariants: boolean,
-) {
-  const items = rows.map(
-    (r) => ({ item_key: r.id, title: r.title, subtitle: r.artist ?? "", hint: "action_list" }) as BrowseItem,
-  );
-  return scoreCandidates(items, query, penalizeVariants);
-}
-
-function refuseWithCandidates(
-  query: string,
-  category: string,
-  scored: ReturnType<typeof scoreCandidates>,
-): DeferredTarget {
-  const best = scored[0];
+  category: ResolveCategory,
+  zoneName: string,
+  error: "not_found" | "ambiguous",
+  candidates: RankedCandidate[],
+): ToolResult {
+  const escape =
+    "Act on an exact id instead: search_albums + play_album_by_id / queue_album_by_id, or search_tracks + play_tracks / queue_by_id.";
+  const detail =
+    error === "ambiguous"
+      ? `"${query}" matches ${candidates.length} ${category}s exactly - refusing to guess. Pick one by id below. ${escape}`
+      : `No exact ${category} match for "${query}". Closest near-misses below (not played). ${escape}`;
   return {
-    kind: "refuse",
-    detail:
-      `No confident match to pin for "${query}" (${category}) at arm time` +
-      (best ? ` - best is "${best.item.title}" at ${Math.round(best.confidence * 100)}%, below the ${Math.round(REPLACE_MIN_CONFIDENCE * 100)}% required` : "") +
-      `. Play it now, or defer a more specific query.`,
-    candidates: scored.slice(0, 5).map((s) => ({
-      title: s.item.title,
-      artist: s.item.subtitle || undefined,
-      confidence: Number(s.confidence.toFixed(2)),
-    })),
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(
+          {
+            ok: false,
+            error,
+            query,
+            category,
+            zone: zoneName,
+            detail,
+            candidates: candidates.map((c) => ({
+              id: c.id,
+              title: c.title,
+              artist: c.artist ?? null,
+              year: c.year ?? null,
+              in_library: c.in_library ?? null,
+              is_live: c.is_live ?? null,
+              is_compilation: c.is_compilation ?? null,
+              instrumental: c.instrumental ?? null,
+              confidence: c.confidence,
+            })),
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+    isError: true,
   };
 }
 
+/** A name resolved to a single exact, pinnable provider target. */
+type ProviderTarget =
+  | { kind: "album"; id: string; label: string }
+  | { kind: "tracks"; ids: string[]; label: string };
+
+type ProviderResolve =
+  | { ok: true; target: ProviderTarget }
+  | { ok: false; error: "not_found" | "ambiguous"; candidates: RankedCandidate[] };
+
 /**
- * Resolve (query, category) to a pinnable target at ARM TIME, using the music
- * provider's search (stable ids) rather than Roon browse (whose item_keys
- * expire by the seam). Pins against the provider (e.g. Qobuz): a query only
- * reachable via Roon browse (local files, a Roon-only playlist) refuses here
- * and should be played immediately instead.
+ * Resolve (query, category) to ONE exact provider target, or an error with
+ * candidates. Uses the music provider's search (stable ids) - the same
+ * substrate the `search_albums` / `search_tracks` tools expose - then applies
+ * the deterministic uniqueness gate (selectUnique). No thresholds: exactly one
+ * exact match acts, anything else refuses. This is the front end for the
+ * `*_by_id` mutation gateway that album/track/playlist plays funnel through,
+ * for BOTH the immediate and the after-current (pinned) paths. May throw if the
+ * provider is unreachable/unconfigured; callers wrap it.
  */
-async function resolveDeferredTarget(query: string, category: string): Promise<DeferredTarget> {
-  if (category === "artist" || category === "composer" || category === "genre") {
-    return {
-      kind: "refuse",
-      detail: `A deferred ${category} play can't be pinned to an exact id, so it can't be guaranteed for later. Play it now (immediate), or name a specific album or track to defer.`,
-    };
+async function resolveProviderTarget(
+  query: string,
+  category: "album" | "track" | "playlist",
+): Promise<ProviderResolve> {
+  const provider = initProviders().get(undefined);
+
+  if (category === "album") {
+    const albums = await provider.searchAlbums(query, 10);
+    const cands: UniqueCandidate[] = albums.map((a) => ({
+      id: a.id,
+      title: a.title,
+      artist: a.artist,
+      year: a.year,
+      in_library: undefined,
+    }));
+    const sel = selectUnique(cands, query, "album");
+    if (sel.kind === "unique") {
+      const a = albums.find((x) => x.id === sel.candidate.id)!;
+      return { ok: true, target: { kind: "album", id: a.id, label: `${a.title}${a.artist ? ` - ${a.artist}` : ""}` } };
+    }
+    return { ok: false, error: sel.kind, candidates: sel.candidates };
   }
-  try {
-    const provider = initProviders().get(undefined);
-    if (category === "album") {
-      const albums = await provider.searchAlbums(query, 10);
-      const scored = scoreProviderMatches(albums.map((a) => ({ id: a.id, title: a.title, artist: a.artist })), query, true);
-      if (!scored[0] || scored[0].confidence < REPLACE_MIN_CONFIDENCE) return refuseWithCandidates(query, category, scored);
-      const album = albums.find((a) => a.id === scored[0].item.item_key)!;
-      return { kind: "album", albumId: album.id, label: `${album.title}${album.artist ? ` - ${album.artist}` : ""}` };
+
+  if (category === "track") {
+    const tracks = await provider.searchTracks(query, 10);
+    const cands: UniqueCandidate[] = tracks.map((t) => ({
+      id: t.id,
+      title: t.title,
+      artist: t.artist,
+      year: t.year,
+      instrumental: t.instrumental,
+      in_library: t.inLibrary,
+    }));
+    const sel = selectUnique(cands, query, "track");
+    if (sel.kind === "unique") {
+      const t = tracks.find((x) => x.id === sel.candidate.id)!;
+      return { ok: true, target: { kind: "tracks", ids: [t.id], label: `${t.title}${t.artist ? ` - ${t.artist}` : ""}` } };
     }
-    if (category === "track") {
-      const tracks = await provider.searchTracks(query, 10);
-      const scored = scoreProviderMatches(tracks.map((t) => ({ id: t.id, title: t.title, artist: t.artist })), query, true);
-      if (!scored[0] || scored[0].confidence < REPLACE_MIN_CONFIDENCE) return refuseWithCandidates(query, category, scored);
-      const track = tracks.find((t) => t.id === scored[0].item.item_key)!;
-      return { kind: "tracks", trackIds: [track.id], label: `${track.title}${track.artist ? ` - ${track.artist}` : ""}` };
-    }
-    if (category === "playlist") {
-      const playlists = await provider.listPlaylists(50);
-      const scored = scoreProviderMatches(playlists.map((p) => ({ id: p.id, title: p.name })), query, false);
-      if (!scored[0] || scored[0].confidence < REPLACE_MIN_CONFIDENCE) return refuseWithCandidates(query, category, scored);
-      const pl = playlists.find((p) => p.id === scored[0].item.item_key)!;
-      const { tracks } = await provider.getPlaylist(pl.id, 500);
-      const trackIds = tracks.map((t) => t.id).filter((id): id is string => !!id);
-      if (!trackIds.length) return { kind: "refuse", detail: `Playlist "${pl.name}" has no pinnable provider tracks; play it now instead.` };
-      return { kind: "tracks", trackIds, label: `playlist "${pl.name}" (${trackIds.length} tracks, snapshot at arm time)` };
-    }
-    return { kind: "refuse", detail: `Cannot defer category "${category}".` };
-  } catch (e) {
-    return { kind: "refuse", detail: `Couldn't resolve "${query}" (${category}) to a pinnable id: ${e instanceof Error ? e.message : String(e)}. Play it now instead.` };
+    return { ok: false, error: sel.kind, candidates: sel.candidates };
   }
+
+  // playlist
+  const playlists = await provider.listPlaylists(50);
+  const cands: UniqueCandidate[] = playlists.map((p) => ({ id: p.id, title: p.name }));
+  const sel = selectUnique(cands, query, "playlist");
+  if (sel.kind !== "unique") return { ok: false, error: sel.kind, candidates: sel.candidates };
+  const pl = playlists.find((p) => p.id === sel.candidate.id)!;
+  const { tracks } = await provider.getPlaylist(pl.id, 500);
+  const ids = tracks.map((t) => t.id).filter((id): id is string => !!id);
+  if (!ids.length) return { ok: false, error: "not_found", candidates: [] };
+  return { ok: true, target: { kind: "tracks", ids, label: `playlist "${pl.name}" (${ids.length} tracks)` } };
+}
+
+/** Whether a category funnels through the provider `*_by_id` gateway. Artist has
+ *  no stable provider id (no provider artist search), and a shuffle needs Roon's
+ *  native Shuffle action, so both stay on the deterministic Roon-browse path. */
+function providerPinnable(category: string, shuffle: boolean): category is "album" | "track" | "playlist" {
+  return !shuffle && (category === "album" || category === "track" || category === "playlist");
+}
+
+/** Dispatch a resolved provider target to the deterministic by-id gateway. */
+function actOnTarget(target: ProviderTarget, zoneName: string, when: "now" | "next" | "queue"): Promise<ToolResult> {
+  return target.kind === "album"
+    ? playOrQueueAlbumById(target.id, undefined, zoneName, when)
+    : queueOrPlayTracks(target.ids, undefined, zoneName, when);
 }
 
 /**
- * Play a match, honoring `when`. `now` replaces immediately (current behavior).
- * `after_current` arms an event-driven deferral so the queue-replace fires at
- * the end of the current track - clean queue AND no mid-track stomp. The
- * deferred target is PINNED to exact provider id(s) at arm time (see
- * resolveDeferredTarget) so it never re-resolves at play time. If nothing is
- * playing there is no seam to wait for, so the pinned action fires now.
+ * Play a name match, honoring `when`. `now` replaces immediately; `after_current`
+ * arms an event-driven deferral so the queue-replace fires at the end of the
+ * current track (clean queue, no mid-track stomp).
+ *
+ * album/track/playlist funnel through the provider `*_by_id` gateway: the name
+ * is resolved to ONE exact provider id (or an error with candidates), and that
+ * id is what acts - immediately, or pinned into the seam action (stable across
+ * the wait). artist and shuffle stay on the deterministic Roon-browse path
+ * (no provider id to pin), which likewise resolves to the one exact match or
+ * errors. A deferred artist/shuffle can't be pinned, so it is refused at arm
+ * time when a seam exists (play it now instead).
  */
 async function playWithWhen(
   query: string,
@@ -1486,9 +1430,9 @@ async function playWithWhen(
   category: string,
   when: "now" | "after_current",
   shuffle = false,
-  minConfidence?: number,
 ): Promise<ToolResult> {
   const playActionType: ActionType = shuffle ? "shuffle" : "play";
+
   if (when === "after_current") {
     let zone;
     try {
@@ -1502,30 +1446,34 @@ async function playWithWhen(
 
     const np = zone.now_playing;
     if (zone.state === "playing" && np && np.length != null) {
-      // There is a real seam to wait for. Pin the target to exact provider
-      // id(s) NOW (Monty's ruling: the future queue is resolved when Maya
-      // creates it, never re-resolved at play time).
-      const target = await resolveDeferredTarget(query, category);
-      if (target.kind === "refuse") {
-        const lines = [`Can't defer this: ${target.detail}`];
-        if (target.candidates?.length) {
-          lines.push("Closest matches:");
-          for (const c of target.candidates) {
-            lines.push(`  - ${c.title}${c.artist ? ` - ${c.artist}` : ""} [${Math.round(c.confidence * 100)}%]`);
-          }
-        }
-        return { content: [{ type: "text", text: lines.join("\n") }], isError: true };
+      // A real seam to wait for.
+      if (!providerPinnable(category, shuffle)) {
+        return {
+          content: [{
+            type: "text",
+            text: `Can't defer this: a ${shuffle ? "shuffled" : category} play can't be pinned to an exact id, so it can't be guaranteed for later. Play it now (immediate), or name a specific album or track to defer.`,
+          }],
+          isError: true,
+        };
       }
+      // Pin the target to an exact provider id NOW (resolved when the future
+      // queue is created, never re-resolved at play time).
+      let resolved: ProviderResolve;
+      try {
+        resolved = await resolveProviderTarget(query, category);
+      } catch (e) {
+        return { content: [{ type: "text", text: `Couldn't resolve "${query}" (${category}) to a pinnable id: ${e instanceof Error ? e.message : String(e)}. Play it now instead.` }], isError: true };
+      }
+      if (!resolved.ok) return renderUniqueError(query, category, zone.display_name, resolved.error, resolved.candidates);
+      const target = resolved.target;
 
       // The seam action fires the PINNED exact id(s) as a replace at the track
-      // boundary. Provider ids are stable, so the same recording plays no
-      // matter how long the wait or how the library shifts. Both entry points
-      // read back the zone and return a verified outcome for the ledger.
-      // (shuffle is not applied to a deferred pinned set - it plays in order.)
+      // boundary. Provider ids are stable, so the same recording plays no matter
+      // how long the wait or how the library shifts.
       const seamAction: SeamAction =
         target.kind === "album"
-          ? async () => seamOutcomeFrom(await playOrQueueAlbumById(target.albumId, undefined, zoneName, "now"))
-          : async () => seamOutcomeFrom(await queueOrPlayTracks(target.trackIds, undefined, zoneName, "now"));
+          ? async () => seamOutcomeFrom(await playOrQueueAlbumById(target.id, undefined, zoneName, "now"))
+          : async () => seamOutcomeFrom(await queueOrPlayTracks(target.ids, undefined, zoneName, "now"));
 
       const { deferral_id } = await deferredPlayer.scheduleAfterCurrent(zone, seamAction, {
         zoneId: zone.zone_id,
@@ -1541,17 +1489,57 @@ async function playWithWhen(
         }],
       };
     }
-    // Nothing playing - no seam to wait for. There is nothing to pin against
-    // and no re-resolution risk (it plays right now), so fall through to the
-    // immediate browse play, which preserves shuffle and library semantics.
+    // Nothing playing - no seam to wait for. Fall through to the immediate play.
   }
 
-  // An immediate play supersedes any armed deferral. Gated on match confidence -
-  // REPLACE_MIN_CONFIDENCE (0.9) when this is a deliberate stomp (the caller
-  // passes minConfidence explicitly), else searchAndPlay's DEFAULT_MIN_CONFIDENCE
-  // floor (0.75) applies.
+  // An immediate play supersedes any armed deferral.
   deferredPlayer.cancel();
-  return searchAndPlay(query, zoneName, category, playActionType, { minConfidence });
+
+  if (providerPinnable(category, shuffle)) {
+    let zone;
+    try {
+      zone = roonConnection.findZoneOrThrow(zoneName);
+    } catch (error) {
+      return { content: [{ type: "text", text: String(error instanceof Error ? error.message : error) }], isError: true };
+    }
+    let resolved: ProviderResolve;
+    try {
+      resolved = await resolveProviderTarget(query, category);
+    } catch (e) {
+      return { content: [{ type: "text", text: `Couldn't resolve "${query}" (${category}): ${e instanceof Error ? e.message : String(e)}.` }], isError: true };
+    }
+    if (!resolved.ok) return renderUniqueError(query, category, zone.display_name, resolved.error, resolved.candidates);
+    return actOnTarget(resolved.target, zoneName, "now");
+  }
+
+  // artist, or a shuffle request: deterministic Roon-browse play (unique-or-error).
+  return searchAndPlay(query, zoneName, category, playActionType);
+}
+
+/**
+ * Add a name match to the queue through the provider `*_by_id` gateway: resolve
+ * to ONE exact provider target (or error with candidates), then append. The
+ * queue counterpart of playWithWhen's immediate path.
+ */
+async function addByNameToQueue(
+  query: string,
+  zoneName: string,
+  category: "album" | "track" | "playlist",
+): Promise<ToolResult> {
+  let zone;
+  try {
+    zone = roonConnection.findZoneOrThrow(zoneName);
+  } catch (error) {
+    return { content: [{ type: "text", text: String(error instanceof Error ? error.message : error) }], isError: true };
+  }
+  let resolved: ProviderResolve;
+  try {
+    resolved = await resolveProviderTarget(query, category);
+  } catch (e) {
+    return { content: [{ type: "text", text: `Couldn't resolve "${query}" (${category}): ${e instanceof Error ? e.message : String(e)}.` }], isError: true };
+  }
+  if (!resolved.ok) return renderUniqueError(query, category, zone.display_name, resolved.error, resolved.candidates);
+  return actOnTarget(resolved.target, zoneName, "queue");
 }
 
 /**
@@ -1565,24 +1553,8 @@ const immediateArg = immediateBool
   .optional()
   .default(false)
   .describe(
-    "Interrupt/replace the currently-playing track RIGHT NOW. Default false = never cut the current track (plays after it ends / appends to the queue). A stomp is refused if the name match is below 90% confidence (the 'Gas instead of Spoon' guard). Prefer when:\"replace\" where available.",
+    "Interrupt/replace the currently-playing track RIGHT NOW. Default false = never cut the current track (plays after it ends / appends to the queue). Either way the name must resolve to a SINGLE exact match; an ambiguous or unmatched name returns candidates and plays nothing (the 'Gas instead of Spoon' poka-yoke). Prefer when:\"replace\" where available.",
   );
-
-/**
- * Confidence a fuzzy name match must clear before ANY name-based play/queue
- * tool acts on it. Below this the tool returns the candidate list and
- * mutates nothing - a loose match may never ride through silently (the "Gas
- * instead of Spoon" rule). This is the floor for every searchAndPlay call
- * that does not pass a higher explicit threshold.
- */
-const DEFAULT_MIN_CONFIDENCE = 0.75;
-
-/**
- * Confidence a fuzzy name match must clear before an INTERRUPT (immediate /
- * replace) is allowed to stomp the current track - stricter than the default
- * floor above, since a stomp is destructive and irreversible mid-track.
- */
-const REPLACE_MIN_CONFIDENCE = 0.9;
 
 export function registerBrowseTools(server: McpServer): void {
   server.tool(
@@ -1729,12 +1701,12 @@ export function registerBrowseTools(server: McpServer): void {
         .describe("Play in shuffled order via Roon's native Shuffle action (default false)"),
     },
     async ({ artist, zone, immediate, shuffle }) =>
-      playWithWhen(artist, zone, "artist", immediate ? "now" : "after_current", shuffle ?? false, immediate ? REPLACE_MIN_CONFIDENCE : undefined),
+      playWithWhen(artist, zone, "artist", immediate ? "now" : "after_current", shuffle ?? false),
   );
 
   server.tool(
     "play_album",
-    "Search for an album and play it in a Roon zone. SAFE DEFAULT: does NOT cut the current track - the album replaces the queue only after the current track ends (server-side, event-driven, so the queue stays clean and the playing track is never cut mid-way). when='replace' replaces the queue and plays the album RIGHT NOW (the harness-safe one-call stomp; immediate:true is the legacy equivalent). A stomp is refused if the album name match is below 90% confidence (candidates are returned instead).",
+    "Search for an album by name and play the SINGLE EXACT match in a Roon zone, or return candidates if the name is ambiguous or unmatched - it never guesses among several and never auto-selects a fuzzy 'best' (resolves a provider album id, then funnels through play_album_by_id). SAFE DEFAULT: does NOT cut the current track - the album replaces the queue only after the current track ends (server-side, event-driven, so the queue stays clean and the playing track is never cut mid-way). when='replace' replaces the queue and plays the album RIGHT NOW (the harness-safe one-call stomp; immediate:true is the legacy equivalent).",
     {
       album: z.string().describe("Album name to search for"),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
@@ -1750,13 +1722,13 @@ export function registerBrowseTools(server: McpServer): void {
     },
     async ({ album, zone, immediate, when, shuffle }) => {
       const interrupt = immediate || when === "replace";
-      return playWithWhen(album, zone, "album", interrupt ? "now" : "after_current", shuffle ?? false, interrupt ? REPLACE_MIN_CONFIDENCE : undefined);
+      return playWithWhen(album, zone, "album", interrupt ? "now" : "after_current", shuffle ?? false);
     },
   );
 
   server.tool(
     "play_playlist",
-    "Search for a playlist and start playing it in a Roon zone. SAFE DEFAULT: does NOT cut the current track - the playlist starts after the current track ends (server-side, event-driven, no mid-track cut). when='replace' replaces the queue and starts the playlist RIGHT NOW (the harness-safe one-call stomp; immediate:true is the legacy equivalent). A stomp is refused if the playlist name match is below 90% confidence (candidates are returned instead). shuffle=true executes Roon's native Shuffle action (random track order, no extra transport events); if the matched playlist exposes no Shuffle action, it falls back to Play Now and the result text says so.",
+    "Search for a playlist by name and start the SINGLE EXACT match in a Roon zone, or return candidates if the name is ambiguous or unmatched - it never guesses among several. SAFE DEFAULT: does NOT cut the current track - the playlist starts after the current track ends (server-side, event-driven, no mid-track cut). when='replace' replaces the queue and starts the playlist RIGHT NOW (the harness-safe one-call stomp; immediate:true is the legacy equivalent). shuffle=true plays the exact playlist in Roon's native shuffled order.",
     {
       playlist: z.string().describe("Playlist name to search for"),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
@@ -1772,25 +1744,25 @@ export function registerBrowseTools(server: McpServer): void {
     },
     async ({ playlist, zone, immediate, when, shuffle }) => {
       const interrupt = immediate || when === "replace";
-      return playWithWhen(playlist, zone, "playlist", interrupt ? "now" : "after_current", shuffle ?? false, interrupt ? REPLACE_MIN_CONFIDENCE : undefined);
+      return playWithWhen(playlist, zone, "playlist", interrupt ? "now" : "after_current", shuffle ?? false);
     },
   );
 
   server.tool(
     "play_track",
-    "Search for a specific track/song and play it in a Roon zone. SAFE DEFAULT: does NOT cut the current track - it plays after the current track ends (server-side, event-driven, so the queue stays clean and the playing track is never cut mid-way). Pass immediate:true to replace the queue and play the track RIGHT NOW.",
+    "Search for a track/song by name and play the SINGLE EXACT match in a Roon zone, or return candidates if the name is ambiguous or unmatched - it never guesses among several and never auto-selects a fuzzy 'best' (resolves a provider track id, then funnels through play_tracks). SAFE DEFAULT: does NOT cut the current track - it plays after the current track ends (server-side, event-driven, so the queue stays clean and the playing track is never cut mid-way). Pass immediate:true to replace the queue and play the track RIGHT NOW.",
     {
       track: z.string().describe("Track/song name to search for"),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
       immediate: immediateArg,
     },
     async ({ track, zone, immediate }) =>
-      playWithWhen(track, zone, "track", immediate ? "now" : "after_current", false, immediate ? REPLACE_MIN_CONFIDENCE : undefined),
+      playWithWhen(track, zone, "track", immediate ? "now" : "after_current", false),
   );
 
   server.tool(
     "add_to_queue",
-    "Search for a track, album, artist, or playlist and add it to the queue in a Roon zone. category='artist' enqueues a varied stretch of that artist (their albums), not a single track. category='album' queues the WHOLE album and verifies the full album landed (against the album's real track count), reporting tracks_added and an honest under-add count rather than claiming success when only part of the album made it.",
+    "Search by name and add the SINGLE EXACT match to the queue in a Roon zone, or return candidates if the name is ambiguous or unmatched (never a fuzzy guess). category='album'/'track'/'playlist' resolve a provider id and funnel through the deterministic *_by_id gateway (an album adds album-order; a playlist adds its tracks in order). category='artist' enqueues a varied stretch of that exact artist (their albums), not a single track. With no category, a deterministic Roon-browse add is used (unique-or-error).",
     {
       query: z.string().describe("Search query (track name, album title, artist name, etc.)"),
       zone: z.string().optional().default("").describe("Zone name or ID (uses default zone if omitted)"),
@@ -1800,15 +1772,15 @@ export function registerBrowseTools(server: McpServer): void {
         .describe("Category to search in (optional, auto-detects if not specified)"),
     },
     async ({ query, zone, category }) =>
-      // An artist add means "more of this artist" - enqueue their albums, not a
-      // single matched row. A direct artist-node Queue action reports success
-      // but enqueues nothing, so this takes a dedicated, verified path. An album
-      // add likewise needs its own path: verify the WHOLE album landed (not just
-      // queue growth), or report an honest under-add count (BUG C).
+      // artist has no stable provider id (no provider artist search) and "more of
+      // this artist" means enqueue their albums, not a single row - so it keeps
+      // its dedicated, verified Roon path (deterministic artist selection). The
+      // provider-pinnable categories funnel through the *_by_id gateway; a bare
+      // (auto-detect) add falls back to the deterministic Roon-browse path.
       category === "artist"
         ? queueArtist(query, zone)
-        : category === "album"
-          ? queueAlbum(query, zone)
+        : category === "album" || category === "track" || category === "playlist"
+          ? addByNameToQueue(query, zone, category)
           : searchAndPlay(query, zone, category, "queue"),
   );
 
