@@ -19,6 +19,10 @@ const world = {
   nextId: 4000,
   nowPlaying: null as string | null,
   nowAlbum: null as string | null,
+  // How many queue items a queue/next action actually commits - defaults to
+  // a full 13-track album landing; a test drops this to simulate an
+  // under-add (Roon accepting the action but only some tracks landing).
+  itemsPerAct: 13,
 };
 
 function qitem(title: string): QueueItem {
@@ -33,6 +37,13 @@ function qitem(title: string): QueueItem {
 const ALBUMS: Record<string, ProviderAlbum> = {
   "x16j3kp3b4g2b": {
     provider: "qobuz", id: "x16j3kp3b4g2b", title: "Trouble Will Find Me", artist: "The National",
+    trackCount: 13, year: 2013, explicit: true, hires: true,
+  },
+  // Same underlying Roon rows (title+artist match the fixture's browse tree),
+  // a distinct provider id, so a test can drive world.itemsPerAct down to
+  // simulate an under-add without disturbing the other tests' full-album path.
+  "under-add-id": {
+    provider: "qobuz", id: "under-add-id", title: "Trouble Will Find Me", artist: "The National",
     trackCount: 13, year: 2013, explicit: true, hires: true,
   },
 };
@@ -77,7 +88,7 @@ const mockBrowse = {
     if (key.startsWith("act:")) {
       world.executed.push(key);
       if (key.startsWith("act:queue:") || key.startsWith("act:next:")) {
-        world.queue.push(qitem("1. All the Wine"));
+        for (let i = 0; i < world.itemsPerAct; i++) world.queue.push(qitem(`${i + 1}. Track ${i + 1}`));
       }
       if (key.startsWith("act:play:real")) {
         world.nowPlaying = "1. All the Wine";
@@ -151,6 +162,7 @@ function reset() {
   world.nextId = 4000;
   world.nowPlaying = null;
   world.nowAlbum = null;
+  world.itemsPerAct = 13;
   lastBrowse = "root";
   lastInput = "";
 }
@@ -169,21 +181,37 @@ describe("play_album_by_id / queue_album_by_id (exact-pinned, decoy present)", (
     expect(world.executed).not.toContain("act:play:decoy");
   });
 
-  it("queues the EXACT album by ID, verified by queue growth", async () => {
+  it("queues the EXACT album by ID, verified by the FULL album's track count landing (not just queue growth)", async () => {
     const server = buildServer();
     const { json } = await call(server, "queue_album_by_id", { album_id: "x16j3kp3b4g2b" });
     expect(json.ok).toBe(true);
     expect(json.verified).toBe(true);
+    expect(json.tracks_added).toBe(13);
+    expect(json.tracks_expected).toBe(13);
     expect(world.executed).toContain("act:queue:real");
   });
 
-  it("play_album_by_id SAFE DEFAULT does not cut the current track (Add Next)", async () => {
+  it("play_album_by_id SAFE DEFAULT does not cut the current track (Add Next), verified against the full track count", async () => {
     const server = buildServer();
     const { json } = await call(server, "play_album_by_id", { album_id: "x16j3kp3b4g2b" });
     expect(json.ok).toBe(true);
     expect(json.when).toBe("next");
+    expect(json.tracks_added).toBe(13);
+    expect(json.tracks_expected).toBe(13);
     expect(world.executed).toContain("act:next:real");
     expect(world.executed).not.toContain("act:play:real");
+  });
+
+  it("reports an honest under-add when only some of the album's tracks land, instead of claiming success on queue growth alone", async () => {
+    const server = buildServer();
+    world.itemsPerAct = 1; // Roon accepts the Queue action but only 1 of 13 tracks actually lands.
+    const { isError, json } = await call(server, "queue_album_by_id", { album_id: "under-add-id" });
+    expect(isError).toBe(true);
+    expect(json.ok).toBe(false);
+    expect(json.error).toBe("album_under_added");
+    expect(json.tracks_added).toBe(1);
+    expect(json.tracks_expected).toBe(13);
+    expect(world.executed).toContain("act:queue:real");
   });
 
   it("a nonexistent album ID errors cleanly with no fuzzy fallback (no browse call at all)", async () => {
