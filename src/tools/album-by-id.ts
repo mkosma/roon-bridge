@@ -31,6 +31,7 @@ import {
   newSessionKey,
   browseAndLoad,
   promisifyBrowse,
+  promisifyLoad,
   normalizeTitle,
   pickAlbumRow,
   resolveActionItem,
@@ -151,6 +152,59 @@ async function drillToAlbumActions(
 export type ExecResult = { ok: boolean } & Record<string, unknown>;
 
 /**
+ * Fire a resolved action item and, if Roon responds with a nested submenu
+ * instead of executing directly, drill one level further and click the
+ * matching leaf action there.
+ *
+ * ROOT CAUSE of the silent no-op this closes: browsing an Albums-category row
+ * sometimes lands on the quick action popup (leaf items, hint:"action" -
+ * clicking one executes immediately), but sometimes lands on the album's full
+ * detail page instead, whose only action-shaped entry is a wrapper like "Play
+ * Album" (see browse.ts's `isAlbumPage` split, and `executeQueueAction`'s
+ * "step 7b parity" comment, which already does this for the artist-queue
+ * path). Executing that wrapper returns `action: "list"` - a confirm/choice
+ * submenu (Play Now / Shuffle / Start Radio, or a queue-position choice) -
+ * NOT the actual play/queue effect. The old code treated `exec.error == null`
+ * as "done" and moved straight to verification, so it silently opened a
+ * submenu, never clicked the real leaf action inside it, and then correctly
+ * observed nothing had changed - reported as "not verified" / `add_not_verified`
+ * while the zone stayed exactly as it started. Track-level execute
+ * (play-by-id.ts) never needed this: a Tracks-category row's action popup is
+ * always leaf actions directly, with no "Play Album"-style wrapper level.
+ */
+async function execWithSubmenu(
+  browse: RoonApiBrowse,
+  itemKey: string,
+  zoneId: string | undefined,
+  sessionKey: string,
+  intent: QueueAction,
+): Promise<{ error: false | string; body: Awaited<ReturnType<typeof promisifyBrowse>>["body"] }> {
+  let exec = await promisifyBrowse(browse, {
+    hierarchy: "search",
+    item_key: itemKey,
+    zone_or_output_id: zoneId,
+    multi_session_key: sessionKey,
+  });
+  if (exec.error) return exec;
+
+  if (exec.body.action === "list" && exec.body.list) {
+    const sub = await promisifyLoad(browse, { hierarchy: "search", multi_session_key: sessionKey, count: 20 });
+    if (!sub.error && sub.body.items?.length) {
+      const subAction = resolveActionItem(sub.body.items, intent);
+      if (subAction?.item.item_key) {
+        exec = await promisifyBrowse(browse, {
+          hierarchy: "search",
+          item_key: subAction.item.item_key,
+          zone_or_output_id: zoneId,
+          multi_session_key: sessionKey,
+        });
+      }
+    }
+  }
+  return exec;
+}
+
+/**
  * Resolve an AlbumIdentity to its exact Roon row, execute the `when` action,
  * and verify the effect. Mirrors play-by-id.ts's executeIdentity, scoped to
  * albums (no queue-provenance recording - that map is track-shaped).
@@ -208,12 +262,7 @@ export async function executeAlbumIdentity(
       /* fall through with an empty before-set */
     }
 
-    const exec = await promisifyBrowse(browse, {
-      hierarchy: "search",
-      item_key: action.item.item_key,
-      zone_or_output_id: zone.zone_id,
-      multi_session_key: sessionKey,
-    });
+    const exec = await execWithSubmenu(browse, action.item.item_key, zone.zone_id, sessionKey, intent);
     if (exec.error) return { ok: false, error: String(exec.error), matched: identity.title };
     await autoRadioOff(zone);
 
@@ -262,12 +311,7 @@ export async function executeAlbumIdentity(
   // path can do, since that path never has authoritative album metadata).
   const beforeNP = roonConnection.findZone(zone.zone_id)?.now_playing?.three_line?.line1 ?? null;
 
-  const exec = await promisifyBrowse(browse, {
-    hierarchy: "search",
-    item_key: action.item.item_key,
-    zone_or_output_id: zone.zone_id,
-    multi_session_key: sessionKey,
-  });
+  const exec = await execWithSubmenu(browse, action.item.item_key, zone.zone_id, sessionKey, intent);
   if (exec.error) return { ok: false, error: String(exec.error), matched: identity.title };
   await autoRadioOff(zone);
 
