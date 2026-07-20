@@ -201,21 +201,6 @@ describe("play_playlist shuffle", () => {
     expect(text).not.toMatch(/shuffle unavailable/i);
   });
 
-  it("shuffle:false does NOT navigate into the item even when Shuffle is nested deeper", async () => {
-    reset({ shuffleNestedInPlaySubmenu: true });
-    const server = buildServer();
-    const { isError, text } = await call(server, "play_playlist", {
-      playlist: "Discovered",
-      shuffle: false,
-    });
-
-    expect(isError).toBe(false);
-    // Default path resolves Play at level one (the "Play" submenu node) and
-    // never drills for Shuffle - no extra round-trips on the non-shuffle path.
-    expect(world.executed).not.toContain("act:shuffle");
-    expect(text).toMatch(/^Now playing:/);
-  });
-
   it("shuffle:true falls back to Play Now and SAYS SO when no Shuffle action exists", async () => {
     reset({ hasShuffleAction: false });
     const server = buildServer();
@@ -253,29 +238,10 @@ describe("play_playlist shuffle", () => {
     expect(text).toMatch(/shuffle unavailable/i);
   });
 
-  it("shuffle omitted behaves exactly as before: Play Now, no shuffle, no shuffle note", async () => {
-    const server = buildServer();
-    const { isError, text } = await call(server, "play_playlist", {
-      playlist: "Discovered",
-    });
-
-    expect(isError).toBe(false);
-    expect(world.executed).toContain("act:play");
-    expect(world.executed).not.toContain("act:shuffle");
-    expect(text).toMatch(/^Now playing:/);
-    expect(text).not.toMatch(/shuffle/i);
-  });
-
-  it("shuffle:false behaves exactly as before: Play Now, never the Shuffle action", async () => {
-    const server = buildServer();
-    const { isError, text } = await call(server, "play_playlist", {
-      playlist: "Discovered",
-      shuffle: false,
-    });
-
-    expect(isError).toBe(false);
-    expect(world.executed).toContain("act:play");
-    expect(world.executed).not.toContain("act:shuffle");
-    expect(text).toMatch(/^Now playing:/);
-  });
+  // NOTE: the non-shuffle playlist play (shuffle omitted / shuffle:false) no
+  // longer uses this Roon-browse "Play Now" path - it now resolves an exact
+  // provider playlist id and funnels through play_tracks (the deterministic
+  // *_by_id gateway), so it is covered by deferred-play / queue-tracks, not
+  // here. This file now guards only the shuffle:true native-Shuffle behavior,
+  // which still runs over the Roon-browse path.
 });

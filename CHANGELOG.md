@@ -12,6 +12,21 @@ entries so she knows her tool surface moved.
 
 ## Unreleased
 
+- Deterministic playback poka-yoke (no param/enum change; return-shape +
+  behavior change). The five name-based tools - `play_album`, `play_track`,
+  `play_artist`, `play_playlist`, `add_to_queue` (by-name path) - now resolve to
+  a SINGLE exact match or return an error; they never guess among several and
+  never auto-select a fuzzy "best". The confidence gate (0.75/0.90) is deleted.
+  album/track/playlist resolve an exact provider id (Qobuz search) and funnel
+  through the `*_by_id` gateway; artist and shuffle stay on the Roon-browse path
+  with the same unique-or-error rule. On an ambiguous or unmatched name the tool
+  mutates nothing and returns `{ ok:false, error:"ambiguous"|"not_found",
+  query, category, zone, candidates:[{ id, title, artist, year, ... , confidence }] }`
+  (`isError:true`); each candidate carries an exact id for a one-hop by-id
+  follow-up. `add_to_queue category=album` now verifies queue growth via
+  `queue_album_by_id` rather than reading the album's full track count (the old
+  under-add count report is gone).
+
 - `is_public` (`create_playlist`), `confirm` (`delete_playlist`), `shuffle`
   (`play_artist`, `play_album`, `play_playlist`), `enabled` (`shuffle`),
   `relative` (`seek`), `exclude_live` (`find_versions`), `mute` (`mute`),

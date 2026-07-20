@@ -186,13 +186,25 @@ const world = {
 };
 
 let stage: "root" | "category" | "match" | "action" = "root";
+// The last search input (from a pop_all step), so the "match" stage can model
+// a query-specific Roon row - used to simulate a local-library-only item
+// (present in Roon's own browse search, absent from the provider mock).
+let lastSearchInput = "";
 
 function stageItems(): BrowseItem[] {
   switch (stage) {
     case "category":
       return [{ title: "Albums", item_key: "cat:album", hint: "list" }];
     case "match":
-      return [{ title: "Some Album", item_key: "match:album", hint: "list", subtitle: "An Artist" }];
+      // "LIBRARY_ONLY" models an album Monty owns locally but that isn't on
+      // Qobuz: the provider mock (below) returns zero results for it, while
+      // Roon's own browse search (this fixture) still finds the exact row.
+      return [{
+        title: lastSearchInput === "LIBRARY_ONLY" ? "LIBRARY_ONLY" : "Some Album",
+        item_key: "match:album",
+        hint: "list",
+        subtitle: "An Artist",
+      }];
     case "action":
       return [
         { title: "Play Now", item_key: "act:play", hint: "action" },
@@ -207,6 +219,7 @@ const mockBrowse = {
   browse: (opts: Record<string, unknown>, cb: (e: false | string, b: BrowseResult) => void) => {
     if (opts.pop_all) {
       stage = "category";
+      lastSearchInput = String(opts.input ?? "");
       cb(false, { action: "list", list: { title: "Search", count: 1, level: 0 } });
       return;
     }
@@ -261,20 +274,37 @@ vi.mock("../src/roon-connection.js", () => ({
   roonConnection: mockConn,
 }));
 
-// A deferred play is now PINNED to exact provider id(s) at arm time
-// (resolveDeferredTarget), so the browse tool reaches the music provider when
-// arming. Mock it deterministically: title === query -> a confident match; the
-// query "EMPTY" -> no results (drives the no-confident-match refusal).
+// A name play now resolves to ONE exact provider id (selectUnique) and funnels
+// through the *_by_id gateway - immediately, or pinned into the seam action.
+// Mock the provider deterministically: title === query -> a single exact match;
+// "EMPTY" -> no results (drives the not_found refusal); "AMBIG" -> two identical
+// exact rows (drives the ambiguous refusal).
 vi.mock("../src/providers/bootstrap.js", () => ({
   initProviders: () => ({
     get: () => ({
       searchAlbums: async (q: string) =>
-        q === "EMPTY" ? [] : [{ provider: "qobuz", id: "alb1", title: q, artist: "Test Artist" }],
+        q === "EMPTY" || q === "LIBRARY_ONLY"
+          ? []
+          : q === "AMBIG"
+            ? [
+                { provider: "qobuz", id: "alb1", title: q, artist: "Test Artist" },
+                { provider: "qobuz", id: "alb2", title: q, artist: "Test Artist" },
+              ]
+            : [{ provider: "qobuz", id: "alb1", title: q, artist: "Test Artist" }],
       searchTracks: async (q: string) =>
-        q === "EMPTY" ? [] : [{ provider: "qobuz", id: "trk1", title: q, artist: "Test Artist" }],
+        q === "EMPTY" || q === "LIBRARY_ONLY"
+          ? []
+          : q === "AMBIG"
+            ? [
+                { provider: "qobuz", id: "trk1", title: q, artist: "Test Artist" },
+                { provider: "qobuz", id: "trk2", title: q, artist: "Test Artist" },
+              ]
+            : [{ provider: "qobuz", id: "trk1", title: q, artist: "Test Artist" }],
       listPlaylists: async () => [
         { provider: "qobuz", id: "pl1", name: "Some Album" },
         { provider: "qobuz", id: "pl2", name: "Other List" },
+        { provider: "qobuz", id: "pl3", name: "AMBIG" },
+        { provider: "qobuz", id: "pl4", name: "AMBIG" },
       ],
       getPlaylist: async (id: string) => ({
         playlist: { provider: "qobuz", id, name: "Some Album" },
@@ -319,6 +349,7 @@ describe("default-safe playback: the immediate gate (browse play tools)", () => 
     vi.clearAllMocks();
     world.executed = [];
     stage = "root";
+    lastSearchInput = "";
     mockConn.zone = playingZone("Now Playing", 100, 0);
   });
 
@@ -344,13 +375,68 @@ describe("default-safe playback: the immediate gate (browse play tools)", () => 
       expect(world.executed).toHaveLength(0);
     });
 
-    it(`${tool} immediate:true replaces and plays right now`, async () => {
-      const server = buildServer();
-      const { isError, text } = await call(server, tool, { [arg]: "Some Album", immediate: true });
+  }
 
-      expect(isError).toBe(false);
-      expect(text).toContain("Now playing");
-      expect(world.executed).toContain("act:play");
+  // immediate:true funnels through the *_by_id gateway. The album case runs
+  // end-to-end against the mock (album-by-id needs no queue snapshot); track /
+  // playlist by-id execution is covered exhaustively by play-by-id / queue-
+  // tracks. Here we assert the ROUTING contract: a UNIQUE match acts (album),
+  // and an ambiguous / unmatched name refuses with candidates and mutates
+  // nothing - for every pinnable category.
+  it("play_album immediate:true resolves the exact provider album and plays it via play_album_by_id", async () => {
+    const server = buildServer();
+    const { isError, text } = await call(server, "play_album", { album: "Some Album", immediate: true });
+    expect(isError).toBe(false);
+    const json = JSON.parse(text.slice(text.indexOf("{")));
+    expect(json.ok).toBe(true);
+    expect(world.executed).toContain("act:play");
+  });
+
+  // Local-library fallback (Fix 1): an album that exists only in Monty's
+  // local library - the provider (Qobuz) mock returns zero results for
+  // "LIBRARY_ONLY" - still resolves and plays, via Roon's own browse/search
+  // substrate, instead of a false not_found.
+  it("play_album immediate:true falls back to the local library when the provider has zero results, and plays it", async () => {
+    const server = buildServer();
+    const { isError, text } = await call(server, "play_album", { album: "LIBRARY_ONLY", immediate: true });
+    expect(isError).toBe(false);
+    const json = JSON.parse(text.slice(text.indexOf("{")));
+    expect(json.ok).toBe(true);
+    // Executed through the Roon-browse action list (act:play), never through
+    // an album-by-id provider pin - there is no provider id for this album.
+    expect(world.executed).toContain("act:play");
+  });
+
+  it("add_to_queue category=album falls back to the local library when the provider has zero results, and queues it", async () => {
+    const server = buildServer();
+    const { isError, text } = await call(server, "add_to_queue", { query: "LIBRARY_ONLY", category: "album" });
+    expect(isError).toBe(false);
+    const json = JSON.parse(text.slice(text.indexOf("{")));
+    expect(json.ok).toBe(true);
+    expect(world.executed).toContain("act:queue");
+  });
+
+  it("play_album immediate:true still refuses (not_found) when NEITHER the provider NOR the local library has an exact match", async () => {
+    const server = buildServer();
+    const { isError, text } = await call(server, "play_album", { album: "EMPTY", immediate: true });
+    expect(isError).toBe(true);
+    const json = JSON.parse(text.slice(text.indexOf("{")));
+    expect(json.error).toBe("not_found");
+    expect(world.executed).toHaveLength(0);
+  });
+
+  for (const [tool, arg] of [
+    ["play_album", "album"],
+    ["play_track", "track"],
+    ["play_playlist", "playlist"],
+  ] as const) {
+    it(`${tool} immediate:true with an AMBIGUOUS name returns candidates and plays nothing`, async () => {
+      const server = buildServer();
+      const { isError, text } = await call(server, tool, { [arg]: "AMBIG", immediate: true });
+      expect(isError).toBe(true);
+      const json = JSON.parse(text.slice(text.indexOf("{")));
+      expect(json.error).toBe("ambiguous");
+      expect(world.executed).toHaveLength(0);
     });
   }
 
@@ -374,14 +460,15 @@ describe("default-safe playback: the immediate gate (browse play tools)", () => 
     expect(world.executed).toContain("act:play");
   });
 
-  // A deferred track/album with no confident provider match refuses at arm time
+  // A deferred track/album with no exact provider match refuses at arm time
   // (fail early, while Maya can still ask) - never silently at the seam.
-  it("deferred play with no confident provider match refuses at arm time", async () => {
+  it("deferred play with no exact provider match refuses (not_found) at arm time", async () => {
     const server = buildServer();
     const { isError, text } = await call(server, "play_track", { track: "EMPTY" });
 
     expect(isError).toBe(true);
-    expect(text.toLowerCase()).toContain("no confident match");
+    const json = JSON.parse(text.slice(text.indexOf("{")));
+    expect(json.error).toBe("not_found");
     expect(world.executed).toHaveLength(0);
   });
 });

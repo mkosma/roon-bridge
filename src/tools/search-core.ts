@@ -473,6 +473,9 @@ export interface AlbumIdentity {
   title: string;
   artist: string;
   year?: number;
+  /** The album's real track count, when the provider reports one - used to
+   *  verify a WHOLE album landed on queue/next, not just that the queue grew. */
+  expectedTrackCount?: number;
 }
 
 /**
