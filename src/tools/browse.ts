@@ -1397,6 +1397,147 @@ async function resolveProviderTarget(
   return { ok: true, target: { kind: "tracks", ids, label: `playlist "${pl.name}" (${ids.length} tracks)` } };
 }
 
+/**
+ * Read-only exact-match probe against Roon's own library/search substrate -
+ * the same "search" hierarchy searchAndPlay drills through - used ONLY to
+ * decide whether a local-library item satisfies the name exactly, never to
+ * act. Mirrors searchAndPlay's steps 1-4 (search -> category -> items ->
+ * exact filter on the normalized key via selectUnique) without touching the
+ * action list. This is the fallback substrate for an album/track/playlist
+ * that lives only in Monty's local library (not on the provider/Qobuz),
+ * which the provider-only `resolveProviderTarget` alone would report as
+ * `not_found`. Never returns a fuzzy "best guess" - same ambiguity-or-error
+ * contract as selectUnique.
+ */
+async function libraryExactSearch(
+  query: string,
+  category: "album" | "track" | "playlist",
+  zoneId: string,
+): Promise<
+  | { kind: "unique"; item_key: string; title: string; artist?: string }
+  | { kind: "not_found" | "ambiguous"; candidates: RankedCandidate[] }
+> {
+  const browse = roonConnection.getBrowse();
+  const sessionKey = newSessionKey();
+  const hierarchy = "search";
+
+  const searchData = await browseAndLoad(browse, {
+    hierarchy,
+    input: query,
+    pop_all: true,
+    zone_or_output_id: zoneId,
+    multi_session_key: sessionKey,
+  });
+  if (searchData.error || !searchData.items?.length) return { kind: "not_found", candidates: [] };
+
+  const catLower = category.toLowerCase();
+  const categories = searchData.items;
+  let targetCategory = categories.find(
+    (item) => item.item_key && (item.title.toLowerCase() === catLower + "s" || item.title.toLowerCase() === catLower),
+  );
+  if (!targetCategory) {
+    targetCategory = categories.find(
+      (item) => item.item_key && item.title.toLowerCase().includes(catLower) && item.hint !== "header",
+    );
+  }
+  if (!targetCategory?.item_key) return { kind: "not_found", candidates: [] };
+
+  const categoryData = await browseAndLoad(browse, {
+    hierarchy,
+    item_key: targetCategory.item_key,
+    zone_or_output_id: zoneId,
+    multi_session_key: sessionKey,
+  });
+  if (categoryData.error || !categoryData.items?.length) return { kind: "not_found", candidates: [] };
+
+  const playable = categoryData.items.filter((i) => i.item_key && i.hint !== "header");
+  const uniqueCands: UniqueCandidate[] = playable.map((i) => ({
+    id: i.item_key!,
+    title: i.title,
+    artist: stripRoonLinks(i.subtitle || "").split(/[,/]/)[0].trim() || undefined,
+  }));
+  const selection = selectUnique(uniqueCands, query, category);
+  if (selection.kind !== "unique") return { kind: selection.kind, candidates: selection.candidates };
+  return {
+    kind: "unique",
+    item_key: selection.candidate.id,
+    title: selection.candidate.title,
+    artist: selection.candidate.artist,
+  };
+}
+
+/** resolveProviderTarget, but swallows a provider outage/misconfiguration into
+ *  a clean "found nothing on the provider" instead of throwing - so a
+ *  provider hiccup doesn't take the local-library fallback down with it. The
+ *  swallowed error is logged, never silently dropped. */
+async function safeResolveProviderTarget(query: string, category: "album" | "track" | "playlist"): Promise<ProviderResolve> {
+  try {
+    return await resolveProviderTarget(query, category);
+  } catch (e) {
+    console.error(
+      `[roon-bridge] resolveTargetWithLibraryFallback: provider resolve failed for "${query}" (${category}), falling back to library-only:`,
+      e instanceof Error ? e.message : e,
+    );
+    return { ok: false, error: "not_found", candidates: [] };
+  }
+}
+
+/** A target resolved by the combined provider+library search. */
+type CombinedResolve =
+  | { ok: true; source: "provider"; target: ProviderTarget }
+  | { ok: true; source: "library" }
+  | { ok: false; error: "not_found" | "ambiguous"; candidates: RankedCandidate[] };
+
+/**
+ * Resolve (query, category) against the provider catalog first, falling back
+ * to Monty's local Roon library ONLY when the provider itself found ZERO
+ * exact matches:
+ *
+ *   - provider has the one exact match -> provider target (funnels through
+ *     the `*_by_id` gateway, as before). The library is never even queried -
+ *     Roon's own "search" hierarchy re-surfaces anything reachable through a
+ *     linked streaming service too, so probing it unconditionally would flag
+ *     an ordinary provider hit as a false cross-source "collision" (verified
+ *     against the existing fixture suite, which legitimately returns the
+ *     same album from both the provider mock and the Roon-browse mock).
+ *   - provider is itself ambiguous (2+ exact provider matches) -> ambiguous,
+ *     provider candidates only. Refuses before ever touching the library.
+ *   - provider has zero exact matches -> fall back to an exact-match filter
+ *     over Roon's own local browse/search results (the substrate
+ *     searchAndPlay already uses for artist/shuffle). Unique there -> library
+ *     target (execution delegates to the Roon-browse execute path via
+ *     searchAndPlay, since a local item has no provider id for `*_by_id`).
+ *     Ambiguous there -> ambiguous, library candidates. Zero there too ->
+ *     not_found, candidates merged from both sides' near-miss rankings.
+ *
+ * Read-only: neither probe mutates anything.
+ */
+async function resolveTargetWithLibraryFallback(
+  query: string,
+  zoneId: string,
+  category: "album" | "track" | "playlist",
+): Promise<CombinedResolve> {
+  const providerRes = await safeResolveProviderTarget(query, category);
+  if (providerRes.ok) return { ok: true, source: "provider", target: providerRes.target };
+  if (providerRes.error === "ambiguous") return { ok: false, error: "ambiguous", candidates: providerRes.candidates };
+
+  // Provider found ZERO exact matches - try Monty's local library before
+  // declaring not_found (an album that exists only on disk, not on Qobuz).
+  let libraryRes: Awaited<ReturnType<typeof libraryExactSearch>>;
+  try {
+    libraryRes = await libraryExactSearch(query, category, zoneId);
+  } catch (e) {
+    console.error(`[roon-bridge] resolveTargetWithLibraryFallback: library probe failed for "${query}" (${category}):`, e instanceof Error ? e.message : e);
+    libraryRes = { kind: "not_found", candidates: [] };
+  }
+
+  if (libraryRes.kind === "unique") return { ok: true, source: "library" };
+  if (libraryRes.kind === "ambiguous") return { ok: false, error: "ambiguous", candidates: libraryRes.candidates };
+
+  const merged = [...providerRes.candidates, ...libraryRes.candidates].slice(0, 5);
+  return { ok: false, error: "not_found", candidates: merged };
+}
+
 /** Whether a category funnels through the provider `*_by_id` gateway. Artist has
  *  no stable provider id (no provider artist search), and a shuffle needs Roon's
  *  native Shuffle action, so both stay on the deterministic Roon-browse path. */
@@ -1502,13 +1643,14 @@ async function playWithWhen(
     } catch (error) {
       return { content: [{ type: "text", text: String(error instanceof Error ? error.message : error) }], isError: true };
     }
-    let resolved: ProviderResolve;
+    let resolved: CombinedResolve;
     try {
-      resolved = await resolveProviderTarget(query, category);
+      resolved = await resolveTargetWithLibraryFallback(query, zone.zone_id, category);
     } catch (e) {
       return { content: [{ type: "text", text: `Couldn't resolve "${query}" (${category}): ${e instanceof Error ? e.message : String(e)}.` }], isError: true };
     }
     if (!resolved.ok) return renderUniqueError(query, category, zone.display_name, resolved.error, resolved.candidates);
+    if (resolved.source === "library") return searchAndPlay(query, zoneName, category, playActionType);
     return actOnTarget(resolved.target, zoneName, "now");
   }
 
@@ -1532,13 +1674,14 @@ async function addByNameToQueue(
   } catch (error) {
     return { content: [{ type: "text", text: String(error instanceof Error ? error.message : error) }], isError: true };
   }
-  let resolved: ProviderResolve;
+  let resolved: CombinedResolve;
   try {
-    resolved = await resolveProviderTarget(query, category);
+    resolved = await resolveTargetWithLibraryFallback(query, zone.zone_id, category);
   } catch (e) {
     return { content: [{ type: "text", text: `Couldn't resolve "${query}" (${category}): ${e instanceof Error ? e.message : String(e)}.` }], isError: true };
   }
   if (!resolved.ok) return renderUniqueError(query, category, zone.display_name, resolved.error, resolved.candidates);
+  if (resolved.source === "library") return searchAndPlay(query, zoneName, category, "queue");
   return actOnTarget(resolved.target, zoneName, "queue");
 }
 

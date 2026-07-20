@@ -34,6 +34,7 @@ import {
   normalizeTitle,
   pickAlbumRow,
   resolveActionItem,
+  waitForStableQueue,
   type BrowseItem,
   type AlbumIdentity,
   type QueueAction,
@@ -196,8 +197,14 @@ export async function executeAlbumIdentity(
   };
 
   if (when !== "now") {
-    // Verify by re-reading the queue until it grows (bounded poll) - the same
-    // "Tonight - RÜFÜS DU SOL" defect class the browse queue path guards.
+    // Verify the WHOLE album landed, not just that the queue grew. A
+    // growth-only check (queue length > before, or any new item id) reports
+    // success even when Roon under-commits the album - only some tracks land
+    // (the BUG-C under-add). Snapshot before, execute, wait for the queue to
+    // SETTLE (no change for quietMs, mirroring the old queueAlbum path), and
+    // count the tracks that actually landed against the album's real track
+    // count (identity.expectedTrackCount, from the provider). No expected
+    // count available -> fall back to the old growth-only honesty (>0 lands).
     let beforeIds = new Set<number>();
     let beforeCount = 0;
     try {
@@ -217,27 +224,37 @@ export async function executeAlbumIdentity(
     if (exec.error) return { ok: false, error: String(exec.error), matched: identity.title };
     await autoRadioOff(zone);
 
-    let landed = false;
+    let tracksAdded = 0;
     let afterCount = beforeCount;
-    const deadline = Date.now() + 2500;
-    while (Date.now() < deadline) {
-      try {
-        const after = await roonConnection.getQueueSnapshot(zone);
-        afterCount = after.length;
-        if (after.length > beforeCount || after.some((i) => !beforeIds.has(i.queue_item_id))) { landed = true; break; }
-      } catch {
-        break;
-      }
-      await new Promise((r) => setTimeout(r, 150));
-    }
-
-    if (!landed) {
+    try {
+      const after = await waitForStableQueue(() => roonConnection.getQueueSnapshot(zone), { quietMs: 300, deadlineMs: 12000 });
+      const newItems = after.filter((i) => !beforeIds.has(i.queue_item_id));
+      tracksAdded = Math.max(newItems.length, after.length - beforeCount);
+      afterCount = after.length;
+    } catch (verifyErr) {
       return {
         ok: false,
         error: "add_not_verified",
-        detail: `The action reported success but "${identity.title}" did not appear in the queue.`,
+        detail: `The action reported success but the queue for "${identity.title}" could not be verified: ${String(verifyErr)}.`,
         matched,
         action: action.matched,
+        queue_count_before: beforeCount,
+        zone: zone.display_name,
+      };
+    }
+
+    const expected = identity.expectedTrackCount ?? 0;
+    const full = expected > 0 ? tracksAdded >= expected : tracksAdded > 0;
+
+    if (!full) {
+      return {
+        ok: false,
+        error: "album_under_added",
+        detail: `Only ${tracksAdded} of ${expected || "?"} track(s) from "${identity.title}" landed in the queue.`,
+        matched,
+        action: action.matched,
+        tracks_added: tracksAdded,
+        tracks_expected: expected || null,
         queue_count_before: beforeCount,
         queue_count_after: afterCount,
         zone: zone.display_name,
@@ -250,6 +267,8 @@ export async function executeAlbumIdentity(
       when,
       matched,
       verified: true,
+      tracks_added: tracksAdded,
+      tracks_expected: expected || null,
       queue_count_before: beforeCount,
       queue_count_after: afterCount,
       zone: zone.display_name,
@@ -353,7 +372,12 @@ export async function executeAlbumById(
   if (!meta.title || !meta.artist) {
     return { ok: false, error: "incomplete_album", detail: `Provider returned no title/artist for album id ${albumId}.`, album_id: albumId };
   }
-  const identity: AlbumIdentity = { title: meta.title, artist: meta.artist, year: meta.year };
+  const identity: AlbumIdentity = {
+    title: meta.title,
+    artist: meta.artist,
+    year: meta.year,
+    expectedTrackCount: meta.trackCount > 0 ? meta.trackCount : undefined,
+  };
   return executeAlbumIdentity(identity, zone, when, { albumId, provider: meta.provider ?? provider });
 }
 
