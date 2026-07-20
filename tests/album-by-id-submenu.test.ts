@@ -103,7 +103,12 @@ const mockBrowse = {
     if (key.startsWith("act:play:")) {
       world.executed.push(key);
       if (key === "act:play:queue" || key === "act:play:next") {
-        world.queue.push(qitem("1. Small Stakes"));
+        // A real album-level Queue/Add-Next action lands the WHOLE album, not
+        // one track - match ALBUMS[...].trackCount so Fix 2's completeness
+        // check (added on the sibling branch) sees a true full landing here.
+        for (let i = 0; i < ALBUMS["eavjov9j20toa"].trackCount; i++) {
+          world.queue.push(qitem(`${i + 1}. Track ${i + 1}`));
+        }
       }
       if (key === "act:play:now") {
         world.nowPlaying = "1. Small Stakes";
@@ -205,6 +210,6 @@ describe("play_album_by_id / queue_album_by_id (album-page wrapper action requir
     expect(submenuOpened).toBe(true);
     expect(world.executed).toContain("act:playalbum");
     expect(world.executed).toContain("act:play:queue");
-    expect(world.queue.length).toBe(1);
+    expect(world.queue.length).toBe(ALBUMS["eavjov9j20toa"].trackCount);
   });
 });
