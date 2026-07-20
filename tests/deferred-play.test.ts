@@ -186,13 +186,25 @@ const world = {
 };
 
 let stage: "root" | "category" | "match" | "action" = "root";
+// The last search input (from a pop_all step), so the "match" stage can model
+// a query-specific Roon row - used to simulate a local-library-only item
+// (present in Roon's own browse search, absent from the provider mock).
+let lastSearchInput = "";
 
 function stageItems(): BrowseItem[] {
   switch (stage) {
     case "category":
       return [{ title: "Albums", item_key: "cat:album", hint: "list" }];
     case "match":
-      return [{ title: "Some Album", item_key: "match:album", hint: "list", subtitle: "An Artist" }];
+      // "LIBRARY_ONLY" models an album Monty owns locally but that isn't on
+      // Qobuz: the provider mock (below) returns zero results for it, while
+      // Roon's own browse search (this fixture) still finds the exact row.
+      return [{
+        title: lastSearchInput === "LIBRARY_ONLY" ? "LIBRARY_ONLY" : "Some Album",
+        item_key: "match:album",
+        hint: "list",
+        subtitle: "An Artist",
+      }];
     case "action":
       return [
         { title: "Play Now", item_key: "act:play", hint: "action" },
@@ -207,6 +219,7 @@ const mockBrowse = {
   browse: (opts: Record<string, unknown>, cb: (e: false | string, b: BrowseResult) => void) => {
     if (opts.pop_all) {
       stage = "category";
+      lastSearchInput = String(opts.input ?? "");
       cb(false, { action: "list", list: { title: "Search", count: 1, level: 0 } });
       return;
     }
@@ -270,7 +283,7 @@ vi.mock("../src/providers/bootstrap.js", () => ({
   initProviders: () => ({
     get: () => ({
       searchAlbums: async (q: string) =>
-        q === "EMPTY"
+        q === "EMPTY" || q === "LIBRARY_ONLY"
           ? []
           : q === "AMBIG"
             ? [
@@ -279,7 +292,7 @@ vi.mock("../src/providers/bootstrap.js", () => ({
               ]
             : [{ provider: "qobuz", id: "alb1", title: q, artist: "Test Artist" }],
       searchTracks: async (q: string) =>
-        q === "EMPTY"
+        q === "EMPTY" || q === "LIBRARY_ONLY"
           ? []
           : q === "AMBIG"
             ? [
@@ -336,6 +349,7 @@ describe("default-safe playback: the immediate gate (browse play tools)", () => 
     vi.clearAllMocks();
     world.executed = [];
     stage = "root";
+    lastSearchInput = "";
     mockConn.zone = playingZone("Now Playing", 100, 0);
   });
 
@@ -376,6 +390,39 @@ describe("default-safe playback: the immediate gate (browse play tools)", () => 
     const json = JSON.parse(text.slice(text.indexOf("{")));
     expect(json.ok).toBe(true);
     expect(world.executed).toContain("act:play");
+  });
+
+  // Local-library fallback (Fix 1): an album that exists only in Monty's
+  // local library - the provider (Qobuz) mock returns zero results for
+  // "LIBRARY_ONLY" - still resolves and plays, via Roon's own browse/search
+  // substrate, instead of a false not_found.
+  it("play_album immediate:true falls back to the local library when the provider has zero results, and plays it", async () => {
+    const server = buildServer();
+    const { isError, text } = await call(server, "play_album", { album: "LIBRARY_ONLY", immediate: true });
+    expect(isError).toBe(false);
+    const json = JSON.parse(text.slice(text.indexOf("{")));
+    expect(json.ok).toBe(true);
+    // Executed through the Roon-browse action list (act:play), never through
+    // an album-by-id provider pin - there is no provider id for this album.
+    expect(world.executed).toContain("act:play");
+  });
+
+  it("add_to_queue category=album falls back to the local library when the provider has zero results, and queues it", async () => {
+    const server = buildServer();
+    const { isError, text } = await call(server, "add_to_queue", { query: "LIBRARY_ONLY", category: "album" });
+    expect(isError).toBe(false);
+    const json = JSON.parse(text.slice(text.indexOf("{")));
+    expect(json.ok).toBe(true);
+    expect(world.executed).toContain("act:queue");
+  });
+
+  it("play_album immediate:true still refuses (not_found) when NEITHER the provider NOR the local library has an exact match", async () => {
+    const server = buildServer();
+    const { isError, text } = await call(server, "play_album", { album: "EMPTY", immediate: true });
+    expect(isError).toBe(true);
+    const json = JSON.parse(text.slice(text.indexOf("{")));
+    expect(json.error).toBe("not_found");
+    expect(world.executed).toHaveLength(0);
   });
 
   for (const [tool, arg] of [
