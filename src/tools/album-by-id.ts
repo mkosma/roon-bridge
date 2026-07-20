@@ -173,34 +173,60 @@ export type ExecResult = { ok: boolean } & Record<string, unknown>;
  * (play-by-id.ts) never needed this: a Tracks-category row's action popup is
  * always leaf actions directly, with no "Play Album"-style wrapper level.
  */
+/**
+ * A real album's action chain can nest MORE than one "list" response deep -
+ * e.g. an album detail page's "Play Album" wrapper opens its OWN Play
+ * Now/Add Next/Queue submenu, so one click lands on a list, a second click
+ * lands on ANOTHER list, and only the third actually executes. Loop on
+ * `action === "list"` (bounded) until a terminal response or no further
+ * matching leaf is found, rather than assuming exactly one level of nesting.
+ */
+const MAX_SUBMENU_DEPTH = 3;
+
 async function execWithSubmenu(
   browse: RoonApiBrowse,
   itemKey: string,
+  itemHint: string | null | undefined,
   zoneId: string | undefined,
   sessionKey: string,
   intent: QueueAction,
 ): Promise<{ error: false | string; body: Awaited<ReturnType<typeof promisifyBrowse>>["body"] }> {
+  const trace = (step: string, data: unknown) =>
+    console.error(`[roon-bridge] execWithSubmenu[${sessionKey}] ${step}:`, JSON.stringify(data));
   let exec = await promisifyBrowse(browse, {
     hierarchy: "search",
     item_key: itemKey,
     zone_or_output_id: zoneId,
     multi_session_key: sessionKey,
   });
+  trace("click-0", { hint: itemHint, error: exec.error, action: exec.body?.action, list: exec.body?.list });
   if (exec.error) return exec;
+  // hint:"action" is a true Roon leaf - once clicked, it has fired, full stop,
+  // no matter what the response body looks like afterward (Roon sometimes
+  // echoes back a content list as post-action UI feedback, e.g. the album
+  // page again after a real Queue click - that is NOT a further choice to
+  // make, and re-drilling it double-fires the action). Only hint:"action_list"
+  // (a genuine wrapper/container) warrants looking for a nested leaf to click.
+  let lastHint = itemHint;
 
-  if (exec.body.action === "list" && exec.body.list) {
+  for (let depth = 1; depth <= MAX_SUBMENU_DEPTH && lastHint === "action_list" && exec.body.action === "list" && exec.body.list; depth++) {
     const sub = await promisifyLoad(browse, { hierarchy: "search", multi_session_key: sessionKey, count: 20 });
-    if (!sub.error && sub.body.items?.length) {
-      const subAction = resolveActionItem(sub.body.items, intent);
-      if (subAction?.item.item_key) {
-        exec = await promisifyBrowse(browse, {
-          hierarchy: "search",
-          item_key: subAction.item.item_key,
-          zone_or_output_id: zoneId,
-          multi_session_key: sessionKey,
-        });
-      }
-    }
+    trace(`submenu-loaded-${depth}`, { error: sub.error, items: sub.body?.items?.map((i) => ({ title: i.title, hint: i.hint })) });
+    if (sub.error || !sub.body.items?.length) break;
+
+    const subAction = resolveActionItem(sub.body.items, intent);
+    trace(`submenu-matched-${depth}`, { intent, matched: subAction?.item ? { title: subAction.item.title, hint: subAction.item.hint } : null });
+    if (!subAction?.item.item_key) break;
+
+    exec = await promisifyBrowse(browse, {
+      hierarchy: "search",
+      item_key: subAction.item.item_key,
+      zone_or_output_id: zoneId,
+      multi_session_key: sessionKey,
+    });
+    lastHint = subAction.item.hint;
+    trace(`click-${depth}`, { hint: lastHint, error: exec.error, action: exec.body?.action, list: exec.body?.list });
+    if (exec.error) return exec;
   }
   return exec;
 }
@@ -230,9 +256,11 @@ export async function executeAlbumIdentity(
   const drilled = await drillToAlbumActions(browse, resolved.itemKey, zone.zone_id, sessionKey);
   if (drilled.message) return { ok: false, error: "message", detail: drilled.message, matched: identity.title };
   if (drilled.error) return { ok: false, error: drilled.error, matched: identity.title };
+  log("drilled-actionItems", drilled.actionItems.map((i) => ({ title: i.title, hint: i.hint, item_key: i.item_key })));
 
   const intent = WHEN_TO_INTENT[when];
   const action = resolveActionItem(drilled.actionItems, intent);
+  log("resolved-action", { intent, matched: action?.item ? { title: action.item.title, hint: action.item.hint } : null });
   if (!action?.item.item_key) {
     return {
       ok: false,
@@ -269,7 +297,7 @@ export async function executeAlbumIdentity(
       /* fall through with an empty before-set */
     }
 
-    const exec = await execWithSubmenu(browse, action.item.item_key, zone.zone_id, sessionKey, intent);
+    const exec = await execWithSubmenu(browse, action.item.item_key, action.item.hint, zone.zone_id, sessionKey, intent);
     if (exec.error) return { ok: false, error: String(exec.error), matched: identity.title };
     await autoRadioOff(zone);
 
@@ -330,7 +358,7 @@ export async function executeAlbumIdentity(
   // path can do, since that path never has authoritative album metadata).
   const beforeNP = roonConnection.findZone(zone.zone_id)?.now_playing?.three_line?.line1 ?? null;
 
-  const exec = await execWithSubmenu(browse, action.item.item_key, zone.zone_id, sessionKey, intent);
+  const exec = await execWithSubmenu(browse, action.item.item_key, action.item.hint, zone.zone_id, sessionKey, intent);
   if (exec.error) return { ok: false, error: String(exec.error), matched: identity.title };
   await autoRadioOff(zone);
 

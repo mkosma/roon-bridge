@@ -62,10 +62,12 @@ function loadItems(): BrowseItem[] {
     case "cat:album":
       return [{ title: "Kill the Moonlight", item_key: "alb:km", hint: "list", subtitle: "Spoon" }];
     case "alb:km":
-      // Full album detail page: track rows + a single wrapper action, no
-      // leaf hint:"action" items and no action_list hint at this level.
+      // Full album detail page: track rows + a single wrapper action. Its own
+      // hint is "action_list" (a container to drill into), NOT "action" - the
+      // real live trace confirmed this (2026-07-20). Getting this wrong is
+      // exactly what let the old mock hide the double-fire bug below.
       return [
-        { title: "Play Album", item_key: "act:playalbum", hint: "action" },
+        { title: "Play Album", item_key: "act:playalbum", hint: "action_list" },
         { title: "1. Small Stakes", item_key: "trk:1", hint: "list" },
         { title: "2. The Way We Get By", item_key: "trk:2", hint: "list" },
       ];
@@ -99,7 +101,13 @@ const mockBrowse = {
       return;
     }
 
-    // Leaf actions from inside the submenu.
+    // Leaf actions from inside the submenu. These are TRUE terminal actions
+    // (hint:"action") - but real Roon's response after firing one is NOT a
+    // clean {action:"none"}; it echoes back a content list (the album page
+    // again), exactly like a genuine unclicked submenu would look. This is
+    // the live 2026-07-20 double-fire trap: a loop that keeps drilling on any
+    // list-shaped response (rather than stopping once a hint:"action" item
+    // has fired) re-clicks this same leaf a second time.
     if (key.startsWith("act:play:")) {
       world.executed.push(key);
       if (key === "act:play:queue" || key === "act:play:next") {
@@ -114,7 +122,8 @@ const mockBrowse = {
         world.nowPlaying = "1. Small Stakes";
         world.nowAlbum = "Kill the Moonlight";
       }
-      cb(false, { action: "none" });
+      lastBrowse = "alb:km";
+      cb(false, { action: "list", list: { title: "Kill the Moonlight", count: 3, level: 3 } });
       return;
     }
 
@@ -199,9 +208,12 @@ describe("play_album_by_id / queue_album_by_id (album-page wrapper action requir
     expect(world.executed).toContain("act:playalbum");
     expect(world.executed).toContain("act:play:now");
     expect(world.nowPlaying).toBe("1. Small Stakes");
+    // Double-fire regression (live 2026-07-20): the leaf action's post-click
+    // list-shaped echo must NOT be mistaken for a further submenu to drill.
+    expect(world.executed.filter((k) => k === "act:play:now").length).toBe(1);
   });
 
-  it("queue_album_by_id on the same fixture actually enqueues the album, verified by queue growth", async () => {
+  it("queue_album_by_id on the same fixture actually enqueues the album ONCE, not twice", async () => {
     const server = buildServer();
     const { isError, json } = await call(server, "queue_album_by_id", { album_id: "eavjov9j20toa" });
     expect(isError).toBe(false);
@@ -210,6 +222,10 @@ describe("play_album_by_id / queue_album_by_id (album-page wrapper action requir
     expect(submenuOpened).toBe(true);
     expect(world.executed).toContain("act:playalbum");
     expect(world.executed).toContain("act:play:queue");
+    // Double-fire regression: exactly one Queue click, exactly one album's
+    // worth of tracks - not two (the live bug added the album twice, 24 not
+    // 12, because the post-click echo looked like an unclicked submenu).
+    expect(world.executed.filter((k) => k === "act:play:queue").length).toBe(1);
     expect(world.queue.length).toBe(ALBUMS["eavjov9j20toa"].trackCount);
   });
 });
