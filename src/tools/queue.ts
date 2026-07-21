@@ -328,7 +328,7 @@ async function findAndQueue(
       artist: r.artist,
     })),
     zone: zone.display_name,
-    resulting_state: await resultingState(zone),
+    resulting_state: await resultingState(zone, "queue_next"),
   });
 }
 
@@ -403,7 +403,7 @@ export function registerQueueTools(server: McpServer): void {
             verified,
             reason: verified ? undefined : "not_head",
             detail: verified ? undefined : `after the jump the head is "${head?.title ?? "(none)"}", not the target`,
-            resulting_state: await resultingState(z),
+            resulting_state: await resultingState(z, "play_from_here"),
           };
         };
 
@@ -439,7 +439,10 @@ export function registerQueueTools(server: McpServer): void {
               jump_to: { queue_item_id, title: target.title, artist: target.artist },
               detail: `Armed: playback will jump to "${target.title}" when "${np.three_line?.line1 ?? "the current track"}" ends (no mid-track cut). Pass immediate:true to jump now. Track with deferred_status; cancel with cancel_deferred("${deferral_id}").`,
               zone: z.display_name,
-              resulting_state: await resultingState(z),
+              // Nothing executed yet - this reports the current state at arm
+              // time. The real mutation is recorded inside runJump() above,
+              // when the deferral fires at the seam.
+              resulting_state: await resultingState(z, null),
             });
           }
           // Nothing playing - no seam to wait for; jump now.

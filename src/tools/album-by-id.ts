@@ -462,7 +462,7 @@ export async function playOrQueueAlbumById(
   try {
     const zone = roonConnection.findZoneOrThrow(zoneName);
     const result = await executeAlbumById(albumId, provider, zone, when);
-    const resulting_state = await resultingState(zone);
+    const resulting_state = await resultingState(zone, `album_by_id:${when}`);
     const { warning, ...rest } = result as ExecResult & { warning?: string };
     if (warning) {
       return {

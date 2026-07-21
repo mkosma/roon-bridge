@@ -4,11 +4,20 @@
  * Two things every mutating tool needs, factored here so they behave
  * identically everywhere:
  *
- *   1. resultingState(zone) - a compact snapshot of what the zone looks like
- *      AFTER a mutation (now-playing, queue head/count, volume). Appended to a
- *      mutating tool's success payload so the caller does not have to issue a
- *      follow-up get_queue / now_playing read to learn what actually happened,
- *      and so a claim of success always carries the state that backs it.
+ *   1. resultingState(zone, action) - a compact snapshot of what the zone
+ *      looks like AFTER a mutation (now-playing, queue head/count, volume).
+ *      Appended to a mutating tool's success payload so the caller does not
+ *      have to issue a follow-up get_queue / now_playing read to learn what
+ *      actually happened, and so a claim of success always carries the state
+ *      that backs it. It runs at the exact point every mutating tool already
+ *      confirms its action executed, which makes it the natural single place
+ *      to also record command provenance (last-command.ts): every call
+ *      records `action` against `zone.zone_id`, tagged with the ambient
+ *      command source from command-context.ts. `action` is required (not
+ *      optional) so a new call site cannot silently skip provenance. A
+ *      handful of mutations that don't build a resulting_state payload (seek,
+ *      shuffle, loop, zone grouping/transfer) record directly against
+ *      lastCommandStore instead - see playback.ts and topology.ts.
  *
  *   2. immediateBool - the boolean interrupt switch, hardened against the MCP
  *      harness that stringifies scalars. Some clients send `"true"` / `"false"`
@@ -21,6 +30,8 @@
 import { z } from "zod";
 import { roonConnection } from "../roon-connection.js";
 import { VolumeRamper } from "../control/volume-ramper.js";
+import { lastCommandStore } from "../control/last-command.js";
+import { currentCommandSource } from "../control/command-context.js";
 import type { Zone, QueueItem } from "node-roon-api-transport";
 
 /** The state block appended to every mutating tool's success payload. */
@@ -44,8 +55,19 @@ function queueTitle(item: QueueItem): string {
  * mutation that already happened. Re-reads the zone for freshness (the passed
  * Zone object may pre-date the mutation) and pulls the queue head/count from a
  * one-shot snapshot.
+ *
+ * `action` records this call as the provenance for the mutation that just
+ * happened against `zone.zone_id` (see last-command.ts / command-context.ts).
+ * A string is required at every call site (not optional) so a new mutating
+ * call site cannot silently skip provenance - pass `null` explicitly for the
+ * handful of call sites that read state WITHOUT anything having executed yet
+ * (a deferred/"armed" response reporting the current, not-yet-changed state;
+ * the actual mutation is recorded later, when the deferral fires and calls
+ * resultingState again with the real action name).
  */
-export async function resultingState(zone: Zone): Promise<ResultingState> {
+export async function resultingState(zone: Zone, action: string | null): Promise<ResultingState> {
+  if (action !== null) lastCommandStore.record(zone.zone_id, action, currentCommandSource());
+
   let fresh: Zone = zone;
   try {
     fresh = roonConnection.findZone(zone.zone_id) ?? zone;

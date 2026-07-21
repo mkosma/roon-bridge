@@ -137,7 +137,7 @@ export function registerVolumeTools(server: McpServer): void {
           // Muse dropout) is a FAILURE, not a success - flag isError with the
           // per-output detail so a caller checking the flag is not misled.
           const partialFailure = failedOutputs.length > 0;
-          const resulting_state = await resultingState(foundZone);
+          const resulting_state = await resultingState(foundZone, "change_volume");
           return {
             content: [{
               type: "text",
@@ -163,7 +163,7 @@ export function registerVolumeTools(server: McpServer): void {
         }
 
         const target = how === "absolute" ? value : (currentMax as number) + value;
-        const resulting_state = await resultingState(foundZone);
+        const resulting_state = await resultingState(foundZone, "change_volume");
         return {
           content: [
             {
@@ -242,7 +242,7 @@ export function registerVolumeTools(server: McpServer): void {
         }
 
         const dur = duration_ms != null ? `${duration_ms}ms (${rampShape})` : `${steps} steps`;
-        const resulting_state = await resultingState(foundZone);
+        const resulting_state = await resultingState(foundZone, "ramp_volume");
         return {
           content: [{
             type: "text",
@@ -352,7 +352,7 @@ export function registerVolumeTools(server: McpServer): void {
         }
 
         const verb = dir === "next" ? "skipped to next" : "went to previous";
-        const resulting_state = await resultingState(foundZone);
+        const resulting_state = await resultingState(foundZone, "smooth_skip");
         return {
           content: [{
             type: "text",
@@ -403,7 +403,7 @@ export function registerVolumeTools(server: McpServer): void {
         }
 
         const partialFailure = failedOutputs.length > 0;
-        const resulting_state = await resultingState(foundZone);
+        const resulting_state = await resultingState(foundZone, "mute");
         return {
           content: [{
             type: "text",
@@ -486,7 +486,7 @@ export function registerVolumeTools(server: McpServer): void {
 
         await sharedRamper.toggleMute(getZone, transport);
 
-        const resulting_state = await resultingState(foundZone);
+        const resulting_state = await resultingState(foundZone, "mute_toggle");
         return {
           content: [{
             type: "text",
@@ -537,7 +537,7 @@ export function registerVolumeTools(server: McpServer): void {
             .catch((e: unknown) => console.error("[volume_preset] error:", e));
         }
 
-        const resulting_state = await resultingState(foundZone);
+        const resulting_state = await resultingState(foundZone, "volume_preset");
         return {
           content: [{
             type: "text",

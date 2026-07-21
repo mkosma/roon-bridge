@@ -374,7 +374,7 @@ export function registerVersionTools(server: McpServer): void {
             if (np && normalizeTitle(np) === want) { nowOk = true; break; }
             await new Promise((r) => setTimeout(r, 150));
           }
-          const resulting_state = await resultingState(zoneObj);
+          const resulting_state = await resultingState(zoneObj, "queue_version");
           if (nowOk) {
             return jsonResult({ ok: true, action: action.matched, when, matched, verified: true, zone: zoneObj.display_name, resulting_state });
           }
@@ -430,7 +430,7 @@ export function registerVersionTools(server: McpServer): void {
           );
         }
 
-        return jsonResult({ ok: true, action: action.matched, when, matched, verified: true, queue_count_before: beforeCount, queue_count_after: afterCount, zone: zoneObj.display_name, resulting_state: await resultingState(zoneObj) });
+        return jsonResult({ ok: true, action: action.matched, when, matched, verified: true, queue_count_before: beforeCount, queue_count_after: afterCount, zone: zoneObj.display_name, resulting_state: await resultingState(zoneObj, "queue_version") });
       } catch (e) {
         return jsonResult({ ok: false, error: e instanceof Error ? e.message : String(e) }, true);
       }

@@ -425,6 +425,69 @@ Returns, reading only the in-memory zone map (sub-150ms, negligible load):
 `GET /monitor/state/all` returns the same snapshot for every zone. Same bearer
 token as `/mcp` and `/control`. Unknown explicit zone → 404; Roon down → 503.
 
+### Command provenance (`last_command`)
+
+Every mutating MCP tool call (transport play/pause/stop/skip/seek, any queue
+mutation, volume/mute changes, zone grouping/transfer) tags an in-memory,
+per-zone `last_command` record: `{ source, action, zone_id, at }`. `/monitor/state`
+and `/monitor/state/all` include it per zone:
+
+```json
+{
+  "ok": true,
+  "zone": "WiiM + 1",
+  "...": "...",
+  "last_command": { "source": "maya", "action": "play", "zone_id": "...", "at": "2026-07-20T12:34:56.789Z" }
+}
+```
+
+**The key is OMITTED ENTIRELY** (never `null`, never `{}`) for a zone with no
+recorded command since the bridge last started - this is load-bearing for
+Maya's `music-monitor.py` daemon, whose `_attribute_source()` treats a missing
+key as "unknown" (the safe default), a present-but-stale record as "monty" (a
+real Roon-app change), and a recent one as `last_command.source`. `at` is
+always an ISO8601 UTC timestamp (`new Date().toISOString()`); "recent" is
+decided entirely by the consumer, not the bridge.
+
+`source` comes from an optional `X-Command-Source` request header on the MCP
+call, sanitized to `[a-z0-9_-]{1,32}` (lowercased); anything missing or
+malformed falls back to `"maya"`, this bridge's only MCP client today. The
+header is **provenance only** - it is never used for authentication or
+authorization, and is not trusted for anything beyond labeling who asked for
+the mutation.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" -H "X-Command-Source: telegram" \
+  -X POST "http://localhost:3100/mcp" ...
+```
+
+### Queue read (`GET /monitor/queue`)
+
+A read-only queue peek safe to poll every couple of minutes indefinitely - no
+mutation, no side effects. Reuses the same `readQueueRows` the `get_queue` MCP
+tool uses.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:3100/monitor/queue?zone=WiiM%20%2B%201&limit=10"
+```
+
+```json
+{
+  "ok": true,
+  "zone": "WiiM + 1",
+  "zone_id": "...",
+  "count": 3,
+  "items": [
+    { "position": 1, "queue_item_id": 100, "title": "...", "artist": "...", "album": "...", "length_seconds": 320, "is_now_playing": true }
+  ]
+}
+```
+
+`limit` defaults to 10. Unknown explicit zone → 404 (same shape as
+`/monitor/state`); Roon down → 503; a queue read failure → 500 with a clean
+error JSON, never a crash.
+
 ## REST control endpoint
 
 For one-shot HTTP clients (iOS Shortcuts, browser bookmarks, `curl`),

@@ -556,7 +556,7 @@ async function queueOrPlayById(
   try {
     const zone = roonConnection.findZoneOrThrow(zoneName);
     const result = await executeById(trackId, provider, zone, when);
-    const resulting_state = await resultingState(zone);
+    const resulting_state = await resultingState(zone, `play_by_id:${when}`);
     // An unconfirmed play carries a `warning`; render it as the first line of
     // the text (ahead of the JSON) so the caller cannot miss it, matching the
     // browse play path. Otherwise emit the plain JSON result.
@@ -764,7 +764,7 @@ async function runReplaceSequenceVerified(
   }
   await autoRadioOff(zone);
 
-  const resulting_state = await resultingState(zone);
+  const resulting_state = await resultingState(zone, "play_tracks:replace");
 
   // Nothing could be played: the replace did not happen. This is the failure the
   // ledger must show loud (failed(resolve)) instead of a silently-lost action.
@@ -958,7 +958,9 @@ export async function queueOrPlayTracks(
           count_queued: resolved.length,
           note: `${resolved.length} track(s) will replace the queue in order when "${np.three_line.line1}" ends (exact ids resolved now, replayed at the seam; prior queue discarded). Track with deferred_status; cancel with cancel_deferred("${deferral_id}").`,
           tracks: trackStatus(),
-          resulting_state: await resultingState(zone),
+          // Nothing executed yet - runReplaceSequenceVerified records the real
+          // mutation when the deferral fires at the seam.
+          resulting_state: await resultingState(zone, null),
         });
       }
       // Nothing playing - no seam; fall through to an immediate replace.
@@ -1052,7 +1054,7 @@ export async function queueOrPlayTracks(
       v.in_order &&
       trailing === 0;
 
-    const resulting_state = await resultingState(zone);
+    const resulting_state = await resultingState(zone, `play_tracks:${when}`);
     return jsonResult(
       {
         ok,

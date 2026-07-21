@@ -19,6 +19,7 @@ import { roonConnection } from "./roon-connection.js";
 import { createMcpServer } from "./mcp-server-factory.js";
 import { createControlRouter, createConfigRouter } from "./control/control-router.js";
 import { createMonitorRouter } from "./control/monitor-router.js";
+import { sanitizeSource, runWithCommandSource } from "./control/command-context.js";
 import express from "express";
 import { randomUUID } from "node:crypto";
 import { Bonjour } from "bonjour-service";
@@ -177,10 +178,16 @@ async function startHttpServer(): Promise<void> {
   app.all("/mcp", async (req, res) => {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
+    // Command provenance (last-command.ts / command-context.ts): an
+    // X-Command-Source header names the caller for anything this request
+    // ends up mutating; absent/malformed falls back to "maya" (this bridge's
+    // only MCP client today). Provenance only - never used for auth.
+    const commandSource = sanitizeSource(req.headers["x-command-source"]);
+
     // If we have an existing session, route to it
     if (sessionId && sessions.has(sessionId)) {
       const session = sessions.get(sessionId)!;
-      await session.transport.handleRequest(req, res, req.body);
+      await runWithCommandSource(commandSource, () => session.transport.handleRequest(req, res, req.body));
       return;
     }
 
@@ -213,7 +220,7 @@ async function startHttpServer(): Promise<void> {
 
     const server = createMcpServer();
     await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
+    await runWithCommandSource(commandSource, () => transport.handleRequest(req, res, req.body));
   });
 
   const httpServer = app.listen(BRIDGE_PORT, BRIDGE_HOST, () => {

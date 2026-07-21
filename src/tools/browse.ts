@@ -24,6 +24,8 @@ import type { SeamAction, SeamOutcome } from "../control/deferred-player.js";
 import { resultingState, immediateBool, boolish } from "./resulting-state.js";
 import { queueOrPlayTracks } from "./play-by-id.js";
 import { playOrQueueAlbumById } from "./album-by-id.js";
+import { lastCommandStore } from "../control/last-command.js";
+import { currentCommandSource } from "../control/command-context.js";
 import { initProviders } from "../providers/bootstrap.js";
 import type RoonApiBrowse from "node-roon-api-browse";
 
@@ -759,6 +761,7 @@ async function queueArtist(query: string, zoneName: string): Promise<ToolResult>
       // Non-critical
     }
 
+    lastCommandStore.record(zone.zone_id, "browse_queue_artist", currentCommandSource());
     const albumList = queuedTitles.map((t) => `"${t}"`).join(", ");
     const artistNote = byArtist > 0 ? ` (${byArtist} confirmed by ${artist.title})` : "";
     return {
@@ -1200,7 +1203,7 @@ async function searchAndPlay(
         await new Promise((r) => setTimeout(r, 150));
       }
 
-      const resulting_state = await resultingState(zone);
+      const resulting_state = await resultingState(zone, `browse_${effectiveActionType}`);
 
       // False success: now-playing WAS readable and it never left the track that
       // was playing before. The action was acked but nothing changed - the exact
@@ -1253,7 +1256,7 @@ async function searchAndPlay(
     }
 
     // Queue add: report the match; the queue growth was already verified above.
-    const resulting_state = await resultingState(zone);
+    const resulting_state = await resultingState(zone, `browse_${effectiveActionType}`);
     return {
       content: [{
         type: "text",

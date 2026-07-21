@@ -2,6 +2,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { roonConnection } from "../roon-connection.js";
 import { resultingState, boolish } from "./resulting-state.js";
+import { lastCommandStore } from "../control/last-command.js";
+import { currentCommandSource } from "../control/command-context.js";
 
 export function registerPlaybackTools(server: McpServer): void {
   server.tool(
@@ -78,6 +80,7 @@ export function registerPlaybackTools(server: McpServer): void {
             if (error) {
               resolve({ content: [{ type: "text", text: `Error: ${error}` }], isError: true });
             } else {
+              lastCommandStore.record(zone.zone_id, "seek", currentCommandSource());
               const desc = relative
                 ? `Seeked ${seconds > 0 ? "forward" : "backward"} ${Math.abs(seconds)}s`
                 : `Seeked to ${formatSeekTime(seconds)}`;
@@ -113,6 +116,7 @@ export function registerPlaybackTools(server: McpServer): void {
             if (error) {
               resolve({ content: [{ type: "text", text: `Error: ${error}` }], isError: true });
             } else {
+              lastCommandStore.record(zone.zone_id, "shuffle", currentCommandSource());
               resolve({
                 content: [{
                   type: "text",
@@ -150,6 +154,7 @@ export function registerPlaybackTools(server: McpServer): void {
             if (error) {
               resolve({ content: [{ type: "text", text: `Error: ${error}` }], isError: true });
             } else {
+              lastCommandStore.record(zone.zone_id, "loop", currentCommandSource());
               const modeMap: Record<string, string> = {
                 loop: "Loop all",
                 loop_one: "Loop one",
@@ -208,7 +213,7 @@ async function transportControl(
             next: "Skipped to next track",
             previous: "Went to previous track",
           };
-          const resulting_state = await resultingState(zone);
+          const resulting_state = await resultingState(zone, control);
           resolve({
             content: [
               {

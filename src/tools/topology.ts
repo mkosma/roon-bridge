@@ -19,6 +19,8 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { roonConnection } from "../roon-connection.js";
+import { lastCommandStore } from "../control/last-command.js";
+import { currentCommandSource } from "../control/command-context.js";
 import type { Zone, Output } from "node-roon-api-transport";
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
@@ -59,6 +61,9 @@ export function registerTopologyTools(server: McpServer): void {
         }
         const movedTitle = from.now_playing?.three_line?.line1 ?? null;
         await roonConnection.transferZone(from, to);
+        const source = currentCommandSource();
+        lastCommandStore.record(from.zone_id, "transfer_zone", source);
+        lastCommandStore.record(to.zone_id, "transfer_zone", source);
 
         const verified = await waitFor(() => {
           const dst = roonConnection.findZone(to.zone_id);
@@ -93,6 +98,10 @@ export function registerTopologyTools(server: McpServer): void {
         }
         const outputIds = outputs.map((o) => o.output_id);
         await roonConnection.groupOutputs(outputs);
+        {
+          const source = currentCommandSource();
+          for (const z of resolved) lastCommandStore.record(z.zone_id, "group_zones", source);
+        }
 
         // Verify: some zone now contains all the requested outputs together.
         const verified = await waitFor(() =>
@@ -107,6 +116,7 @@ export function registerTopologyTools(server: McpServer): void {
             const ids = new Set(outputsOf(zone).map((o) => o.output_id));
             return outputIds.every((id) => ids.has(id));
           });
+        if (grouped) lastCommandStore.record(grouped.zone_id, "group_zones", currentCommandSource());
         return jsonResult({
           ok: true,
           requested_zones: resolved.map((z) => z.display_name),
@@ -135,6 +145,7 @@ export function registerTopologyTools(server: McpServer): void {
         }
         const outputIds = outputs.map((o) => o.output_id);
         await roonConnection.ungroupOutputs(outputs);
+        lastCommandStore.record(z.zone_id, "ungroup_zone", currentCommandSource());
 
         const verified = await waitFor(() =>
           !roonConnection.getZones().some((zz) => {

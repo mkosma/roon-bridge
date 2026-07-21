@@ -389,7 +389,7 @@ export function registerEditQueueTools(server: McpServer): void {
         if (when === "now") {
           const outcome = await runRebuild(z.zone_id, items, upcomingIds, /* guard */ false);
           return jsonResult(
-            { ok: outcome.ok, when, zone: z.display_name, deleted_playing_note: deletedPlayingNote, plan: planSummary, before_queue: rows.map((r) => ({ position: r.position, queue_item_id: r.queue_item_id, title: r.title, artist: r.artist, is_now_playing: r.is_now_playing })), outcome, resulting_state: await resultingState(z) },
+            { ok: outcome.ok, when, zone: z.display_name, deleted_playing_note: deletedPlayingNote, plan: planSummary, before_queue: rows.map((r) => ({ position: r.position, queue_item_id: r.queue_item_id, title: r.title, artist: r.artist, is_now_playing: r.is_now_playing })), outcome, resulting_state: await resultingState(z, "edit_queue") },
             !outcome.ok,
           );
         }
@@ -410,7 +410,7 @@ export function registerEditQueueTools(server: McpServer): void {
               aborted: outcome.aborted === true,
               reason: outcome.reason,
               detail: outcome.detail,
-              resulting_state: await resultingState(roonConnection.findZone(z.zone_id) ?? z),
+              resulting_state: await resultingState(roonConnection.findZone(z.zone_id) ?? z, "edit_queue"),
             };
           };
           const { deferral_id } = await deferredPlayer.scheduleAfterCurrent(z, seamAction, {
@@ -429,14 +429,16 @@ export function registerEditQueueTools(server: McpServer): void {
             deleted_playing_note: deletedPlayingNote,
             plan: planSummary,
             before_queue: rows.map((r) => ({ position: r.position, queue_item_id: r.queue_item_id, title: r.title, artist: r.artist, is_now_playing: r.is_now_playing })),
-            resulting_state: await resultingState(z),
+            // Nothing executed yet - the rebuild is recorded inside seamAction()
+            // above when the deferral fires.
+            resulting_state: await resultingState(z, null),
           });
         }
 
         // Nothing playing - no seam; rebuild immediately.
         const outcome = await runRebuild(z.zone_id, items, upcomingIds, /* guard */ false);
         return jsonResult(
-          { ok: outcome.ok, when: "now (nothing was playing)", zone: z.display_name, deleted_playing_note: deletedPlayingNote, plan: planSummary, outcome, resulting_state: await resultingState(z) },
+          { ok: outcome.ok, when: "now (nothing was playing)", zone: z.display_name, deleted_playing_note: deletedPlayingNote, plan: planSummary, outcome, resulting_state: await resultingState(z, "edit_queue") },
           !outcome.ok,
         );
       } catch (e) {
